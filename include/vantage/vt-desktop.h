@@ -48,6 +48,7 @@ int           vt_desktop_add_icon(vt_desktop_t *d, const char *name,
 void          vt_desktop_remove_icon(vt_desktop_t *d, const char *name);
 void          vt_desktop_render(vt_desktop_t *d);
 void          vt_desktop_show_menu(vt_desktop_t *d, int x, int y);
+int           vt_desktop_step(vt_desktop_t *d, int timeout_ms);
 
 #ifdef __cplusplus
 }

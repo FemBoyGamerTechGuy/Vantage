@@ -16,6 +16,7 @@
 #include <ctype.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/wait.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -890,4 +891,112 @@ void *vt_mem_search(const void *hay, size_t hay_n,
         if (j == needle_sz) return (void *)(h + i);
     }
     return NULL;
+}
+
+/* ============================================================ STRBUILDER */
+void vt_strbuilder_init(vt_strbuilder_t *sb, size_t cap) {
+    if (!sb) return;
+    sb->cap = cap < 16 ? 16 : cap;
+    sb->buf = vt_malloc(sb->cap);
+    sb->buf[0] = 0;
+    sb->len = 0;
+}
+
+void vt_strbuilder_fini(vt_strbuilder_t *sb) {
+    if (!sb) return;
+    vt_free(sb->buf);
+    sb->buf = NULL;
+    sb->len = sb->cap = 0;
+}
+
+void vt_strbuilder_reset(vt_strbuilder_t *sb) {
+    if (!sb || !sb->buf) return;
+    sb->len = 0;
+    sb->buf[0] = 0;
+}
+
+static bool _sb_grow(vt_strbuilder_t *sb, size_t need) {
+    if (sb->len + need + 1 <= sb->cap) return true;
+    size_t ncap = sb->cap * 2;
+    while (ncap < sb->len + need + 1) ncap *= 2;
+    char *nb = vt_realloc(sb->buf, ncap);
+    if (!nb) return false;
+    sb->buf = nb;
+    sb->cap = ncap;
+    return true;
+}
+
+void vt_strbuilder_append_n(vt_strbuilder_t *sb, const char *s, size_t n) {
+    if (!sb || !s || n == 0) return;
+    if (!_sb_grow(sb, n)) return;
+    memcpy(sb->buf + sb->len, s, n);
+    sb->len += n;
+    sb->buf[sb->len] = 0;
+}
+
+void vt_strbuilder_append(vt_strbuilder_t *sb, const char *s) {
+    if (!s) return;
+    vt_strbuilder_append_n(sb, s, strlen(s));
+}
+
+void vt_strbuilder_appendf(vt_strbuilder_t *sb, const char *fmt, ...) {
+    if (!sb || !fmt) return;
+    va_list ap;
+    va_start(ap, fmt);
+    char *tmp = vt_vstrprintf(fmt, ap);
+    va_end(ap);
+    if (!tmp) return;
+    vt_strbuilder_append_n(sb, tmp, strlen(tmp));
+    vt_free(tmp);
+}
+
+char *vt_strbuilder_finish(vt_strbuilder_t *sb, size_t *out_len) {
+    if (!sb) return NULL;
+    char *out = sb->buf ? sb->buf : vt_strdup("");
+    if (out_len) *out_len = sb->len;
+    sb->buf = NULL;
+    sb->len = sb->cap = 0;
+    return out;
+}
+
+/* ============================================================ PROCESS */
+bool vt_proc_spawn_detached(const char *cmdline) {
+    if (!cmdline || !*cmdline) return false;
+    pid_t pid = fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        /* child: detach into own session, redirect stdio to /dev/null */
+        setsid();
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, 0);
+            dup2(devnull, 1);
+            dup2(devnull, 2);
+            if (devnull > 2) close(devnull);
+        }
+        execl("/bin/sh", "sh", "-c", cmdline, (char *)NULL);
+        _exit(127);
+    }
+    /* parent: reap immediately-ish (child is in its own session) */
+    int status;
+    waitpid(pid, &status, WNOHANG);
+    return true;
+}
+
+bool vt_proc_find_in_path(const char *name) {
+    if (!name || !*name) return false;
+    if (strchr(name, '/')) return access(name, X_OK) == 0;
+    const char *path = getenv("PATH");
+    if (!path || !*path) path = "/usr/bin:/bin";
+    char *copy = vt_strdup(path);
+    char *save = NULL;
+    bool found = false;
+    for (char *tok = strtok_r(copy, ":", &save); tok && !found;
+         tok = strtok_r(NULL, ":", &save)) {
+        char *full = vt_strprintf("%s/%s", tok, name);
+        if (access(full, X_OK) == 0) found = true;
+        vt_free(full);
+    }
+    vt_free(copy);
+    return found;
 }

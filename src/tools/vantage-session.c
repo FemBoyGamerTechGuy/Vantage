@@ -1,157 +1,177 @@
 /*
- * vantage-session.c — Session entry point
+ * vantage-session.c — Vantage session manager binary
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * This is the binary registered in the xsessions .desktop file. It
- * starts the chosen backend, renderer, compositor, WM, panel, and
- * desktop, runs autostart, and blocks until logout/shutdown.
+ * Session entry point (used by vantage.desktop / xsessions):
+ *   1. sets up the desktop environment variables
+ *   2. starts vantage-wm (critical, supervised with restart backoff)
+ *   3. starts vantage-panel and vantage-desktop (supervised)
+ *   4. runs XDG autostart entries (system + user, spec-compliant)
+ *   5. runs the session IPC server (logout / reboot / shutdown / status)
+ *   6. on SIGTERM or IPC logout: stops children gracefully and exits
+ *
+ * Works with or without systemd, D-Bus, and any Red Hat infrastructure.
  */
 
 #define VT_LOG_DOMAIN "session"
 #include <vantage/vt-core.h>
-#include <vantage/vt-config.h>
 #include <vantage/vt-session.h>
-#include <vantage/vt-backend.h>
-#include <vantage/vt-renderer.h>
-#include <vantage/vt-compositor.h>
-#include <vantage/vt-wm.h>
-#include <vantage/vt-panel.h>
-#include <vantage/vt-desktop.h>
-#include <vantage/vt-wallpaper.h>
-#include <vantage/vt-theme.h>
-#include <vantage/vt-settings.h>
-#include <vantage/vt-integrations.h>
-
+#include <vantage/vt-config.h>
+#include <vantage/vt-ipc.h>
 #include <signal.h>
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 static volatile sig_atomic_t _stop = 0;
 static void _on_sig(int sig) { (void)sig; _stop = 1; }
 
+typedef struct {
+    vt_session_t *session;
+    vt_ipc_t     *ipc;
+} _sctx_t;
+
+/* ------------------------------------------------------------- IPC */
+static int _h_ping(vt_ipc_t *ipc, const vt_ipc_msg_t *req,
+                   vt_ipc_msg_t *resp, void *ud) {
+    (void)ipc; (void)req; (void)ud;
+    resp->payload = (uint8_t *)vt_strdup("pong");
+    resp->len = 4;
+    return 0;
+}
+
+static int _h_status(vt_ipc_t *ipc, const vt_ipc_msg_t *req,
+                     vt_ipc_msg_t *resp, void *ud) {
+    (void)ipc; (void)req;
+    _sctx_t *ctx = ud;
+    const char *stage[] = { "init", "early", "components", "ready",
+                            "shutdown" };
+    int st = (int)vt_session_stage(ctx->session);
+    char *s = vt_strprintf("session=vantage %s\nstage=%s\nchildren=%zu\n",
+                           VT_VERSION,
+                           stage[st >= 0 && st < 5 ? st : 0],
+                           vt_session_children_alive(ctx->session));
+    resp->payload = (uint8_t *)s;
+    resp->len = (uint32_t)strlen(s);
+    return 0;
+}
+
+static int _h_end(vt_ipc_t *ipc, const vt_ipc_msg_t *req,
+                  vt_ipc_msg_t *resp, void *ud) {
+    (void)ipc; (void)resp;
+    _sctx_t *ctx = ud;
+    const char *action = "";
+    if (req && req->payload && req->len)
+        action = (const char *)req->payload;
+    vt_session_end_t how = VT_SESSION_END_LOGOUT;
+    if (vt_strstartswith(action, "reboot")) how = VT_SESSION_END_REBOOT;
+    else if (vt_strstartswith(action, "shutdown")) how = VT_SESSION_END_SHUTDOWN;
+    else if (vt_strstartswith(action, "suspend")) how = VT_SESSION_END_SUSPEND;
+    else if (vt_strstartswith(action, "hibernate")) how = VT_SESSION_END_HIBERNATE;
+    vt_logi("session: end requested (%s)", action);
+    vt_session_end(ctx->session, how);
+    _stop = 1;
+    return 0;
+}
+
+static int _h_reload(vt_ipc_t *ipc, const vt_ipc_msg_t *req,
+                     vt_ipc_msg_t *resp, void *ud) {
+    (void)ipc; (void)req; (void)resp; (void)ud;
+    /* children watch their own config files (inotify) */
+    resp->payload = (uint8_t *)vt_strdup("ok");
+    resp->len = 2;
+    return 0;
+}
+
+/* --------------------------------------------------------------- main */
 int main(int argc, char **argv) {
-    (void)argc; (void)argv;
     signal(SIGINT, _on_sig);
     signal(SIGTERM, _on_sig);
-
+    signal(SIGCHLD, SIG_DFL);
+    signal(SIGPIPE, SIG_IGN);
     vt_log_set_level(VT_LOG_INFO);
-    vt_logi("session: Vantage " VT_VERSION);
+    for (int i = 1; i < argc; i++) {
+        if (vt_streq(argv[i], "-v") || vt_streq(argv[i], "--verbose"))
+            vt_log_set_level(VT_LOG_DEBUG);
+    }
 
-    /* Load config */
     vt_config_t *cfg = vt_config_new_defaults();
-    if (vt_config_load(cfg, vt_config_default_path()) == VT_OK)
-        vt_logi("session: config loaded from %s", vt_config_default_path());
-    else
-        vt_logi("session: using defaults (config not yet created)");
+    vt_config_load(cfg, vt_config_default_path());
 
-    /* Detect & setup power integration */
-    vt_power_t *pwr = vt_power_new();
-    vt_power_init(pwr);
-    (void)pwr;
-
-    /* Start session manager */
     vt_session_t *s = vt_session_new();
+    _sctx_t ctx = { .session = s, .ipc = NULL };
 
-    /* Initialize backend (auto-detected) */
-    vt_backend_kind_t be_kind = vt_backend_kind_from_str(
-        vt_config_get(cfg, "desktop", "backend", "auto"));
-    vt_backend_t *backend = vt_backend_new(be_kind);
-    vt_logi("session: backend=%s", vt_backend_name(backend));
+    /* 1. environment */
+    vt_session_start(s);   /* sets XDG_* vars, runs hooks */
+    /* toolkit hints so GTK/Qt apps follow the Vantage theme */
+    setenv("XDG_CURRENT_DESKTOP", "Vantage", 0);
+    setenv("DESKTOP_SESSION", "vantage", 0);
+    setenv("QT_QPA_PLATFORMTHEME", "vantage", 0);
+    char *qt_plugins = vt_strprintf("%s/.local/lib/vantage/qt6",
+                                    vt_home_dir());
+    setenv("QT_PLUGIN_PATH", qt_plugins, 0);
+    vt_free(qt_plugins);
 
-    /* Initialize renderer (auto) */
-    const char *r_str = vt_config_get(cfg, "desktop", "renderer", "auto");
-    vt_renderer_kind_t r_kind = (r_str && r_str[0] == 's') ?
-                                VT_RENDERER_SW : VT_RENDERER_AUTO;
-    vt_renderer_t *renderer = vt_renderer_new(r_kind);
-    vt_logi("session: renderer=%s, hw-accel=%s",
-            vt_renderer_name(renderer),
-            renderer->caps.hw_accel ? "yes" : "no");
+    /* 2-3. supervised components */
+    const char *backend = vt_config_get(cfg, "desktop", "backend", "auto");
+    char *wm_cmd;
+    if (vt_proc_find_in_path("vantage-wm"))
+        wm_cmd = vt_strprintf("vantage-wm");
+    else
+        wm_cmd = vt_strprintf("\"%s/vantage-wm\"", VT_BINDIR);
+    vt_session_spawn_managed(s, "wm", wm_cmd, true);
+    vt_free(wm_cmd);
+    (void)backend;
 
-    /* Start compositor */
-    vt_compositor_t *comp = vt_compositor_new(renderer, backend);
-    vt_compositor_start(comp);
-
-    /* Start WM */
-    vt_wm_t *wm = vt_wm_new(backend);
-    vt_wm_start(wm);
-
-    /* Apply theme */
-    vt_theme_t *theme = vt_theme_load_by_name(
-        vt_config_get(cfg, "desktop", "theme", "Vantage-Dark"));
-    if (!theme) theme = vt_theme_new();
-    vt_theme_apply(theme);
-
-    /* Start panel + add default applets */
-    vt_panel_t *panel = vt_panel_new(renderer);
-    vt_panel_add_applet(panel, VT_PANEL_APPLET_LAUNCHER);
-    vt_panel_add_applet(panel, VT_PANEL_APPLET_TASKLIST);
-    vt_panel_add_applet(panel, VT_PANEL_APPLET_WORKSPACES);
-    vt_panel_add_applet(panel, VT_PANEL_APPLET_TRAY);
-    vt_panel_add_applet(panel, VT_PANEL_APPLET_VOLUME);
-    vt_panel_add_applet(panel, VT_PANEL_APPLET_NETWORK);
-    vt_panel_add_applet(panel, VT_PANEL_APPLET_BATTERY);
-    vt_panel_add_applet(panel, VT_PANEL_APPLET_CLOCK);
-    vt_panel_start(panel);
-
-    /* Start desktop */
-    vt_desktop_t *desk = vt_desktop_new(renderer);
-    vt_desktop_start(desk);
-
-    /* Apply settings */
-    vt_settings_t *settings = vt_settings_new();
-    vt_settings_apply_all(settings);
-
-    /* Wallpaper */
-    vt_wallpaper_t *wp = vt_wallpaper_new();
-    const char *wp_path = vt_config_get(cfg, "desktop", "wallpaper", "");
-    const char *wp_video = vt_config_get(cfg, "desktop", "video-wallpaper", "");
-    if (*wp_video) {
-        vt_wallpaper_set_kind(wp, VT_WALLPAPER_VIDEO);
-        vt_wallpaper_set_path(wp, wp_video);
-        vt_wallpaper_set_volume(wp, (float)vt_config_get_double(cfg, "desktop",
-                              "video-volume", 0));
-        vt_wallpaper_load(wp, NULL);
-    } else if (*wp_path) {
-        vt_wallpaper_set_kind(wp, VT_WALLPAPER_IMAGE);
-        vt_wallpaper_set_path(wp, wp_path);
-        vt_wallpaper_load(wp, NULL);
-    } else {
-        vt_wallpaper_set_kind(wp, VT_WALLPAPER_COLOR);
+    if (vt_config_get_bool(cfg, "panel", "enabled", true)) {
+        vt_session_spawn_managed(s, "panel",
+                                 vt_proc_find_in_path("vantage-panel")
+                                 ? "vantage-panel"
+                                 : VT_BINDIR "/vantage-panel", false);
+    }
+    if (vt_config_get_bool(cfg, "desktop", "show", true)) {
+        vt_session_spawn_managed(s, "desktop",
+                                 vt_proc_find_in_path("vantage-desktop")
+                                 ? "vantage-desktop"
+                                 : VT_BINDIR "/vantage-desktop", false);
     }
 
-    /* Start session */
-    vt_session_start(s);
+    /* 4. XDG autostart (system + user) */
     vt_session_autostart_load(s);
+    vt_session_autostart_run(s);
 
-    /* Run main loop until shutdown */
-    while (!_stop && vt_session_stage(s) != VT_SESSION_STAGE_SHUTDOWN) {
-        vt_backend_dispatch(backend, 50);
-        vt_wm_step(wm, 0);
-        vt_compositor_step(comp, 0);
-        /* render panel + wallpaper via compositor once per frame */
-        if (renderer && renderer->initialized) {
-            vt_panel_render(panel);
-            vt_rect_t r = {0, 32, 1920, 1048};
-            vt_wallpaper_step(wp, renderer, 1920, 1048);
-            vt_wallpaper_render(wp, renderer, r);
-        }
+    /* 5. session IPC server */
+    ctx.ipc = vt_ipc_new_server(vt_strprintf("%s/vantage-session.sock",
+                                             vt_runtime_dir()));
+    vt_ipc_register(ctx.ipc, VT_IPC_MSG_PING,   _h_ping, &ctx);
+    vt_ipc_register(ctx.ipc, VT_IPC_MSG_RELOAD, _h_reload, &ctx);
+    vt_ipc_register(ctx.ipc, VT_IPC_MSG_QUIT,   _h_end, &ctx);
+    vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_LOGOUT, _h_end, &ctx);
+    vt_logi("session: ready (ipc at %s)",
+            vt_ipc_get_path(ctx.ipc));
+
+    /* 6. main loop */
+    while (!_stop && vt_session_is_running(s)) {
+        vt_session_supervise(s);
+        vt_ipc_step(ctx.ipc, 200);
     }
 
-    vt_logi("session: shutting down");
-    vt_wallpaper_free(wp);
-    vt_session_end(s, VT_SESSION_END_LOGOUT);
-    vt_settings_free(settings);
-    vt_desktop_free(desk);
-    vt_panel_free(panel);
-    vt_theme_free(theme);
-    vt_wm_free(wm);
-    vt_compositor_free(comp);
-    vt_renderer_free(renderer);
-    vt_backend_free(backend);
-    vt_power_free(pwr);
-    vt_config_free(cfg);
+    /* shutdown: TERM children, wait briefly, KILL stragglers */
+    vt_logi("session: stopping children");
+    vt_session_end(s, VT_SESSION_END_LOGOUT);  /* enter SHUTDOWN stage:
+                                                  no more restarts */
+    vt_session_term_children(s);
+    for (int i = 0; i < 30; i++) {
+        vt_session_supervise(s);
+        if (vt_session_children_alive(s) == 0) break;
+        vt_time_sleep_ms(100);
+    }
+    vt_session_stop_children(s, SIGKILL);
+    vt_ipc_free(ctx.ipc);
     vt_session_free(s);
+    vt_config_free(cfg);
+    vt_logi("session: exited");
     return 0;
 }

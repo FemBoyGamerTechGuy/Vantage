@@ -34,6 +34,7 @@ typedef enum {
 } vt_session_end_t;
 
 typedef struct vt_session vt_session_t;
+struct vt_session;  /* private: hooks, autostarts, env, managed children */
 
 typedef void (*vt_session_hook_t)(vt_session_t *s, vt_session_stage_t stage,
                                    void *ud);
@@ -59,6 +60,22 @@ void vt_session_set_env(vt_session_t *s, const char *k, const char *v);
 const char *vt_session_get_env(vt_session_t *s, const char *k);
 
 vt_session_stage_t vt_session_stage(const vt_session_t *s);
+bool vt_session_is_running(const vt_session_t *s);
+
+/* ------------------------------------------------------------- supervisor */
+/* Spawn a named managed child. `critical` children (the WM) restart with
+ * exponential backoff and take the session down after too many failures;
+ * non-critical children (panel, desktop) restart with fixed delay. */
+int  vt_session_spawn_managed(vt_session_t *s, const char *name,
+                              const char *cmd, bool critical);
+/* Reap dead children and apply restart policy. Call from the main loop. */
+void vt_session_supervise(vt_session_t *s);
+/* Send SIGTERM to all managed children (graceful stop). */
+void vt_session_term_children(vt_session_t *s);
+/* Number of live managed children. */
+size_t vt_session_children_alive(const vt_session_t *s);
+/* The end action requested (LOGOUT etc.) — valid during SHUTDOWN. */
+int  vt_session_stop_children(vt_session_t *s, int sig);
 
 #ifdef __cplusplus
 }

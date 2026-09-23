@@ -100,6 +100,11 @@ struct vt_renderer {
     bool initialized;
 };
 
+/* Access the current framebuffer of a software renderer (NULL for GL).
+ * Returned pointer is owned by the renderer; valid until the next
+ * begin()/render call. */
+const uint8_t *vt_renderer_framebuffer(const vt_renderer_t *r, int *w, int *h);
+
 vt_renderer_t *vt_renderer_new(vt_renderer_kind_t preferred);
 void           vt_renderer_free(vt_renderer_t *r);
 int            vt_renderer_init(vt_renderer_t *r);

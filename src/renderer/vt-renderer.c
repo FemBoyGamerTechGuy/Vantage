@@ -112,6 +112,16 @@ bool vt_renderer_probe(vt_renderer_kind_t kind, vt_renderer_caps_t *out) {
     return false;
 }
 
+const uint8_t *vt_renderer_framebuffer(const vt_renderer_t *r, int *w, int *h) {
+    if (!r || !r->priv) return NULL;
+    if (r->kind != VT_RENDERER_SW) return NULL;
+    /* _sw_state_t layout from vt-renderer-sw.c (w, h, buf) */
+    struct { int w, h; uint8_t *buf; void *bound; } *s = (void *)r->priv;
+    if (w) *w = s->w;
+    if (h) *h = s->h;
+    return s->buf;
+}
+
 const char *vt_renderer_name(const vt_renderer_t *r) {
     return (r && r->ops && r->ops->name) ? r->ops->name() : "invalid";
 }

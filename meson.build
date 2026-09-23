@@ -31,6 +31,7 @@ add_project_arguments([
   '-DVT_DATADIR="' + vt_datadir + '"',
   '-DVT_SYSCONFDIR="' + vt_sysconfdir + '"',
   '-DVT_LIBDIR="' + vt_libdir + '"',
+  '-DVT_BINDIR="' + vt_bindir + '"',
   '-DVT_PREFIX="' + vt_prefix + '"',
 ], language : 'c')
 
@@ -69,6 +70,17 @@ dep_xcb_xinput      = dependency('xcb-input',      required : false)
 dep_xcb_util        = dependency('xcb-util',       required : false)
 dep_xcb_ewmh        = dependency('xcb-ewmh',       required : false)
 dep_xcb_icccm       = dependency('xcb-icccm',      required : false)
+dep_xrender         = dependency('xrender',        required : false)
+dep_xcomposite      = dependency('xcomposite',     required : false)
+dep_xdamage         = dependency('xdamage',        required : false)
+dep_xfixes          = dependency('xfixes',         required : false)
+dep_xrandr          = dependency('xrandr',         required : false)
+dep_xinerama        = dependency('xinerama',       required : false)
+dep_xcursor         = dependency('xcursor',        required : false)
+dep_xres            = dependency('xres',          required : false)
+dep_xft             = dependency('xft',            required : false)
+dep_xi              = dependency('xi',             required : false)
+dep_x11xcb          = dependency('x11-xcb',        required : false)
 dep_xkbcommon       = dependency('xkbcommon',      required : false)
 dep_xkbcommon_x11   = dependency('xkbcommon-x11',  required : false)
 

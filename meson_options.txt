@@ -15,3 +15,5 @@ option('networkmanager',type : 'feature', value : 'auto',  description : 'Build 
 option('upower',        type : 'feature', value : 'auto',  description : 'Build UPower integration')
 option('tests',         type : 'feature', value : 'enabled', description : 'Build unit tests')
 option('docs',          type : 'feature', value : 'enabled', description : 'Install documentation')
+
+option('panel-applets', type : 'feature', value : 'auto', description : 'Build panel applets (launcher, tasklist, clock, ...)')

@@ -21,6 +21,9 @@
 extern "C" {
 #endif
 
+struct vt_wm;
+struct vt_compositor_x11;
+
 typedef struct vt_compositor   vt_compositor_t;
 typedef struct vt_surface      vt_surface_t;
 typedef struct vt_compositor_config {
@@ -90,6 +93,20 @@ void             vt_compositor_set_config(vt_compositor_t *c,
 void             vt_compositor_get_config(vt_compositor_t *c,
                                             vt_compositor_config_t *out);
 uint32_t         vt_compositor_fps(const vt_compositor_t *c);
+
+/* X11 composite engine (XComposite + XDamage + XRender). Redirects the
+ * root's subwindows, composites them damage-driven into a back buffer,
+ * honors _NET_WM_WINDOW_OPACITY, and paints optional soft shadows.
+ * Returns VT_OK or a negative error (VT_ERR_NOTSUPP when extensions are
+ * missing). The engine runs inside vt_compositor_step(). */
+int  vt_compositor_attach_x11(vt_compositor_t *c, struct vt_wm *wm);
+bool vt_compositor_x11_active(const vt_compositor_t *c);
+/* Query whether the running X server provides the needed extensions. */
+bool vt_compositor_x11_available(void);
+/* Engine integration (called from the compositor core) */
+void vt_compositor_x11_step(void);
+void vt_compositor_x11_stop(void);
+void vt_compositor_x11_screen_resized(void);
 
 #ifdef __cplusplus
 }

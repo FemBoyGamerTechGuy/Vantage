@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Vantage Wayland Session
+Comment=Vantage running as a native Wayland compositor
+Exec=vantage-session
+TryExec=vantage-session
+Icon=
+DesktopNames=Vantage;

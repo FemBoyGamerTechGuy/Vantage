@@ -1,12 +1,16 @@
 /*
  * vantage-desktop.c — Standalone desktop binary
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ *
+ * Owns the wallpaper surface, desktop icons and the root context menu.
+ * Started by vantage-session; also works standalone on any EWMH WM.
  */
 
 #define VT_LOG_DOMAIN "desktop"
 #include <vantage/vt-core.h>
 #include <vantage/vt-desktop.h>
 #include <vantage/vt-renderer.h>
-#include <vantage/vt-wallpaper.h>
 #include <vantage/vt-config.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -19,17 +23,20 @@ int main(int argc, char **argv) {
     (void)argc; (void)argv;
     signal(SIGINT, _on_sig);
     signal(SIGTERM, _on_sig);
+    signal(SIGPIPE, SIG_IGN);
     vt_log_set_level(VT_LOG_INFO);
 
-    vt_renderer_t *r = vt_renderer_new(VT_RENDERER_AUTO);
-    vt_desktop_t *d = vt_desktop_new(r);
-    vt_desktop_start(d);
-
-    while (!_stop) {
-        vt_desktop_render(d);
-        vt_time_sleep_ms(100);
+    vt_desktop_t *d = vt_desktop_new(NULL);
+    if (vt_desktop_start(d) != VT_OK) {
+        vt_loge("desktop: failed to start");
+        vt_desktop_free(d);
+        return 1;
     }
+
+    while (!_stop)
+        vt_desktop_step(d, 100);
+
+    vt_logi("desktop: shutting down");
     vt_desktop_free(d);
-    vt_renderer_free(r);
     return 0;
 }

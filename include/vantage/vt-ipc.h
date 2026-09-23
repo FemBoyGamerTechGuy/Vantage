@@ -77,6 +77,13 @@ int  vt_ipc_step(vt_ipc_t *ipc, int timeout_ms);
 int  vt_ipc_send(vt_ipc_t *ipc, uint32_t msg_id, vt_ipc_msg_type_t type,
                   const void *data, uint32_t len);
 
+/* Broadcast an event to every subscribed client (server only). */
+int  vt_ipc_broadcast(vt_ipc_t *ipc, uint32_t msg_id, const void *data,
+                      uint32_t len);
+
+/* Free a message payload received via vt_ipc_call / client dispatch. */
+void vt_ipc_msg_free(vt_ipc_msg_t *m);
+
 /* Convenience: send a request, wait for response with timeout. */
 int  vt_ipc_call(vt_ipc_t *ipc, uint32_t msg_id,
                   const void *req, uint32_t req_len,
@@ -86,21 +93,34 @@ int  vt_ipc_call(vt_ipc_t *ipc, uint32_t msg_id,
 int  vt_ipc_encode(const vt_ipc_msg_t *m, uint8_t **out, size_t *out_len);
 int  vt_ipc_decode(const uint8_t *buf, size_t n, vt_ipc_msg_t *out);
 
-/* Common message ids used by Vantage components. */
+/* Common message ids used by Vantage components.
+ * Payloads are single-line UTF-8 text (key=value) for debuggability. */
 enum {
     VT_IPC_MSG_HELLO       = 0x0001,
     VT_IPC_MSG_PING        = 0x0002,
     VT_IPC_MSG_QUIT        = 0x0003,
     VT_IPC_MSG_RELOAD      = 0x0004,
-    VT_IPC_MSG_SUBSCRIBE   = 0x0005,
-    VT_IPC_MSG_EVENT_OUT   = 0x0006,
+    VT_IPC_MSG_SUBSCRIBE   = 0x0005,   /* client → server: send me events */
+    VT_IPC_MSG_EVENT_OUT   = 0x0006,   /* server → clients: event line */
     VT_IPC_MSG_LOG_LINE    = 0x0007,
     VT_IPC_MSG_PANEL_QUERY = 0x0010,
-    VT_IPC_MSG_WM_QUERY    = 0x0020,
+    /* WM commands (payload: "id=<window-id>" or "ws=<n>" etc.) */
+    VT_IPC_MSG_WM_QUERY    = 0x0020,   /* → list of windows, one per line */
     VT_IPC_MSG_WM_FOCUS    = 0x0021,
     VT_IPC_MSG_WM_CLOSE    = 0x0022,
     VT_IPC_MSG_WM_TILE     = 0x0023,
     VT_IPC_MSG_WM_WS_SWITCH= 0x0024,
+    VT_IPC_MSG_WM_WS_QUERY = 0x0025,   /* → workspace count + current */
+    VT_IPC_MSG_WM_MINIMIZE = 0x0026,
+    VT_IPC_MSG_WM_MAXIMIZE = 0x0027,
+    VT_IPC_MSG_WM_FULLSCR  = 0x0028,
+    VT_IPC_MSG_WM_MOVE     = 0x0029,
+    VT_IPC_MSG_WM_RESIZE   = 0x002a,
+    VT_IPC_MSG_WM_LAUNCH   = 0x002b,   /* payload: command line to spawn */
+    VT_IPC_MSG_WM_LOGOUT   = 0x002c,
+    /* WM events (broadcast, payload: one text line) */
+    VT_IPC_MSG_WM_EVENT    = 0x0040,   /* window-opened|closed|focused|... */
+    VT_IPC_MSG_WM_WS_EVENT = 0x0041,   /* workspace-changed <n> */
 };
 
 #ifdef __cplusplus

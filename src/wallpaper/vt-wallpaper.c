@@ -30,6 +30,12 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+/* vt-image.c */
+bool vt_image_probe_png(const char *path);
+bool vt_image_probe_jpeg(const char *path);
+uint8_t *vt_image_load_png(const char *path, int *out_w, int *out_h);
+uint8_t *vt_image_load_jpeg(const char *path, int *out_w, int *out_h);
+
 struct vt_wallpaper_priv {
     /* video decoder state */
 #if defined(VT_HAVE_FFMPEG)
@@ -65,7 +71,7 @@ void vt_wallpaper_free(vt_wallpaper_t *w) {
 #if defined(VT_HAVE_FFMPEG)
     if (w->priv) {
         struct vt_wallpaper_priv *p = w->priv;
-        if (p->sws)        sws_free(p->sws);
+        if (p->sws)        sws_freeContext(p->sws);
         if (p->frame)      av_frame_free(&p->frame);
         if (p->dec_ctx)    avcodec_free_context(&p->dec_ctx);
         if (p->fmt_ctx)    avformat_close_input(&p->fmt_ctx);
@@ -154,20 +160,25 @@ int vt_wallpaper_step(vt_wallpaper_t *w, vt_renderer_t *r, uint32_t output_w, ui
         struct vt_wallpaper_priv *p = w->priv;
         if (!p || p->paused) return VT_OK;
         if (!p->fmt_ctx) return VT_ERR_INVAL;
-        AVPacket pkt;
-        if (av_read_frame(p->fmt_ctx, &pkt) < 0) {
+        AVPacket *pkt = av_packet_alloc();
+        if (!pkt) return VT_ERR_NOMEM;
+        if (av_read_frame(p->fmt_ctx, pkt) < 0) {
+            av_packet_free(&pkt);
             if (w->loop) {
-                av_seek_frame(p->fmt_ctx, p->video_stream, 0, AVSEEK_FLAG_BACKWARD);
+                if (av_seek_frame(p->fmt_ctx, p->video_stream, 0,
+                                  AVSEEK_FLAG_BACKWARD) >= 0) {
+                    avcodec_flush_buffers(p->dec_ctx);
+                }
             }
             return VT_OK;
         }
-        if (pkt.stream_index == p->video_stream) {
+        if (pkt->stream_index == p->video_stream) {
             int got = 0;
-            if (avcodec_send_packet(p->dec_ctx, &pkt) == 0) {
+            if (avcodec_send_packet(p->dec_ctx, pkt) == 0) {
                 got = (avcodec_receive_frame(p->dec_ctx, p->frame) == 0);
             }
             if (got) {
-                /* convert to RGBA */
+                /* convert to RGBA, preserving aspect ratio (letterbox) */
                 if (!p->sws) {
                     p->sws = sws_getContext(
                         p->dec_ctx->width, p->dec_ctx->height, p->dec_ctx->pix_fmt,
@@ -179,16 +190,37 @@ int vt_wallpaper_step(vt_wallpaper_t *w, vt_renderer_t *r, uint32_t output_w, ui
                 uint8_t *dst[4] = { p->scratch, NULL, NULL, NULL };
                 int linesize[4] = { (int)output_w * 4, 0, 0, 0 };
                 sws_scale(p->sws, (const uint8_t *const *)p->frame->data,
-                          p->frame->linesize, 0, p->dec_ctx->height,
+                          p->frame->linesize, 0, p->frame->height,
                           dst, linesize);
                 if (!w->texture)
                     w->texture = vt_renderer_texture_create(r, output_w, output_h, VT_PF_ARGB8888);
                 vt_renderer_texture_upload(r, w->texture, p->scratch);
             }
         }
-        av_packet_unref(&pkt);
+        av_packet_unref(pkt);
+        av_packet_free(&pkt);
 #endif
     } else if (w->kind == VT_WALLPAPER_IMAGE) {
+        if (!w->texture && w->path) {
+            /* direct loaders first: no gdk-pixbuf/GLib dependency */
+            int iw = 0, ih = 0;
+            uint8_t *rgba = NULL;
+            if (vt_image_probe_png(w->path))
+                rgba = vt_image_load_png(w->path, &iw, &ih);
+            else if (vt_image_probe_jpeg(w->path))
+                rgba = vt_image_load_jpeg(w->path, &iw, &ih);
+            if (rgba) {
+                if (r) {
+                    w->texture = vt_renderer_texture_create(
+                        r, (uint32_t)iw, (uint32_t)ih, VT_PF_ARGB8888);
+                    if (w->texture)
+                        vt_renderer_texture_upload(r, w->texture, rgba);
+                }
+                vt_free(rgba);
+                vt_logi("wallpaper: loaded %s (%dx%d)", w->path, iw, ih);
+                return VT_OK;
+            }
+        }
 #if defined(VT_HAVE_GDKPIXBUF)
         if (!w->texture && w->path) {
             GError *err = NULL;

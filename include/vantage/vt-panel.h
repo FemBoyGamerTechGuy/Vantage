@@ -78,6 +78,7 @@ int         vt_panel_remove_applet(vt_panel_t *p, int idx);
 void        vt_panel_render(vt_panel_t *p);
 void        vt_panel_set_pos(vt_panel_t *p, vt_panel_pos_t pos);
 void        vt_panel_set_height(vt_panel_t *p, int h);
+int         vt_panel_step(vt_panel_t *p, int timeout_ms);
 
 /* Built-in applets */
 extern const vt_panel_plugin_api_t vt_panel_applet_launcher;

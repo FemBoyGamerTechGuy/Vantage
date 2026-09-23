@@ -30,6 +30,18 @@ typedef struct {
     bool run;
 } _autostart_t;
 
+typedef struct {
+    char    *name;
+    char    *cmd;
+    pid_t    pid;
+    pid_t    pgid;         /* process group id (== first spawn pid) */
+    bool     critical;
+    bool     cmd_missing;
+    int      restarts;
+    uint64_t last_start_ms;
+    uint64_t restart_delay_ms;
+} _managed_t;
+
 struct vt_session {
     vt_vec_t       hooks;
     vt_vec_t       autostarts;
@@ -39,6 +51,8 @@ struct vt_session {
     void           *pwr_ud;
     vt_session_stage_t stage;
     bool           running;
+    void           *managed;      /* vt_vec_t of _managed_t */
+    vt_session_end_t end_action;
 };
 
 vt_session_t *vt_session_new(void) {
@@ -47,7 +61,11 @@ vt_session_t *vt_session_new(void) {
     vt_vec_init(&s->autostarts, sizeof(_autostart_t), 8);
     vt_vec_init(&s->env_keys, sizeof(char *), 16);
     vt_vec_init(&s->env_vals, sizeof(char *), 16);
+    vt_vec_t *m = vt_malloc0(sizeof(vt_vec_t));
+    vt_vec_init(m, sizeof(_managed_t), 8);
+    s->managed = m;
     s->stage = VT_SESSION_STAGE_INIT;
+    s->end_action = VT_SESSION_END_LOGOUT;
     return s;
 }
 void vt_session_free(vt_session_t *s) {
@@ -65,6 +83,16 @@ void vt_session_free(vt_session_t *s) {
     }
     vt_vec_fini(&s->env_keys);
     vt_vec_fini(&s->env_vals);
+    if (s->managed) {
+        vt_vec_t *v = (vt_vec_t *)s->managed;
+        for (size_t i = 0; i < v->size; i++) {
+            _managed_t *m = vt_vec_at(v, i);
+            vt_free(m->name);
+            vt_free(m->cmd);
+        }
+        vt_vec_fini(v);
+        vt_free(v);
+    }
     vt_free(s);
 }
 
@@ -116,21 +144,57 @@ int vt_session_autostart_load(vt_session_t *s) {
             size_t flen = 0;
             char *content = vt_file_read_all(path, &flen);
             if (content) {
+                char *exec = NULL, *hidden = NULL, *onlyin = NULL,
+                     *notin = NULL, *tryexec = NULL;
                 char *p = content;
                 while (*p) {
                     char *nl = strchr(p, '\n');
                     if (!nl) break;
                     *nl = 0;
-                    if (vt_strstartswith(p, "Exec=")) {
-                        char *cmd = vt_strtrim(p + 5);
-                        _autostart_t a = { .path = vt_strdup(cmd),
-                                            .name = vt_strdup(files[i]),
-                                            .run = true };
-                        vt_vec_push(&s->autostarts, &a);
-                        vt_free(cmd);
-                    }
+                    if (vt_strstartswith(p, "Exec=") && !exec)
+                        exec = vt_strdup(vt_strtrim(p + 5));
+                    else if (vt_strstartswith(p, "Hidden=") &&
+                             strstr(p, "true"))
+                        hidden = vt_strdup("1");
+                    else if (vt_strstartswith(p, "OnlyShowIn=") && !onlyin)
+                        onlyin = vt_strdup(p + 12);
+                    else if (vt_strstartswith(p, "NotShowIn=") && !notin)
+                        notin = vt_strdup(p + 11);
+                    else if (vt_strstartswith(p, "TryExec=") && !tryexec)
+                        tryexec = vt_strdup(p + 9);
                     p = nl + 1;
                 }
+                bool run = exec && !hidden;
+                if (run && onlyin && !strstr(onlyin, "Vantage;") &&
+                    !strstr(onlyin, "GNOME;") && !strstr(onlyin, "XFCE;"))
+                    run = false;
+                if (run && notin && strstr(notin, "Vantage;"))
+                    run = false;
+                if (run && tryexec && *tryexec && !vt_proc_find_in_path(tryexec))
+                    run = false;
+                /* user autostart overrides system entries by filename */
+                if (run) {
+                    for (size_t k = 0; k < s->autostarts.size; k++) {
+                        _autostart_t *prev = vt_vec_at(&s->autostarts, k);
+                        if (vt_streq(prev->name, files[i])) {
+                            vt_free(prev->path);
+                            prev->path = vt_strdup(exec);
+                            run = false; /* replaced */
+                            break;
+                        }
+                    }
+                }
+                if (run) {
+                    _autostart_t a = { .path = vt_strdup(exec),
+                                       .name = vt_strdup(files[i]),
+                                       .run = true };
+                    vt_vec_push(&s->autostarts, &a);
+                }
+                vt_free(exec);
+                vt_free(hidden);
+                vt_free(onlyin);
+                vt_free(notin);
+                vt_free(tryexec);
                 vt_free(content);
             }
             vt_free(path);
@@ -219,6 +283,7 @@ int vt_session_run(vt_session_t *s) {
 
 void vt_session_end(vt_session_t *s, vt_session_end_t how) {
     if (!s) return;
+    s->end_action = how;
     int rc;
     if (s->pwr_cb) rc = s->pwr_cb(s, how, s->pwr_ud);
     else rc = _default_power(s, how);
@@ -232,4 +297,122 @@ void vt_session_end(vt_session_t *s, vt_session_end_t how) {
 
 vt_session_stage_t vt_session_stage(const vt_session_t *s) {
     return s ? s->stage : VT_SESSION_STAGE_INIT;
+}
+bool vt_session_is_running(const vt_session_t *s) {
+    return s ? s->running : false;
+}
+
+/* ============================================================ supervisor */
+int vt_session_spawn_managed(vt_session_t *s, const char *name,
+                             const char *cmd, bool critical) {
+    if (!s || !name || !cmd) return VT_ERR_INVAL;
+    vt_vec_t *v = (vt_vec_t *)s->managed;
+    _managed_t m = { .name = vt_strdup(name), .cmd = vt_strdup(cmd),
+                     .pid = -1, .pgid = -1, .critical = critical,
+                     .restarts = 0, .last_start_ms = 0,
+                     .restart_delay_ms = 500 };
+    pid_t pid = fork();
+    if (pid < 0) return VT_ERR;
+    if (pid == 0) {
+        setsid();
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+    m.pid = pid;
+    m.pgid = pid;      /* setsid() in the child makes it group leader */
+    m.last_start_ms = vt_time_now_ms();
+    vt_vec_push(v, &m);
+    vt_logi("session: started '%s' pid=%d (critical=%d)", name, pid, critical);
+    return VT_OK;
+}
+
+void vt_session_supervise(vt_session_t *s) {
+    if (!s || !s->managed) return;
+    vt_vec_t *v = (vt_vec_t *)s->managed;
+    /* Always reap — including during shutdown (zombies must not make
+     * children_alive() report them as running). */
+    int status;
+    pid_t dead;
+    while ((dead = waitpid(-1, &status, WNOHANG)) > 0) {
+        _managed_t *m = NULL;
+        for (size_t i = 0; i < v->size; i++) {
+            _managed_t *p = vt_vec_at(v, i);
+            if (p->pid == dead) { m = p; break; }
+        }
+        if (!m) continue; /* autostart child — not managed */
+        vt_logw("session: '%s' (pid %d) exited (status %d)", m->name, dead,
+                WEXITSTATUS(status));
+        if (WEXITSTATUS(status) == 127)
+            m->cmd_missing = true;   /* exec failed — do not restart */
+        m->pid = -1;
+    }
+    if (s->stage == VT_SESSION_STAGE_SHUTDOWN) return; /* no restarts now */
+    uint64_t now = vt_time_now_ms();
+    for (size_t i = 0; i < v->size; i++) {
+        _managed_t *m = vt_vec_at(v, i);
+        if (m->pid > 0) continue;
+        if (m->cmd_missing) continue;   /* command not found — give up */
+        if (m->restarts >= 8 && m->critical) {
+            vt_loge("session: critical component '%s' failed %d times — "
+                    "ending session", m->name, m->restarts);
+            vt_session_end(s, VT_SESSION_END_LOGOUT);
+            return;
+        }
+        uint64_t delay = m->critical ? m->restart_delay_ms : 1000;
+        if (now - m->last_start_ms < delay) continue;
+        m->restarts++;
+        m->restart_delay_ms *= 2;
+        if (m->restart_delay_ms > 16000) m->restart_delay_ms = 16000;
+        pid_t pid = fork();
+        if (pid == 0) {
+            setsid();
+            execl("/bin/sh", "sh", "-c", m->cmd, (char *)NULL);
+            _exit(127);
+        }
+        if (pid > 0) {
+            m->pid = pid;
+            m->last_start_ms = now;
+            vt_logi("session: restarted '%s' pid=%d (attempt %d)",
+                    m->name, pid, m->restarts);
+        }
+    }
+}
+
+void vt_session_term_children(vt_session_t *s) {
+    if (!s || !s->managed) return;
+    vt_vec_t *v = (vt_vec_t *)s->managed;
+    for (size_t i = 0; i < v->size; i++) {
+        _managed_t *m = vt_vec_at(v, i);
+        /* children run in their own session (setsid at spawn), so the
+         * process group id == the spawned pid. Signal the whole group:
+         * `sh -c` wrappers may fork, orphaning the real process. */
+        if (m->pid > 0) kill(-m->pid, SIGTERM);
+        if (m->pid > 0) kill(m->pid, SIGTERM);
+    }
+}
+
+int vt_session_stop_children(vt_session_t *s, int sig) {
+    if (!s || !s->managed) return 0;
+    vt_vec_t *v = (vt_vec_t *)s->managed;
+    int n = 0;
+    for (size_t i = 0; i < v->size; i++) {
+        _managed_t *m = vt_vec_at(v, i);
+        if (m->pid > 0) { kill(-m->pid, sig); kill(m->pid, sig); n++; }
+        else if (kill(-m->pgid, sig) == 0) n++;
+    }
+    return n;
+}
+
+size_t vt_session_children_alive(const vt_session_t *s) {
+    if (!s || !s->managed) return 0;
+    vt_vec_t *v = (vt_vec_t *)s->managed;
+    size_t n = 0;
+    for (size_t i = 0; i < v->size; i++) {
+        _managed_t *m = vt_vec_at(v, i);
+        if (m->pid > 0 && kill(m->pid, 0) == 0) { n++; continue; }
+        /* direct child reaped, but the process group may still hold the
+         * actual component (sh -c wrappers fork) */
+        if (m->pgid > 0 && kill(-m->pgid, 0) == 0) { n++; continue; }
+    }
+    return n;
 }

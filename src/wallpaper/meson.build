@@ -1,4 +1,4 @@
-src_wallpaper = ['vt-wallpaper.c']
+src_wallpaper = ['vt-wallpaper.c', 'vt-image.c']
 
 wallpaper_deps = [vantage_core_dep, vantage_renderer_dep]
 wallpaper_cargs = []
@@ -8,6 +8,14 @@ if get_option('video-wallpaper').auto() and dep_libavcodec.found() and dep_libav
   wallpaper_cargs += ['-DVT_HAVE_FFMPEG']
 endif
 
+if dep_libpng.found()
+  wallpaper_deps += [dep_libpng]
+  wallpaper_cargs += ['-DVT_HAVE_PNG']
+endif
+if dep_libjpeg.found()
+  wallpaper_deps += [dep_libjpeg]
+  wallpaper_cargs += ['-DVT_HAVE_JPEG']
+endif
 if dep_gdkpixbuf.found()
   wallpaper_deps += [dep_gdkpixbuf]
   wallpaper_cargs += ['-DVT_HAVE_GDKPIXBUF']

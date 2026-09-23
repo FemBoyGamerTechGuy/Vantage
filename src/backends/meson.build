@@ -4,24 +4,51 @@ src_backends = ['vt-backend.c', 'vt-backend-x11.c', 'vt-backend-wayland.c',
 backend_deps = [vantage_core_dep]
 backend_cargs = []
 
-if dep_xcb.found()
-  src_backends += []  # already in the list
-  backend_deps += [dep_xcb]
-  backend_cargs += ['-DVT_HAVE_XCB']
-  if dep_xcb_randr.found()
-    backend_deps += [dep_xcb_randr]
-    backend_cargs += ['-DVT_HAVE_XCB_RANDR']
+if dep_x11.found()
+  backend_deps += [dep_x11]
+  backend_cargs += ['-DVT_HAVE_X11']
+  if dep_xrandr.found()
+    backend_deps += [dep_xrandr]
+    backend_cargs += ['-DVT_HAVE_XRANDR']
+  endif
+  if dep_xi.found()
+    backend_deps += [dep_xi]
+    backend_cargs += ['-DVT_HAVE_XINPUT']
   endif
 endif
 
-if dep_wayland_client.found()
-  backend_deps += [dep_wayland_client]
+# Wayland compositor backend + generated xdg-shell protocol code
+wl_protocols_dir = dep_wayland_protocols.get_variable(
+  pkgconfig: 'pkgdatadir',
+  default_value: dep_wayland_protocols.get_variable(
+    pkgconfig: 'wayland_protocols_path', default_value: '/usr/share/wayland-protocols'))
+xdg_shell_xml = join_paths(wl_protocols_dir, 'stable', 'xdg-shell', 'xdg-shell.xml')
+
+if dep_wayland_server.found() and dep_wayland_client.found() and \
+   prog_wl_scanner.found() and run_command('test', '-f', xdg_shell_xml, check: false).returncode() == 0
+  xdg_shell_proto_h = custom_target('xdg-shell-protocol.h',
+    input: xdg_shell_xml,
+    output: 'xdg-shell-protocol.h',
+    command: [prog_wl_scanner, 'server-header', '@INPUT@', '@OUTPUT@'])
+  xdg_shell_proto_c = custom_target('xdg-shell-protocol.c',
+    input: xdg_shell_xml,
+    output: 'xdg-shell-protocol.c',
+    command: [prog_wl_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
+  backend_deps += [dep_wayland_client, dep_wayland_server, dep_xkbcommon]
   backend_cargs += ['-DVT_HAVE_WAYLAND']
+  lib_vantage_backends_extra_sources = [xdg_shell_proto_c, xdg_shell_proto_h]
+else
+  lib_vantage_backends_extra_sources = []
+  if dep_wayland_client.found()
+    backend_deps += [dep_wayland_client]
+    backend_cargs += ['-DVT_HAVE_WAYLAND']
+  endif
 endif
 
 lib_vantage_backends = static_library('vantage-backends',
-  sources : src_backends,
-  include_directories : vantage_includes,
+  sources : src_backends + lib_vantage_backends_extra_sources,
+  include_directories : [vantage_includes, include_directories('.')],
   dependencies : backend_deps,
   c_args : backend_cargs,
   pic : true,
@@ -29,6 +56,6 @@ lib_vantage_backends = static_library('vantage-backends',
 
 vantage_backends_dep = declare_dependency(
   link_with : lib_vantage_backends,
-  include_directories : vantage_includes,
-  dependencies : backend_deps,
+  include_directories : [vantage_includes, include_directories('.')],
+  dependencies : [vantage_core_dep, backend_deps],
 )

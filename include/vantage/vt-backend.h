@@ -59,6 +59,7 @@ typedef struct vt_backend {
     void  *priv;
     vt_vec_t outputs;       /* vt_output_t */
     vt_vec_t inputs;        /* vt_input_dev_t */
+    vt_vec_t sinks;         /* event sinks: _vt_event_sink_t */
     int      (*init)(struct vt_backend *self);
     void     (*fini)(struct vt_backend *self);
     int      (*dispatch)(struct vt_backend *self, int timeout_ms);
@@ -72,6 +73,17 @@ typedef struct vt_backend {
     void    *(*get_user_data)(struct vt_backend *self);
 } vt_backend_t;
 
+/* Native event sink: receives backend-native events (XEvent* on X11,
+ * wl_event loop dispatch on Wayland). Lets the WM/compositor layers hook
+ * into the backend's event stream without owning the connection. */
+typedef void (*vt_backend_event_fn)(void *ud, void *event);
+
+typedef struct {
+    int                  id;
+    vt_backend_event_fn  fn;
+    void                *ud;
+} vt_backend_sink_t;
+
 vt_backend_t *vt_backend_new(vt_backend_kind_t preferred);
 void          vt_backend_free(vt_backend_t *b);
 int           vt_backend_init(vt_backend_t *b);
@@ -84,6 +96,15 @@ int           vt_backend_output_apply(vt_backend_t *b, size_t i,
 const char   *vt_backend_name(const vt_backend_t *b);
 const char   *vt_backend_kind_str(vt_backend_kind_t k);
 vt_backend_kind_t vt_backend_kind_from_str(const char *s);
+
+/* Event sink registration. Returns sink id >= 0, or -VT_ERR_INVAL. */
+int           vt_backend_add_event_sink(vt_backend_t *b,
+                                        vt_backend_event_fn fn, void *ud);
+int           vt_backend_remove_event_sink(vt_backend_t *b, int sink_id);
+void          vt_backend_emit_event(vt_backend_t *b, void *event);
+
+/* Native handle accessor (Display* for X11 backends). NULL otherwise. */
+void         *vt_backend_native(const vt_backend_t *b);
 
 #ifdef __cplusplus
 }

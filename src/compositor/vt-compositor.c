@@ -56,8 +56,14 @@ void vt_compositor_free(vt_compositor_t *c) {
 }
 
 int vt_compositor_start(vt_compositor_t *c) {
-    if (!c || !c->renderer || !c->backend) return VT_ERR_INVAL;
+    if (!c || !c->backend) return VT_ERR_INVAL;
     if (c->running) return VT_OK;
+    if (vt_compositor_x11_active(c)) {
+        c->running = true;
+        c->frame_us = vt_time_now_us();
+        return VT_OK;
+    }
+    if (!c->renderer) return VT_ERR_INVAL;
     if (!c->renderer->initialized && vt_renderer_init(c->renderer) < 0) {
         vt_loge("compositor: renderer init failed");
         return VT_ERR;
@@ -69,6 +75,7 @@ int vt_compositor_start(vt_compositor_t *c) {
 
 void vt_compositor_stop(vt_compositor_t *c) {
     if (!c) return;
+    if (vt_compositor_x11_active(c)) vt_compositor_x11_stop();
     c->running = false;
 }
 
@@ -129,6 +136,13 @@ static int _rect_intersect(vt_rect_t a, vt_rect_t b) {
 
 int vt_compositor_step(vt_compositor_t *c, int timeout_ms) {
     if (!c || !c->running) return VT_ERR;
+    /* X11 composite engine drives its own damage/paint pipeline */
+    if (vt_compositor_x11_active(c)) {
+        if (c->backend && c->backend->dispatch)
+            c->backend->dispatch(c->backend, timeout_ms);
+        vt_compositor_x11_step();
+        return VT_OK;
+    }
     /* 1. Dispatch backend events */
     if (c->backend && c->backend->dispatch) {
         int r = c->backend->dispatch(c->backend, timeout_ms);

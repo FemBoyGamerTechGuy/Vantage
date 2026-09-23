@@ -61,3 +61,9 @@ executable('vantage-diagnostics',
   dependencies : tool_deps,
   install : true,
 )
+
+executable('vantage-remote',
+  sources : 'vantage-remote.c',
+  dependencies : tool_deps,
+  install : true,
+)

@@ -111,6 +111,29 @@ char    *vt_strreplace(const char *src, const char *needle, const char *with);
 char    *vt_strescape(const char *src);
 void     vt_strv_free(char **v, size_t n);
 
+/* --------------------------------------------------- string builder */
+typedef struct {
+    char   *buf;
+    size_t  len;
+    size_t  cap;
+} vt_strbuilder_t;
+
+void  vt_strbuilder_init(vt_strbuilder_t *sb, size_t cap);
+void  vt_strbuilder_append(vt_strbuilder_t *sb, const char *s);
+void  vt_strbuilder_appendf(vt_strbuilder_t *sb, const char *fmt, ...)
+      __attribute__((format(printf, 2, 3)));
+void  vt_strbuilder_append_n(vt_strbuilder_t *sb, const char *s, size_t n);
+void  vt_strbuilder_reset(vt_strbuilder_t *sb);
+/* Finish: detaches the buffer (caller owns) and returns it. */
+char *vt_strbuilder_finish(vt_strbuilder_t *sb, size_t *out_len);
+void  vt_strbuilder_fini(vt_strbuilder_t *sb);
+
+/* --------------------------------------------------- process utils */
+/* Spawn `cmdline` via /bin/sh -c, detached from our process group. */
+bool  vt_proc_spawn_detached(const char *cmdline);
+/* True when `name` is an executable found in $PATH. */
+bool  vt_proc_find_in_path(const char *name);
+
 /* --------------------------------------------------- integers */
 bool     vt_parse_int(const char *s, long *out);
 bool     vt_parse_uint(const char *s, unsigned long *out);
