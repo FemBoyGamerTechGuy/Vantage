@@ -1,0 +1,19 @@
+#!/usr/bin/make -f
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	meson setup build --prefix=/usr --buildtype=plain \
+		--libdir=/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)
+
+override_dh_auto_build:
+	ninja -C build
+
+override_dh_auto_test:
+	meson test -C build
+
+override_dh_auto_install:
+	DESTDIR=$(CURDIR)/debian/tmp ninja -C build install

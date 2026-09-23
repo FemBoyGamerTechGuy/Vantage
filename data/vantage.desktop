@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=XSession
+Name=Vantage
+Comment=Lightweight raw-C desktop environment
+Comment[en]=Lightweight raw-C desktop environment
+Exec=vantage-session
+TryExec=vantage-session
+Icon=
+DesktopNames=Vantage;

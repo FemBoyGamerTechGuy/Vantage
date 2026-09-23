@@ -1,0 +1,10 @@
+builddir/
+build/
+*.o
+*.a
+*.so
+*.so.*
+*.p/
+meson-logs/
+subprojects/
+.cache/

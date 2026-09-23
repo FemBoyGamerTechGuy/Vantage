@@ -1,0 +1,45 @@
+Source: vantage
+Section: x11
+Priority: optional
+Maintainer: Vantage Desktop Project <vantage@example.org>
+Build-Depends: meson, ninja-build, gcc, pkg-config,
+ libxcb1-dev, libxcb-randr0-dev, libxcb-ewmh-dev, libxcb-icccm-dev,
+ libxkbcommon-dev, libxkbcommon-x11-dev,
+ libwayland-dev, libwayland-protocols,
+ libegl-dev, libgl-dev, libgles2-mesa-dev,
+ libgbm-dev, libdrm-dev, libudev-dev,
+ libjson-c-dev, libgdk-pixbuf2.0-dev, libpng-dev, libjpeg-dev,
+ libavcodec-dev, libavformat-dev, libavutil-dev, libswscale-dev,
+ libpipewire-0.3-dev, libpulse-dev, libasound2-dev,
+ libnm-dev, libupower-glib-dev,
+ libdbus-1-dev, libsystemd-dev
+Standards-Version: 4.6.0
+Homepage: https://github.com/FemBoyGamerTechGuy/Vantage
+
+Package: vantage
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends},
+ vantage-core (= ${binary:Version})
+Description: Lightweight raw-C desktop environment
+ Vantage is a lightweight Linux desktop environment written primarily in C,
+ inspired by XFCE but implemented from scratch. It supports native Wayland,
+ Xorg, and XLibre backends, hardware-accelerated rendering (NVIDIA/AMD/Intel),
+ live video wallpapers, cross-toolkit Qt6/GTK theming, and runs without D-Bus
+ or systemd if they are not available.
+ .
+ This package contains the desktop session binaries.
+
+Package: vantage-core
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Core libraries for Vantage
+ Internal libraries used by Vantage: vt-core, vt-config, vt-ipc, vt-renderer,
+ vt-gpu, vt-backends, vt-compositor, vt-wm, vt-input, vt-session, vt-theme,
+ vt-wallpaper, vt-desktop, vt-panel, vt-settings, vt-integrations.
+
+Package: vantage-dev
+Architecture: any
+Depends: vantage-core (= ${binary:Version}),
+ ${misc:Depends}
+Description: Development files for Vantage
+ Headers and pkg-config files for plugin development.

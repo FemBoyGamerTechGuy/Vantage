@@ -1,0 +1,14 @@
+{
+  "name": "Vantage-Light",
+  "dark": false,
+  "accent": "#2563eb",
+  "bg": "#f5f5f5",
+  "fg": "#1e1e2e",
+  "surface": "#ffffff",
+  "border": "#cccccc",
+  "radius": 8,
+  "spacing": 8,
+  "font_family": "Sans",
+  "font_size_pt": 11,
+  "icon_theme": "Adwaita"
+}

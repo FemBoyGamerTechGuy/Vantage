@@ -1,0 +1,59 @@
+# Maintainer: Vantage Desktop Project
+pkgname=vantage
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Lightweight raw-C desktop environment — Wayland + Xorg + XLibre, cross-toolkit Qt6/GTK theming, live video wallpapers"
+arch=('x86_64' 'aarch64')
+url="https://github.com/FemBoyGamerTechGuy/Vantage"
+license=('GPL-2.0-or-later')
+depends=(
+  'glibc'
+)
+makedepends=(
+  'meson' 'ninja' 'gcc' 'pkg-config'
+)
+optdepends=(
+  'libxcb: X11 backend'
+  'libxcb-randr: multi-monitor'
+  'libxkbcommon: keyboard layouts'
+  'wayland: Wayland backend'
+  'libglvnd: OpenGL/EGL'
+  'mesa: OpenGL/EGL/GBM'
+  'vulkan-driver: Vulkan renderer (optional)'
+  'libdrm: GPU detection'
+  'json-c: theme JSON parser'
+  'gdk-pixbuf2: image wallpaper'
+  'libpng: PNG wallpaper'
+  'libjpeg-turbo: JPEG wallpaper'
+  'ffmpeg: video wallpaper'
+  'pipewire: audio (preferred)'
+  'libpulse: audio (alternative)'
+  'alsa-lib: audio (fallback)'
+  'networkmanager: network status'
+  'upower: power + battery'
+  'libsystemd: power via logind (systemd)'
+  'libelogind: power via logind (systemd-free)'
+  'dbus: optional D-Bus integration'
+)
+provides=("vantage=$pkgver")
+conflicts=('vantage')
+source=("git+https://github.com/FemBoyGamerTechGuy/Vantage.git")
+sha256sums=('SKIP')
+
+build() {
+  cd "$srcdir/Vantage"
+  meson setup build --prefix=/usr --buildtype=release
+  ninja -C build
+}
+
+check() {
+  cd "$srcdir/Vantage"
+  meson test -C build
+}
+
+package() {
+  cd "$srcdir/Vantage"
+  DESTDIR="$pkgdir" ninja -C build install
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

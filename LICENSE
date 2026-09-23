@@ -1,0 +1,32 @@
+                    GNU GENERAL PUBLIC LICENSE
+                       Version 2, June 1991
+
+ Copyright (C) 1989, 1991 Free Software Foundation, Inc.
+ 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
+
+ Everyone is permitted to copy and distribute verbatim copies
+ of this license document, but changing it is not allowed.
+
+                            Preamble
+
+  The licenses for most software are designed to take away your
+freedom to share and change it.  By contrast, the GNU General Public
+License is intended to guarantee your freedom to share and change free
+software--to make sure the software is free for all its users.
+
+(This is a brief summary of the GNU GPL v2 — the full text is
+available at https://www.gnu.org/licenses/gpl-2.0.html)
+
+Vantage is licensed under the GNU General Public License v2 or, at
+your option, any later version. You may redistribute and/or modify
+Vantage under the terms of the GPL.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+For the full text of the license, see:
+https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt
+
+SPDX-License-Identifier: GPL-2.0-or-later

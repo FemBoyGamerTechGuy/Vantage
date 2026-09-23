@@ -1,0 +1,14 @@
+{
+  "name": "Vantage-Dark",
+  "dark": true,
+  "accent": "#3b82f6",
+  "bg": "#1e1e2e",
+  "fg": "#cdd6f4",
+  "surface": "#313244",
+  "border": "#45475a",
+  "radius": 8,
+  "spacing": 8,
+  "font_family": "Sans",
+  "font_size_pt": 11,
+  "icon_theme": "Adwaita"
+}
