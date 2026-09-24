@@ -136,8 +136,12 @@ int vt_ipc_decode(const uint8_t *buf, size_t n, vt_ipc_msg_t *out) {
     if (out->len > 1024 * 1024) return VT_IPC_E_TRUNC;
     if (out->len > n - 16) return VT_IPC_E_TRUNC;
     if (out->len) {
-        out->payload = vt_malloc(out->len);
+        /* NUL-sentinel (not counted in len): handlers may treat the
+         * payload as a C string — without this, parsers run off the
+         * end of the heap chunk (undefined behaviour). */
+        out->payload = vt_malloc(out->len + 1);
         memcpy(out->payload, buf + 16, out->len);
+        out->payload[out->len] = 0;
     } else {
         out->payload = NULL;
     }
@@ -287,11 +291,12 @@ int vt_ipc_call(vt_ipc_t *ipc, uint32_t msg_id,
     int rc = _parse_hdr(hdr, &m);
     if (rc != VT_IPC_OK) return rc;
     if (m.len) {
-        m.payload = vt_malloc(m.len);
+        m.payload = vt_malloc(m.len + 1);
         if (_recv_all(ipc->fd, m.payload, m.len) != (ssize_t)m.len) {
             vt_free(m.payload);
             return VT_IPC_E_TRUNC;
         }
+        m.payload[m.len] = 0;   /* NUL sentinel for string parsers */
     }
     if (resp) *resp = m;
     else vt_free(m.payload);
@@ -339,15 +344,19 @@ static int _serve_client(vt_ipc_t *ipc, _client_t *c) {
             return VT_IPC_E_TRUNC;
     }
     vt_ipc_msg_t m;
-    int rc = vt_ipc_decode(hdr, 16, &m);
+    /* header-only parse: the payload is received separately below —
+     * vt_ipc_decode() would reject any len > 0 when given only the
+     * 16-byte header (out->len > n - 16). */
+    int rc = _parse_hdr(hdr, &m);
     if (rc != VT_IPC_OK) { vt_loge("ipc: decode failed rc=%d", rc); return rc; }
     if (m.len) {
-        m.payload = vt_malloc(m.len);
+        m.payload = vt_malloc(m.len + 1);
         if (_recv_all(c->fd, m.payload, m.len) != (ssize_t)m.len) {
             vt_free(m.payload);
             vt_loge("ipc: payload trunc");
             return VT_IPC_E_TRUNC;
         }
+        m.payload[m.len] = 0;   /* NUL sentinel for string parsers */
     }
     vt_logd("ipc: msg id=0x%x len=%u", m.id, m.len);
     if (m.id == VT_IPC_MSG_SUBSCRIBE) {
@@ -412,11 +421,12 @@ int vt_ipc_step(vt_ipc_t *ipc, int timeout_ms) {
         int rc = _parse_hdr(hdr, &m);
         if (rc != VT_IPC_OK) return rc;
         if (m.len) {
-            m.payload = vt_malloc(m.len);
+            m.payload = vt_malloc(m.len + 1);
             if (_recv_all(ipc->fd, m.payload, m.len) != (ssize_t)m.len) {
                 vt_free(m.payload);
                 return VT_IPC_E_TRUNC;
             }
+            m.payload[m.len] = 0;   /* NUL sentinel for string parsers */
         }
         vt_ipc_msg_t resp = {0};
         void *ud = NULL;

@@ -220,11 +220,14 @@ void vt_x11_set_net_supported(Window root, const Atom *list, size_t n) {
 }
 
 void vt_x11_set_net_wm_check(Window root, Window wmwin) {
+    /* EWMH: _NET_SUPPORTING_WM_CHECK is of type WINDOW (32-bit xid).
+     * (Written via CARDINAL-compatible 32-bit format, but the type atom
+     * must be XA_WINDOW for spec-conformant readers.) */
     XChangeProperty(_st->dpy, root, _atoms.net_supporting_wm_check,
-                    _atoms.cardinal, 32, PropModeReplace,
+                    XA_WINDOW, 32, PropModeReplace,
                     (const unsigned char *)&wmwin, 1);
     XChangeProperty(_st->dpy, wmwin, _atoms.net_supporting_wm_check,
-                    _atoms.cardinal, 32, PropModeReplace,
+                    XA_WINDOW, 32, PropModeReplace,
                     (const unsigned char *)&wmwin, 1);
     vt_x11_set_utf8_property(wmwin, _atoms.net_wm_name, "Vantage");
 }

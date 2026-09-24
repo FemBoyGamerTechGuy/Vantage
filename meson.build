@@ -24,6 +24,16 @@ vt_includedir    = join_paths(vt_prefix, get_option('includedir'), 'vantage-' + 
 vt_bindir        = join_paths(vt_prefix, get_option('bindir'))
 vt_xdg_autostart = join_paths(vt_prefix, get_option('datadir'), 'xsessions')
 
+# Optional extra RUNPATH baked into INSTALLED executables, for
+# user-prefix builds where runtime libraries live outside the system
+# paths (e.g. distro-in-a-sandbox with dev packages extracted into a
+# private prefix). Configure with:
+#   VT_EXTRA_RPATH=/path/to/libs meson setup build ...
+# When unset this is an empty string and installed binaries get no
+# extra rpath (the normal distro case: libraries live in system dirs).
+vt_extra_rpath = run_command('printenv', 'VT_EXTRA_RPATH',
+                             check : false).stdout().strip()
+
 add_project_arguments([
   '-D_GNU_SOURCE',
   '-DVT_COMPILATION',

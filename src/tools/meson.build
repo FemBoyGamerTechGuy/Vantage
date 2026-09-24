@@ -12,58 +12,68 @@ executable('vantage-session',
   sources : 'vantage-session.c',
   dependencies : tool_deps,
   install : true,
+  install_rpath : vt_extra_rpath,
 )
 
 executable('vantage-wm',
   sources : 'vantage-wm.c',
   dependencies : tool_deps,
   install : true,
+  install_rpath : vt_extra_rpath,
 )
 
 executable('vantage-panel',
   sources : 'vantage-panel.c',
   dependencies : tool_deps,
   install : true,
+  install_rpath : vt_extra_rpath,
 )
 
 executable('vantage-desktop',
   sources : 'vantage-desktop.c',
   dependencies : tool_deps,
   install : true,
+  install_rpath : vt_extra_rpath,
 )
 
 executable('vantage-settings',
   sources : 'vantage-settings.c',
   dependencies : tool_deps,
   install : true,
+  install_rpath : vt_extra_rpath,
 )
 
 executable('vantage-config',
   sources : 'vantage-config.c',
   dependencies : tool_deps,
   install : true,
+  install_rpath : vt_extra_rpath,
 )
 
 executable('vantage-renderer',
   sources : 'vantage-renderer.c',
   dependencies : tool_deps,
   install : true,
+  install_rpath : vt_extra_rpath,
 )
 
 executable('vantage-theme',
   sources : 'vantage-theme.c',
   dependencies : tool_deps,
   install : true,
+  install_rpath : vt_extra_rpath,
 )
 
 executable('vantage-diagnostics',
   sources : 'vantage-diagnostics.c',
   dependencies : tool_deps,
   install : true,
+  install_rpath : vt_extra_rpath,
 )
 
 executable('vantage-remote',
   sources : 'vantage-remote.c',
   dependencies : tool_deps,
   install : true,
+  install_rpath : vt_extra_rpath,
 )

@@ -17,7 +17,7 @@
 #define VT_LOG_DOMAIN "renderer-gl"
 #include <vantage/vt-renderer.h>
 
-#if defined(VT_HAVE_OPENGL) && defined(VT_HAVE_EGL)
+#if (defined(VT_HAVE_OPENGL) || defined(VT_HAVE_GLESV2)) && defined(VT_HAVE_EGL)
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -124,6 +124,44 @@ static bool _gl_probe(vt_renderer_caps_t *caps) {
         eglTerminate(dpy);
         return false;
     }
+    /* GL strings require a current context: create a throwaway pbuffer
+     * so the probe reports the real renderer (llvmpipe / NVIR / iris /
+     * radeonsi ...), GL version and GLSL version instead of "egl"/"?" */
+    eglBindAPI(
+#if defined(VT_HAVE_GLESV2)
+        EGL_OPENGL_ES_API
+#else
+        EGL_OPENGL_API
+#endif
+    );
+    EGLint const cfg_attr[] = {
+        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+        EGL_RENDERABLE_TYPE,
+#if defined(VT_HAVE_GLESV2)
+        EGL_OPENGL_ES2_BIT,
+#else
+        EGL_OPENGL_BIT,
+#endif
+        EGL_NONE,
+    };
+    EGLConfig cfg = NULL;
+    EGLint n = 0;
+    EGLSurface pbuf = EGL_NO_SURFACE;
+    EGLContext ctx = EGL_NO_CONTEXT;
+    if (eglChooseConfig(dpy, cfg_attr, &cfg, 1, &n) && n >= 1) {
+        EGLint const pb_attr[] = { EGL_WIDTH, 4, EGL_HEIGHT, 4, EGL_NONE };
+        pbuf = eglCreatePbufferSurface(dpy, cfg, pb_attr);
+        EGLint const ctx_attr[] = {
+#if defined(VT_HAVE_GLESV2)
+            EGL_CONTEXT_CLIENT_VERSION, 2,
+#endif
+            EGL_NONE,
+        };
+        ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, ctx_attr);
+        if (pbuf != EGL_NO_SURFACE && ctx != EGL_NO_CONTEXT)
+            eglMakeCurrent(dpy, pbuf, pbuf, ctx);
+    }
     if (caps) {
         memset(caps, 0, sizeof(*caps));
         caps->hw_accel = true;
@@ -137,12 +175,12 @@ static bool _gl_probe(vt_renderer_caps_t *caps) {
         const char *glver = (const char *)glGetString(GL_VERSION);
         const char *glslver = (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
         snprintf(caps->vendor, sizeof(caps->vendor), "%s", v ? v : "?");
-        snprintf(caps->version, sizeof(caps->version), "%s", r ? r : "?");
+        snprintf(caps->version, sizeof(caps->version), "%s", glver ? glver : (r ? r : "?"));
         snprintf(caps->renderer, sizeof(caps->renderer), "%s", renderer ? renderer : "egl");
         snprintf(caps->glsl_version, sizeof(caps->glsl_version), "%s", glslver ? glslver : "?");
-        caps->egl = true; /* field only present in renderer caps struct via caps->egl — kept for probe */
-        (void)glver;
     }
+    if (pbuf != EGL_NO_SURFACE) eglDestroySurface(dpy, pbuf);
+    if (ctx != EGL_NO_CONTEXT) eglDestroyContext(dpy, ctx);
     eglTerminate(dpy);
     return true;
 }

@@ -66,6 +66,20 @@ int vt_diag_run(vt_diag_t *d) {
     d->egl_version = vt_strdup(r->caps.version);
     d->vsync = r->caps.vsync;
     d->video_decode = false;  /* would need ffmpeg probe */
+    /* The renderer probe is authoritative for EGL: if the GL renderer
+     * initialized an EGL display + context, EGL is available even when
+     * no /dev/dri node exists (e.g. NVIDIA proprietary on X11 without
+     * nvidia-drm modeset). Hardware accel additionally requires that the
+     * rasterizer is not a CPU fallback (llvmpipe/softpipe/swrast). */
+    if (r->kind == VT_RENDERER_GL && r->caps.hw_accel) {
+        d->egl = true;
+        const char *rr = r->caps.renderer;
+        bool software_gl = strstr(rr, "llvmpipe") || strstr(rr, "softpipe") ||
+                           strstr(rr, "swrast")  || strstr(rr, "Software") ||
+                           strstr(rr, "software");
+        if (!software_gl)
+            d->hw_accel = true;
+    }
 #if defined(VT_HAVE_FFMPEG)
     d->video_decoder = vt_strdup("ffmpeg");
     d->video_decode = true;

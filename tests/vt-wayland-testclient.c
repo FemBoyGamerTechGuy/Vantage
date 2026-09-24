@@ -86,6 +86,7 @@ int main(int argc, char **argv) {
     struct wl_display *d = wl_display_connect(NULL);
     if (!d) { fprintf(stderr, "cannot connect to wayland display\n"); return 1; }
     printf("connected\n");
+    fflush(stdout);
 
     struct wl_registry *reg = wl_display_get_registry(d);
     wl_registry_add_listener(reg, &_registry_listener, NULL);
@@ -108,6 +109,7 @@ int main(int argc, char **argv) {
     /* wait for the initial configure */
     while (!configured) wl_display_roundtrip(d);
     printf("configured\n");
+    fflush(stdout);
 
     /* shm buffer with a solid color */
     size_t stride = (size_t)width * 4;
@@ -127,6 +129,7 @@ int main(int argc, char **argv) {
     wl_surface_commit(surf);
     wl_display_roundtrip(d);
     printf("committed %dx%d\n", width, height);
+    fflush(stdout);   /* harness polls this line while we are alive */
 
     sleep(2);   /* let the compositor paint + dump (SIGUSR1 from harness) */
     (void)have_globals;

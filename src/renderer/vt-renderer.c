@@ -17,7 +17,7 @@
 /* Software renderer (always compiled) */
 extern const vt_renderer_ops_t vt_renderer_sw_ops;
 
-#if defined(VT_HAVE_OPENGL) && defined(VT_HAVE_EGL)
+#if (defined(VT_HAVE_OPENGL) || defined(VT_HAVE_GLESV2)) && defined(VT_HAVE_EGL)
 extern const vt_renderer_ops_t vt_renderer_gl_ops;
 #endif
 
@@ -26,7 +26,7 @@ extern const vt_renderer_ops_t vt_renderer_vulkan_ops;
 #endif
 
 static const vt_renderer_ops_t *const _renderers[] = {
-#if defined(VT_HAVE_OPENGL) && defined(VT_HAVE_EGL)
+#if (defined(VT_HAVE_OPENGL) || defined(VT_HAVE_GLESV2)) && defined(VT_HAVE_EGL)
     &vt_renderer_gl_ops,
 #endif
 #if defined(VT_HAVE_VULKAN)
@@ -44,7 +44,7 @@ vt_renderer_t *vt_renderer_new(vt_renderer_kind_t preferred) {
         if (preferred != VT_RENDERER_AUTO) {
             vt_renderer_kind_t k = VT_RENDERER_AUTO;
             if (ops == &vt_renderer_sw_ops) k = VT_RENDERER_SW;
-#if defined(VT_HAVE_OPENGL) && defined(VT_HAVE_EGL)
+#if (defined(VT_HAVE_OPENGL) || defined(VT_HAVE_GLESV2)) && defined(VT_HAVE_EGL)
             else if (ops == &vt_renderer_gl_ops) k = VT_RENDERER_GL;
 #endif
             if (k != preferred) continue;
@@ -54,7 +54,7 @@ vt_renderer_t *vt_renderer_new(vt_renderer_kind_t preferred) {
         vt_renderer_t *r = vt_malloc0(sizeof(*r));
         r->ops = ops;
         r->kind = (ops == &vt_renderer_sw_ops) ? VT_RENDERER_SW :
-#if defined(VT_HAVE_OPENGL) && defined(VT_HAVE_EGL)
+#if (defined(VT_HAVE_OPENGL) || defined(VT_HAVE_GLESV2)) && defined(VT_HAVE_EGL)
                   (ops == &vt_renderer_gl_ops) ? VT_RENDERER_GL :
 #endif
 #if defined(VT_HAVE_VULKAN)
@@ -99,7 +99,7 @@ bool vt_renderer_probe(vt_renderer_kind_t kind, vt_renderer_caps_t *out) {
     for (size_t i = 0; i < _renderers_n; i++) {
         const vt_renderer_ops_t *ops = _renderers[i];
         vt_renderer_kind_t k = (ops == &vt_renderer_sw_ops) ? VT_RENDERER_SW :
-#if defined(VT_HAVE_OPENGL) && defined(VT_HAVE_EGL)
+#if (defined(VT_HAVE_OPENGL) || defined(VT_HAVE_GLESV2)) && defined(VT_HAVE_EGL)
                               (ops == &vt_renderer_gl_ops) ? VT_RENDERER_GL :
 #endif
 #if defined(VT_HAVE_VULKAN)

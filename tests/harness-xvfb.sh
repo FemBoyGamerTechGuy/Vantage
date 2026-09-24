@@ -1,0 +1,237 @@
+#!/bin/bash
+# harness-xvfb.sh — Vantage full-session integration harness (Xorg path)
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Boots the REAL session stack on a fresh Xvfb display:
+#
+#   Xvfb :N  →  vantage-session
+#                 ├─ vantage-wm       (EWMH/ICCCM WM + XRender compositor)
+#                 ├─ vantage-panel    (dock with struts)
+#                 └─ vantage-desktop  (root desktop window)
+#
+# Verifications:
+#   1. session reaches "ready" stage
+#   2. EWMH _NET_SUPPORTING_WM_CHECK → _NET_WM_NAME == "Vantage"
+#   3. vt-x11-testclient maps two windows; vantage-remote lists them
+#   4. IPC window management works (focus + close via vantage-remote)
+#   5. root screenshot contains the test windows' known colors
+#   6. session shuts down cleanly on SIGTERM (all children exit)
+#
+# Usage: harness-xvfb.sh [build-dir]     (default: $VT_BUILD_DIR or PATH)
+
+set -u
+PASS=0; FAIL=0
+ok()  { echo "  PASS: $1"; PASS=$((PASS+1)); }
+bad() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
+
+# ---------------------------------------------------------------- paths
+BUILD="${1:-${VT_BUILD_DIR:-}}"
+if [ -n "$BUILD" ] && [ -x "$BUILD/src/tools/vantage-session" ]; then
+  BIN="$BUILD/src/tools"
+  TST="$BUILD/tests"
+  export PATH="$BIN:$PATH"      # session spawns components via PATH
+else
+  BIN=""; TST=""
+  for b in vantage-session vantage-wm vantage-panel vantage-desktop vantage-remote; do
+    command -v "$b" >/dev/null 2>&1 || { echo "missing $b in PATH"; exit 77; }
+  done
+fi
+vb() { if [ -n "$BIN" ]; then echo "$BIN/$1"; else echo "$1"; fi; }
+tc() { if [ -n "$TST" ]; then echo "$TST/$1"; else echo "$1"; fi; }
+
+command -v Xvfb >/dev/null 2>&1 || { echo "Xvfb not found"; exit 77; }
+[ -x "$(tc vt-x11-testclient)" ] || { echo "vt-x11-testclient not built"; exit 77; }
+
+# --------------------------------------------------------- isolated env
+WORK=$(mktemp -d /tmp/vantage-xvfb.XXXXXX)
+mkdir -p "$WORK/run" "$WORK/config/vantage" "$WORK/share"
+export XDG_RUNTIME_DIR="$WORK/run"
+export XDG_CONFIG_HOME="$WORK/config"
+export XDG_DATA_HOME="$WORK/share"        # isolate XDG autostart
+export XDG_CONFIG_DIRS=""
+chmod 700 "$XDG_RUNTIME_DIR"
+
+# Force the X11/Xorg code path (auto would pick the Wayland headless
+# compositor first — see vt_backend_new() probe order)
+cat > "$XDG_CONFIG_HOME/vantage/vantage.conf" <<EOF
+[desktop]
+backend=xorg
+compositor=true
+[wm]
+focus-new=true
+[panel]
+enabled=true
+height=32
+EOF
+
+# ---------------------------------------------------------------- Xvfb
+export DISPLAY=":$$"        # unique display number per harness run
+XVFB_PID=""
+start_xvfb() {
+  Xvfb "$DISPLAY" -screen 0 1024x768x24 -nolisten tcp &
+  XVFB_PID=$!
+  for i in $(seq 1 50); do
+    if xdpyinfo >/dev/null 2>&1 || [ -S "/tmp/.X11-unix/X${DISPLAY#:}" ]; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+if ! command -v xdpyinfo >/dev/null 2>&1; then
+  # no xdpyinfo: wait for the socket file instead
+  start_xvfb() {
+    Xvfb "$DISPLAY" -screen 0 1024x768x24 -nolisten tcp &
+    XVFB_PID=$!
+    local sock="/tmp/.X11-unix/X${DISPLAY#:}"
+    for i in $(seq 1 50); do
+      [ -S "$sock" ] && return 0
+      sleep 0.1
+    done
+    return 1
+  }
+fi
+
+echo "== harness-xvfb: starting Xvfb on $DISPLAY =="
+if ! start_xvfb; then
+  echo "  FAIL: Xvfb did not start"; exit 1
+fi
+ok "Xvfb running (pid $XVFB_PID)"
+
+# ------------------------------------------------------------- session
+echo "== harness-xvfb: launching vantage-session =="
+"$(vb vantage-session)" > "$WORK/session.log" 2>&1 &
+SESS_PID=$!
+
+READY=""
+for i in $(seq 1 100); do
+  grep -q "session: ready" "$WORK/session.log" 2>/dev/null && { READY=1; break; }
+  kill -0 "$SESS_PID" 2>/dev/null || break
+  sleep 0.1
+done
+if [ -n "$READY" ]; then ok "session reached ready state"; else
+  bad "session never became ready"; tail -20 "$WORK/session.log"; fi
+
+sleep 1     # let the WM/panel/desktop settle and paint
+
+# ------------------------------------------------------------- checks
+echo "== harness-xvfb: EWMH WM identity =="
+EWMH_OUT=$("$(tc vt-x11-testclient)" --ewmh-probe 2>&1)
+echo "$EWMH_OUT" | grep -q "ewmh-wm-name=Vantage" \
+  && ok "EWMH WM is Vantage" || bad "EWMH probe: $EWMH_OUT"
+
+echo "== harness-xvfb: window management via IPC =="
+# Run the client in the background so the WM queries/IPC ops below happen
+# while its windows are still mapped (the client lives --seconds seconds).
+CLIENT_LOG="$WORK/client.log"
+rm -f "$CLIENT_LOG"
+"$(tc vt-x11-testclient)" --seconds 8 --title "Vantage Test" \
+  > "$CLIENT_LOG" 2>&1 &
+CLIENT_PID=$!
+
+# wait for the windows to be mapped (output is flushed per line)
+MAPPED=""
+for i in $(seq 1 100); do
+  grep -q "^mapped" "$CLIENT_LOG" 2>/dev/null && { MAPPED=1; break; }
+  kill -0 "$CLIENT_PID" 2>/dev/null || break
+  sleep 0.05
+done
+grep -q "^connected" "$CLIENT_LOG" && ok "test client connected to $DISPLAY"
+[ -n "$MAPPED" ] && ok "two windows mapped" || bad "test client never mapped windows"
+sleep 0.5     # let the WM manage + focus them
+
+WMLIST=$("$(vb vantage-remote)" list 2>&1)
+echo "$WMLIST" | grep -q "Vantage Test" && ok "vantage-remote lists managed window" \
+  || bad "vantage-remote list: $WMLIST"
+NWIN=$(echo "$WMLIST" | grep -c . )
+[ "${NWIN:-0}" -ge 2 ] && ok "WM tracks multiple windows ($NWIN)" \
+  || bad "expected >=2 managed windows, got ${NWIN:-0}"
+
+# focus + maximize + close the test window through IPC (while it is alive)
+WID=$(echo "$WMLIST" | grep "Vantage Test" | head -1 | cut -f1)
+if [ -n "$WID" ]; then
+  "$(vb vantage-remote)" focus "$WID" >/dev/null 2>&1 \
+    && ok "IPC focus works" || bad "IPC focus failed"
+  sleep 0.3
+  "$(vb vantage-remote)" maximize "$WID" >/dev/null 2>&1 \
+    && ok "IPC maximize works" || bad "IPC maximize failed"
+  sleep 0.3
+  "$(vb vantage-remote)" close "$WID" >/dev/null 2>&1 \
+    && ok "IPC close works" || bad "IPC close failed"
+  sleep 0.3
+  WMLIST2=$("$(vb vantage-remote)" list 2>&1)
+  echo "$WMLIST2" | grep -q "Vantage Test" \
+    && bad "closed window still listed" || ok "closed window removed from list"
+else
+  bad "no window id found for IPC ops"
+fi
+
+echo "== harness-xvfb: pixel verification =="
+# screenshot while the second test window is still alive
+"$(tc vt-x11-testclient)" --seconds 1 --screenshot "$WORK/shot.ppm" \
+  --title "Vantage Shot" > "$WORK/shot.log" 2>&1
+grep -q "screenshot" "$WORK/shot.log" || bad "no screenshot taken"
+wait "$CLIENT_PID" 2>/dev/null
+
+python3 - "$WORK/shot.ppm" <<'PYEOF'
+import sys
+p = sys.argv[1]
+with open(p, 'rb') as f:
+    data = f.read()
+# parse P6 header (whitespace/comment tolerant)
+i = data.find(b'P6')
+vals, pos = [], i + 2
+while len(vals) < 3:
+    while data[pos:pos+1].isspace(): pos += 1
+    if data[pos:pos+1] == b'#':
+        while data[pos:pos+1] not in (b'\n', b''): pos += 1
+        continue
+    j = pos
+    while not data[j:j+1].isspace(): j += 1
+    vals.append(int(data[pos:j])); pos = j
+pos += 1
+w, h, _ = vals
+pix = data[pos:pos + w*h*3]
+c1 = bytes((0x3a, 0x5f, 0x9a))   # test window 1
+c2 = bytes((0x9a, 0x3a, 0x5f))   # test window 2
+hits1 = pix.count(c1)
+hits2 = pix.count(c2)
+distinct = len(set(pix[i:i+3] for i in range(0, min(len(pix), w*3*40), 3)))
+print(f"pixels: {w}x{h}, window1={hits1}px, window2={hits2}px, distinct-colors(top40rows)={distinct}")
+sys.exit(0 if (hits1 > 500 and hits2 > 500 and distinct >= 3) else 1)
+PYEOF
+[ $? -eq 0 ] && ok "screenshot shows managed windows + painted desktop" \
+  || bad "screenshot pixel check failed"
+
+# ------------------------------------------------------------- shutdown
+echo "== harness-xvfb: clean shutdown =="
+kill -TERM "$SESS_PID" 2>/dev/null
+EXITED=""
+for i in $(seq 1 60); do
+  kill -0 "$SESS_PID" 2>/dev/null || { EXITED=1; break; }
+  sleep 0.1
+done
+[ -n "$EXITED" ] && ok "session exited on SIGTERM" || bad "session ignored SIGTERM"
+grep -q "session: exited" "$WORK/session.log" \
+  && ok "session logged clean exit" || bad "no clean-exit log line"
+kill -0 "$XVFB_PID" 2>/dev/null \
+  && ok "X server survived the session" || bad "X server died during session"
+
+# stragglers?
+sleep 0.3
+STRAGGLERS=$(pgrep -f "$(vb vantage-wm)|$(vb vantage-panel)|$(vb vantage-desktop)" 2>/dev/null | grep -v "^$" | wc -l)
+[ "${STRAGGLERS:-0}" -eq 0 ] && ok "no component stragglers left" \
+  || bad "$STRAGGLERS component process(es) survived shutdown"
+
+kill -TERM "$XVFB_PID" 2>/dev/null
+wait "$XVFB_PID" 2>/dev/null
+
+# ------------------------------------------------------------- summary
+echo
+echo "=========================================="
+echo "harness-xvfb: $PASS passed, $FAIL failed"
+echo "artifacts: $WORK"
+echo "=========================================="
+[ "$FAIL" -eq 0 ] || { echo "---- session.log ----"; cat "$WORK/session.log"; }
+[ "$FAIL" -eq 0 ]

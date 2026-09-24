@@ -584,7 +584,11 @@ static void _paint(void) {
         st->fb[i] = 0xff1a1a1a;
     /* surfaces bottom→top */
     _wl_surf_t *s;
+    int _dbg_count = 0;
     wl_list_for_each(s, &st->surfaces, link) {
+        _dbg_count++;
+        vt_logd("wayland: paint surface %dx%d at +%d+%d mapped=%d pixels=%p",
+                s->w, s->h, s->x, s->y, (int)s->mapped, (void *)s->pixels);
         if (!s->mapped || !s->pixels) continue;
         int x = s->x, y = s->y;
         for (int sy = 0; sy < s->h; sy++) {
