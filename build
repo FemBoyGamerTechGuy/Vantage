@@ -124,7 +124,10 @@ link_tree_binaries() {
             rm -f "$ROOT/$n"
         fi
     done
-    [ "$linked" -gt 0 ] && say "$linked repo-root launch symlinks (./vantage-session …)"
+    if [ "$linked" -gt 0 ]; then
+        say "$linked repo-root launch symlinks (./vantage-session …)"
+    fi
+    return 0
 }
 
 # ---------------------------------------------------------------- cmds
@@ -212,8 +215,9 @@ cmd_clean() {
     for n in vantage-session vantage-wm vantage-panel vantage-desktop \
              vantage-settings vantage-config vantage-renderer \
              vantage-theme vantage-diagnostics vantage-remote; do
-        [ -L "$ROOT/$n" ] && rm -f "$ROOT/$n"
+        if [ -L "$ROOT/$n" ]; then rm -f "$ROOT/$n"; fi
     done
+    return 0
 }
 
 cmd_distclean() {

@@ -18,8 +18,11 @@ dist/
 *.a
 *.so
 *.p
-core
-tags
+# Core dumps and editor tag files: anchored to the repo root so they
+# never swallow real source directories (src/core/ once lost a new
+# file to the unanchored 'core' pattern).
+/core
+/tags
 .ycm_extra_conf.py
 .vscode/
 .idea/
