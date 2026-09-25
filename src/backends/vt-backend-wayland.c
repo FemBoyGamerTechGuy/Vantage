@@ -155,6 +155,20 @@ static void _surf_set_input(struct wl_client *cli,
                             struct wl_resource *region) {
     (void)cli; (void)res; (void)region;
 }
+static void _surf_set_buffer_transform(struct wl_client *cli,
+                                        struct wl_resource *res,
+                                        int32_t transform) {
+    (void)cli; (void)res; (void)transform;
+}
+static void _surf_set_buffer_scale(struct wl_client *cli,
+                                    struct wl_resource *res,
+                                    int32_t scale) {
+    (void)cli; (void)res; (void)scale;
+}
+static void _surf_offset(struct wl_client *cli, struct wl_resource *res,
+                         int32_t x, int32_t y) {
+    (void)cli; (void)res; (void)x; (void)y;
+}
 
 static void _region_destroy(struct wl_client *cli, struct wl_resource *res);
 static void _region_add(struct wl_client *cli, struct wl_resource *res,
@@ -191,13 +205,10 @@ static const struct wl_surface_interface _surf_impl = {
     .set_opaque_region = _surf_set_opaque,
     .set_input_region = _surf_set_input,
     .commit = _surf_commit,
-    .set_buffer_transform = (void (*)(struct wl_client *,
-                                      struct wl_resource *, int32_t))_region_add,
-    .set_buffer_scale = (void (*)(struct wl_client *,
-                                  struct wl_resource *, int32_t))_region_add,
+    .set_buffer_transform = _surf_set_buffer_transform,
+    .set_buffer_scale = _surf_set_buffer_scale,
     .damage_buffer = _surf_damage,
-    .offset = (void (*)(struct wl_client *, struct wl_resource *,
-                        int32_t, int32_t))_region_add,
+    .offset = _surf_offset,
 };
 
 static void _surf_resource_destroy(struct wl_resource *res) {
@@ -265,6 +276,12 @@ static void _xdg_surface_ack(struct wl_client *cli,
                              struct wl_resource *res, uint32_t serial) {
     (void)cli; (void)res; (void)serial;
 }
+static void _xdg_surface_set_window_geometry(struct wl_client *cli,
+                                              struct wl_resource *res,
+                                              int32_t x, int32_t y,
+                                              int32_t w, int32_t h) {
+    (void)cli; (void)res; (void)x; (void)y; (void)w; (void)h;
+}
 
 static void _xdg_surface_destroy(struct wl_client *cli,
                                  struct wl_resource *res) {
@@ -300,6 +317,18 @@ static void _toplevel_set_app_id(struct wl_client *cli,
 static void _toplevel_move(struct wl_client *cli, struct wl_resource *res,
                            struct wl_resource *seat, uint32_t serial) {
     (void)cli; (void)res; (void)seat; (void)serial;
+}
+static void _toplevel_set_parent(struct wl_client *cli,
+                                 struct wl_resource *res,
+                                 struct wl_resource *parent) {
+    (void)cli; (void)res; (void)parent;
+}
+static void _toplevel_show_window_menu(struct wl_client *cli,
+                                        struct wl_resource *res,
+                                        struct wl_resource *seat,
+                                        uint32_t serial, int32_t x,
+                                        int32_t y) {
+    (void)cli; (void)res; (void)seat; (void)serial; (void)x; (void)y;
 }
 static void _toplevel_resize(struct wl_client *cli, struct wl_resource *res,
                              struct wl_resource *seat, uint32_t serial,
@@ -363,13 +392,10 @@ static void _toplevel_unfullscreen(struct wl_client *cli,
 }
 static const struct xdg_toplevel_interface _toplevel_impl = {
     .destroy = _toplevel_destroy,
-    .set_parent = (void (*)(struct wl_client *, struct wl_resource *,
-                            struct wl_resource *))_toplevel_destroy,
+    .set_parent = _toplevel_set_parent,
     .set_title = _toplevel_set_title,
     .set_app_id = _toplevel_set_app_id,
-    .show_window_menu = (void (*)(struct wl_client *, struct wl_resource *,
-                                  struct wl_resource *, uint32_t, int32_t,
-                                  int32_t))_toplevel_move,
+    .show_window_menu = _toplevel_show_window_menu,
     .move = _toplevel_move,
     .resize = _toplevel_resize,
     .set_max_size = _toplevel_set_max,
@@ -397,8 +423,7 @@ static const struct xdg_surface_interface _xdg_surface_impl2 = {
     .destroy = _xdg_surface_destroy,
     .get_toplevel = _xdg_get_toplevel,
     .get_popup = _xdg_get_popup,
-    .set_window_geometry = (void (*)(struct wl_client *, struct wl_resource *,
-                                     int32_t, int32_t, int32_t, int32_t))_xdg_surface_ack,
+    .set_window_geometry = _xdg_surface_set_window_geometry,
     .ack_configure = _xdg_surface_ack,
 };
 
@@ -453,11 +478,15 @@ static void _pos_set_gravity(struct wl_client *cli, struct wl_resource *res,
                              uint32_t g) { (void)cli; (void)res; (void)g; }
 static void _pos_set_offset(struct wl_client *cli, struct wl_resource *res,
                             int32_t x, int32_t y) { (void)cli; (void)res; (void)x; (void)y; }
+static void _pos_set_anchor_rect(struct wl_client *cli,
+                                 struct wl_resource *res,
+                                 int32_t x, int32_t y, int32_t w, int32_t h) {
+    (void)cli; (void)res; (void)x; (void)y; (void)w; (void)h;
+}
 static const struct xdg_positioner_interface _pos_impl = {
     .destroy = _pos_destroy,
     .set_size = _pos_set_size,
-    .set_anchor_rect = (void (*)(struct wl_client *, struct wl_resource *,
-                                 int32_t, int32_t, int32_t, int32_t))_pos_set_size,
+    .set_anchor_rect = _pos_set_anchor_rect,
     .set_anchor = _pos_set_anchor,
     .set_gravity = _pos_set_gravity,
     .set_constraint_adjustment = (void (*)(struct wl_client *,
@@ -522,10 +551,9 @@ static void _seat_get_keyboard(struct wl_client *cli,
                                                id);
     if (!k) { wl_client_post_no_memory(cli); return; }
     wl_resource_set_implementation(k, NULL, NULL, NULL);
-    /* minimal keymap: advertise a compiled keymap string */
-    const char *km = "xkb/keymap/us";
+    /* minimal keymap: fd set by the real input path */
     wl_keyboard_send_keymap(k, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1,
-                            -1, 0); /* fd set by real input path */
+                            -1, 0);
 }
 static void _seat_get_touch(struct wl_client *cli,
                             struct wl_resource *res, uint32_t id) {

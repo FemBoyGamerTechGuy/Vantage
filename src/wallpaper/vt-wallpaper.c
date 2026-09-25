@@ -271,7 +271,7 @@ void vt_wallpaper_render(vt_wallpaper_t *w, vt_renderer_t *r, vt_rect_t area) {
         /* simple horizontal/vertical gradient via N solid stripes */
         int stripes = 32;
         for (int i = 0; i < stripes; i++) {
-            float t = (float)i / stripes;
+            float t = (float)i / (float)stripes;
             vt_color_t c = {
                 w->color_a.r + (w->color_b.r - w->color_a.r) * t,
                 w->color_a.g + (w->color_b.g - w->color_a.g) * t,

@@ -96,7 +96,8 @@ int vt_audio_init(vt_audio_t *a) {
 
 int vt_audio_set_volume(vt_audio_t *a, int pct) {
     if (!a) return VT_ERR_INVAL;
-    if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
     a->volume_pct = pct;
 #if defined(VT_HAVE_ALSA)
     if (a->backend == VT_AUDIO_BACKEND_ALSA && a->alsa_mixer) {

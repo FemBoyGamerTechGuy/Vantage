@@ -175,6 +175,8 @@ static void _probe_node(const char *devpath, vt_gpu_device_t *out) {
     out->vendor_str = vt_strdup(vt_gpu_vendor_str(out->vendor));
     out->driver_str = vt_strdup(vt_gpu_driver_str(out->driver));
     out->device_str = _device_description(sysfs);
+    if (!out->device_str)
+        out->device_str = _device_name_from_uevent(sysfs);
     /* Probing for EGL/GBM/Vulkan happens lazily */
     out->has_gbm = access("/dev/dri/renderD128", F_OK) == 0;
     out->has_egl = false;     /* set by renderer */

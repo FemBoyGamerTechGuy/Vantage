@@ -45,6 +45,7 @@ typedef enum {
     VT_IPC_E_POLL     = -4,
     VT_IPC_E_CONN     = -5,
     VT_IPC_E_NOMEM    = -6,
+    VT_IPC_E_HANDLER  = -7,   /* server rejected the request */
 } vt_ipc_status_t;
 
 typedef struct vt_ipc_msg {
@@ -118,9 +119,15 @@ enum {
     VT_IPC_MSG_WM_RESIZE   = 0x002a,
     VT_IPC_MSG_WM_LAUNCH   = 0x002b,   /* payload: command line to spawn */
     VT_IPC_MSG_WM_LOGOUT   = 0x002c,
+    VT_IPC_MSG_WM_RESTORE  = 0x002d,   /* un-minimize (payload: id=<win>) */
+    VT_IPC_MSG_WM_UNMAXIMIZE = 0x002e,
+    VT_IPC_MSG_WM_UNFULLSCR  = 0x002f,
+    VT_IPC_MSG_WM_WS_MOVE    = 0x0030,   /* payload: id=<win>\nws=<n> */
     /* WM events (broadcast, payload: one text line) */
     VT_IPC_MSG_WM_EVENT    = 0x0040,   /* window-opened|closed|focused|... */
     VT_IPC_MSG_WM_WS_EVENT = 0x0041,   /* workspace-changed <n> */
+    /* session commands (served on vantage-session.sock) */
+    VT_IPC_MSG_SESSION_STATUS = 0x0050,  /* → version/stage/children lines */
 };
 
 #ifdef __cplusplus

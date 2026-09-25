@@ -341,6 +341,7 @@ int main(int argc, char **argv) {
     vt_ipc_register(ctx.ipc, VT_IPC_MSG_RELOAD, _h_reload, &ctx);
     vt_ipc_register(ctx.ipc, VT_IPC_MSG_QUIT,   _h_end, &ctx);
     vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_LOGOUT, _h_end, &ctx);
+    vt_ipc_register(ctx.ipc, VT_IPC_MSG_SESSION_STATUS, _h_status, &ctx);
     vt_logi("session: ready (ipc at %s)",
             vt_ipc_get_path(ctx.ipc));
 

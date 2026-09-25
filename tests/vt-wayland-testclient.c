@@ -9,7 +9,9 @@
  * framebuffer is dumped via SIGUSR1 and pixel-checked by the harness.
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <wayland-client.h>
 #include "xdg-shell-client-protocol.h"
 #include <stdio.h>

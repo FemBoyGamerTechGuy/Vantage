@@ -233,10 +233,10 @@ bool vt_theme_hex_to_rgba(const char *hex, vt_color_t *out) {
     } else if (sscanf(hex, "%02x%02x%02x", &r, &g, &b) < 3) {
         return false;
     }
-    out->r = r / 255.0f;
-    out->g = g / 255.0f;
-    out->b = b / 255.0f;
-    out->a = a / 255.0f;
+    out->r = (float)r / 255.0f;
+    out->g = (float)g / 255.0f;
+    out->b = (float)b / 255.0f;
+    out->a = (float)a / 255.0f;
     return true;
 }
 char *vt_theme_rgba_to_hex(vt_color_t c) {
@@ -421,7 +421,7 @@ void vt_theme_apply_to_gtk(const vt_theme_t *t) {
         t->bg_hex, t->fg_hex, t->surface_hex, t->fg_hex,
         t->border_hex,
         t->font_family, t->font_size_pt, t->radius, t->radius, t->radius,
-        t->radius, t->radius, t->radius, t->radius, t->radius);
+        t->radius, t->radius, t->radius, t->radius);
     char *css3 = vt_strbuilder_finish(&g3, NULL);
 
     /* --- GTK4 CSS: @define-color is not supported; emit literal

@@ -135,8 +135,12 @@ debuggable with any tool that can write to a socket. Examples:
 vantage-remote list           # all windows (id/title/ws/flags/class)
 vantage-remote focus 0x400001
 vantage-remote close 0x400001
+vantage-remote maximize 0x400001   # toggle; unmaximize to force off
+vantage-remote minimize 0x400001   # restore brings it back
 vantage-remote ws 2           # switch workspace
+vantage-remote ws-move 0x400001 2 # move window to workspace 2
 vantage-remote launch "xterm" # spawn an app
+vantage-remote status         # session version/stage/children
 vantage-remote watch          # stream window events
 ```
 

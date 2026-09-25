@@ -100,7 +100,7 @@ static int _x_err(Display *d, XErrorEvent *ev) {
     return 0; /* tolerant: races with dying clients are normal for a WM */
 }
 
-static int _layer_of(_client_t *c) {
+static int _layer_of(const _client_t *c) {
     if (c->model.fullscreen) return VT_WM_LAYER_OVERLAY;
     if (c->is_desktop) return VT_WM_LAYER_DESKTOP;
     if (c->is_dock) return VT_WM_LAYER_PANEL;
@@ -129,10 +129,6 @@ static _client_t *_find(vt_wm_x11_t *e, Window w) {
         if (c->win == w) return c;
     }
     return NULL;
-}
-
-static _client_t *_find_model(vt_wm_x11_t *e, vt_window_t *w) {
-    return w ? _find(e, (Window)w->id) : NULL;
 }
 
 static void _push_model(vt_wm_x11_t *e, _client_t *c) {
@@ -1092,7 +1088,14 @@ static void _on_backend_event(void *ud, void *event) {
         _client_t *c = _find(e, ue->window);
         if (!c) break;
         c->model.mapped = false;
-        if (ue->event != e->root && ue->event != ue->window) break;
+        /* We select StructureNotifyMask on the window AND
+         * SubstructureNotifyMask on the root, so every unmap of a
+         * top-level window arrives TWICE (event=window and
+         * event=root). Both describe the same physical unmap; act on
+         * the root variant only, otherwise the expect_unmap guard is
+         * consumed by the first copy and the second unmanages a
+         * window the WM itself just iconified or moved. */
+        if (ue->event != e->root) break;
         if (c->expect_unmap) { c->expect_unmap = false; break; }
         if (!ue->send_event) {
             _set_wm_state(e, c, WithdrawnState);

@@ -25,7 +25,7 @@
 bool vt_image_probe_png(const char *path);
 bool vt_image_probe_jpeg(const char *path);
 /* Load `path` into a heap RGBA buffer (caller frees). Returns NULL on
- * failure. *out_w/*out_h receive the dimensions. */
+ * failure. The out_w and out_h pointers receive the dimensions. */
 uint8_t *vt_image_load_png(const char *path, int *out_w, int *out_h);
 uint8_t *vt_image_load_jpeg(const char *path, int *out_w, int *out_h);
 

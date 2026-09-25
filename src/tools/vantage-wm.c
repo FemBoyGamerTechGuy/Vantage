@@ -510,12 +510,16 @@ int main(int argc, char **argv) {
     vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_FOCUS,    _h_focus, &ctx);
     vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_CLOSE,    _h_close, &ctx);
     vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_MINIMIZE, _h_minimize, &ctx);
+    vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_RESTORE,  _h_restore, &ctx);
     vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_MAXIMIZE, _h_maximize, &ctx);
+    vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_UNMAXIMIZE, _h_unmaximize, &ctx);
     vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_FULLSCR,  _h_fullscr, &ctx);
+    vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_UNFULLSCR, _h_unfullscr, &ctx);
     vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_TILE,     _h_tile, &ctx);
     vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_MOVE,     _h_move, &ctx);
     vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_RESIZE,   _h_resize, &ctx);
     vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_WS_SWITCH,_h_ws_switch, &ctx);
+    vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_WS_MOVE,  _h_ws_move, &ctx);
     vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_LAUNCH,   _h_launch, &ctx);
     vt_logi("wm: ipc server at %s", vt_ipc_get_path(ctx.ipc));
 

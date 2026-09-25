@@ -31,6 +31,7 @@ int main(int argc, char **argv) {
                i,
                vt_gpu_vendor_str(d->vendor),
                d->vendor_id, d->device_id,
+               vt_gpu_vendor_str(d->vendor),
                vt_gpu_driver_str(d->driver),
                d->path,
                d->primary ? " (primary)" : "");

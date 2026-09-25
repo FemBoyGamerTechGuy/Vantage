@@ -6,8 +6,8 @@
  * A _NET_WM_WINDOW_TYPE_DESKTOP child of the root, rendered bottom-most
  * and present on every workspace. Draws the wallpaper (color, gradient,
  * image, or video via the wallpaper engine + software renderer → XImage
- * → XPutImage), shows desktop icons from ~/Desktop/*.desktop, and offers
- * a right-click application menu.
+ * → XPutImage), shows desktop icons (the .desktop files in ~/Desktop), and
+ * offers a right-click application menu.
  *
  * Video wallpapers are stepped at most ~30 fps and PAUSED whenever a
  * fullscreen window covers the desktop (checked once per second via the

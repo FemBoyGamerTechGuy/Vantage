@@ -298,6 +298,11 @@ int vt_ipc_call(vt_ipc_t *ipc, uint32_t msg_id,
         }
         m.payload[m.len] = 0;   /* NUL sentinel for string parsers */
     }
+    if (m.type == VT_IPC_MSG_ERROR) {
+        /* server rejected the request (no handler, or handler rc != 0) */
+        vt_free(m.payload);
+        return VT_IPC_E_HANDLER;
+    }
     if (resp) *resp = m;
     else vt_free(m.payload);
     return VT_IPC_OK;
@@ -367,7 +372,7 @@ static int _serve_client(vt_ipc_t *ipc, _client_t *c) {
     vt_ipc_msg_t resp = {0};
     void *ud = NULL;
     vt_ipc_handler_t h = _find_handler(ipc, m.id, &ud);
-    vt_logd("ipc: handler=%p id=0x%x", (void*)h, m.id);
+    vt_logd("ipc: handler=%s id=0x%x", h ? "found" : "none", m.id);
     if (h) {
         int hr = h(ipc, &m, &resp, ud);
         vt_logd("ipc: handler rc=%d resp_len=%u", hr, resp.len);
@@ -379,6 +384,16 @@ static int _serve_client(vt_ipc_t *ipc, _client_t *c) {
             _send_all(c->fd, wbuf, wlen);
             vt_free(wbuf);
             vt_free(resp.payload);
+        } else {
+            /* handler rejected the request (e.g. unknown window id):
+             * answer with an ERROR frame so the client fails fast
+             * instead of waiting for a timeout */
+            vt_free(resp.payload);
+            vt_ipc_msg_t err = { .id = m.id, .type = VT_IPC_MSG_ERROR, .len = 0 };
+            uint8_t *wbuf; size_t wlen;
+            vt_ipc_encode(&err, &wbuf, &wlen);
+            _send_all(c->fd, wbuf, wlen);
+            vt_free(wbuf);
         }
     } else {
         vt_ipc_msg_t err = { .id = m.id, .type = VT_IPC_MSG_ERROR, .len = 0 };
