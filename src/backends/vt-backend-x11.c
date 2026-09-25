@@ -1,12 +1,16 @@
 /*
- * vt-backend-x11.c — X11 (Xorg / XLibre) display backend
+ * vt-backend-x11.c — X11 display backend
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * One Xlib Display connection per process, owned by this backend. RandR
- * provides multi-monitor geometry and mode info; XInput2 lists devices.
- * The WM and compositor layers hook into the event stream through the
- * backend event-sink mechanism and share the same connection.
+ * One Xlib Display connection per process, owned by this backend. The
+ * backend is a client of whatever X server is already running
+ * ($DISPLAY — Xorg, XLibre, Xvfb, ...); it never starts one itself and
+ * needs no privileges. RandR provides multi-monitor geometry and mode
+ * info; XInput2 lists devices. The WM and compositor layers hook into
+ * the event stream through the backend event-sink mechanism and share
+ * the same connection. The server implementation is identified via the
+ * vendor string purely for diagnostics.
  */
 
 #define VT_LOG_DOMAIN "backend-x11"
@@ -38,6 +42,8 @@ typedef struct {
     int           randr_event_base;
     int           randr_error_base;
     bool          have_xinput;
+    char         *server_name;     /* normalized, informational */
+    char         *server_vendor;   /* raw vendor string */
 } _x11_state_t;
 
 static _x11_state_t *_st = NULL;
@@ -45,6 +51,10 @@ static _x11_state_t *_st = NULL;
 Display *vt_x11_display(void) { return _st ? _st->dpy : NULL; }
 Window   vt_x11_root(void)    { return _st ? _st->root : None; }
 int      vt_x11_screen(void)  { return _st ? _st->screen : 0; }
+
+const char *vt_x11_server_name(void) {
+    return (_st && _st->server_name) ? _st->server_name : NULL;
+}
 
 /* ------------------------------------------------------------ atoms */
 static vt_x11_atoms_t _atoms;
@@ -344,6 +354,24 @@ static int _x11_init(vt_backend_t *self) {
     st->screen = DefaultScreen(st->dpy);
     st->root = RootWindow(st->dpy, st->screen);
 
+    /* Identify the X server implementation (informational only):
+     * Xorg and XLibre (and Xvfb, etc.) share the exact X11 API used
+     * above and below — this string is reported by diagnostics. */
+    {
+        const char *vendor = XServerVendor(st->dpy);
+        st->server_vendor = vt_strdup(vendor ? vendor : "");
+        if (strstr(st->server_vendor, "XLibre") ||
+            strstr(st->server_vendor, "Xlibre"))
+            st->server_name = vt_strdup("XLibre");
+        else if (strstr(st->server_vendor, "X.Org") ||
+                 strstr(st->server_vendor, "Xorg"))
+            st->server_name = vt_strdup("Xorg");
+        else if (*st->server_vendor)
+            st->server_name = vt_strdup(st->server_vendor);
+        else
+            st->server_name = vt_strdup("unknown X server");
+    }
+
 #if defined(VT_HAVE_XRANDR)
     int major = 0, minor = 0;
     st->randr_present = XRRQueryExtension(st->dpy, &st->randr_event_base,
@@ -403,6 +431,7 @@ static int _x11_init(vt_backend_t *self) {
     vt_logi("x11: connected to %s (screen %d, %zu output%s, randr=%d)",
             dpy_name, st->screen, self->outputs.size,
             self->outputs.size == 1 ? "" : "s", st->randr_present);
+    vt_logi("x11: X server: %s (%s)", st->server_name, st->server_vendor);
     return 0;
 }
 
@@ -410,6 +439,8 @@ static void _x11_fini(vt_backend_t *self) {
     if (!self->priv) return;
     if (self->priv == _st) {
         XCloseDisplay(_st->dpy);
+        vt_free(_st->server_name);
+        vt_free(_st->server_vendor);
         vt_free(_st);
         _st = NULL;
         _atoms_done = false;
@@ -499,7 +530,7 @@ static bool _x11_can_swap_buffers(vt_backend_t *self) {
 
 vt_backend_t *_vt_backend_x11_new(void) {
     vt_backend_t *b = vt_malloc0(sizeof(*b));
-    b->kind = VT_BACKEND_XORG;
+    b->kind = VT_BACKEND_X11;
     b->init = _x11_init;
     b->fini = _x11_fini;
     b->dispatch = _x11_dispatch;
@@ -521,5 +552,7 @@ vt_backend_t *_vt_backend_x11_new(void) {
     vt_logw("x11: built without X11 support");
     return NULL;
 }
+
+const char *vt_x11_server_name(void) { return NULL; }
 
 #endif

@@ -14,6 +14,7 @@
 
 #define VT_LOG_DOMAIN "theme"
 #include <vantage/vt-theme.h>
+#include <vantage/vt-paths.h>
 
 #if defined(VT_HAVE_JSONC)
 #include <json-c/json.h>
@@ -173,6 +174,29 @@ char **vt_theme_list_installed(size_t *out_n) {
     size_t n = 0;
     char **items = vt_file_list_dir(dir, &n);
     vt_free(dir);
+    /* also list the bundled themes (resource discovery: development
+     * tree, XDG data dirs, or compiled install prefix) */
+    const char *res = vt_paths_resource_dir();
+    if (res) {
+        char *bdir = vt_path_join(res, "themes");
+        size_t bn = 0;
+        char **bitems = vt_file_list_dir(bdir, &bn);
+        for (size_t i = 0; i < bn; i++) {
+            bool dup = false;
+            for (size_t k = 0; k < n; k++)
+                if (vt_streq(items[k], bitems[i])) { dup = true; break; }
+            if (!dup) {
+                char **grown = vt_realloc(items, (n + 1) * sizeof(char *));
+                if (!grown) { vt_free(bitems[i]); continue; }
+                items = grown;
+                items[n++] = bitems[i];
+            } else {
+                vt_free(bitems[i]);
+            }
+        }
+        vt_free(bitems);
+        vt_free(bdir);
+    }
     if (out_n) *out_n = n;
     return items;
 }
@@ -182,6 +206,7 @@ char *vt_theme_dir(void) {
 }
 char *vt_theme_path_for(const char *name) {
     if (!name) return NULL;
+    /* 1. user themes (saved via vantage-theme / settings) */
     char *dir = vt_theme_dir();
     char *p = vt_path_join(dir, name);
     vt_free(dir);
@@ -189,7 +214,13 @@ char *vt_theme_path_for(const char *name) {
     vt_free(p);
     if (vt_path_exists(r)) return r;
     vt_free(r);
-    /* try system path */
+    /* 2. bundled themes via resource discovery (dev tree, XDG, or
+     * compiled install prefix — see vt-paths.c) */
+    char *rel = vt_strprintf("themes/%s/theme.json", name);
+    char *found = vt_paths_resource_find(rel);
+    vt_free(rel);
+    if (found) return found;
+    /* 3. legacy fallback: compiled data dir */
     return vt_strprintf(VT_DATADIR "/themes/%s/theme.json", name);
 }
 

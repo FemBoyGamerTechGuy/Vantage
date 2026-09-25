@@ -10,7 +10,7 @@ at `~/.config/vantage/vantage.conf` and system-wide defaults at
 
 | Key              | Default        | Description                              |
 |------------------|----------------|------------------------------------------|
-| `backend`        | `auto`         | wayland / xorg / xlibre / auto / headless |
+| `backend`        | `auto`         | wayland / x11 / auto (`xorg` and `xlibre` accepted as `x11` aliases) |
 | `renderer`       | `auto`         | opengl / vulkan / software / auto         |
 | `theme`          | `Vantage-Dark` | Name of installed theme                  |
 | `dark-mode`      | `true`         | Apply dark variant                       |
@@ -111,7 +111,7 @@ These override the config file:
 |------------------------|------------------------------------------|
 | `VANTAGE_LOG_LEVEL`   | trace/debug/info/notice/warn/error/crit  |
 | `VANTAGE_QSS`         | Path to Qt6 QSS file (set by theme engine) |
-| `VANTAGE_XLIBRE`      | Set to 1 to force XLibre backend         |
+| `VANTAGE_BACKEND`     | `wayland` or `x11` — same choice as the session CLI flags |
 | `__GLX_VENDOR_LIBRARY_NAME` | EGL vendor (set by gpu module)      |
 | `GTK_THEME`           | GTK theme (set by theme engine)          |
 | `QT_QPA_PLATFORMTHEME`| Qt platform theme (set to `vantage`)    |

@@ -3,12 +3,17 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# Boots the REAL session stack on a fresh Xvfb display:
+# Boots the REAL session stack on a fresh Xvfb display, exercising the
+# X11 backend selection exactly as a user would:
 #
-#   Xvfb :N  →  vantage-session
-#                 ├─ vantage-wm       (EWMH/ICCCM WM + XRender compositor)
+#   Xvfb :N  →  vantage-session --x11
+#                 ├─ vantage-wm --x11 (EWMH/ICCCM WM + XRender compositor)
 #                 ├─ vantage-panel    (dock with struts)
 #                 └─ vantage-desktop  (root desktop window)
+#
+# vantage-session --x11 connects to the existing $DISPLAY server (here
+# Xvfb — any conforming X11 server works the same way) and never starts
+# an X server of its own.
 #
 # Verifications:
 #   1. session reaches "ready" stage
@@ -52,11 +57,11 @@ export XDG_DATA_HOME="$WORK/share"        # isolate XDG autostart
 export XDG_CONFIG_DIRS=""
 chmod 700 "$XDG_RUNTIME_DIR"
 
-# Force the X11/Xorg code path (auto would pick the Wayland headless
-# compositor first — see vt_backend_new() probe order)
+# Isolated config; backend selection comes from the --x11 flag (the
+# config default, backend=auto, would resolve the same way here because
+# $DISPLAY is set).
 cat > "$XDG_CONFIG_HOME/vantage/vantage.conf" <<EOF
 [desktop]
-backend=xorg
 compositor=true
 [wm]
 focus-new=true
@@ -100,8 +105,8 @@ fi
 ok "Xvfb running (pid $XVFB_PID)"
 
 # ------------------------------------------------------------- session
-echo "== harness-xvfb: launching vantage-session =="
-"$(vb vantage-session)" > "$WORK/session.log" 2>&1 &
+echo "== harness-xvfb: launching vantage-session --x11 =="
+"$(vb vantage-session)" --x11 > "$WORK/session.log" 2>&1 &
 SESS_PID=$!
 
 READY=""
@@ -112,6 +117,13 @@ for i in $(seq 1 100); do
 done
 if [ -n "$READY" ]; then ok "session reached ready state"; else
   bad "session never became ready"; tail -20 "$WORK/session.log"; fi
+
+grep -q "display backend: X11" "$WORK/session.log" \
+  && ok "session selected the X11 backend" \
+  || bad "session did not report the X11 backend"
+grep -q "X server:" "$WORK/session.log" \
+  && ok "session identified the X server implementation (informational)" \
+  || bad "no X server identification in the log"
 
 sleep 1     # let the WM/panel/desktop settle and paint
 
@@ -208,21 +220,28 @@ PYEOF
 echo "== harness-xvfb: clean shutdown =="
 kill -TERM "$SESS_PID" 2>/dev/null
 EXITED=""
-for i in $(seq 1 60); do
+for i in $(seq 1 100); do
   kill -0 "$SESS_PID" 2>/dev/null || { EXITED=1; break; }
   sleep 0.1
 done
+if [ -z "$EXITED" ]; then
+  kill -KILL "$SESS_PID" 2>/dev/null   # last resort; counts as failure
+fi
 [ -n "$EXITED" ] && ok "session exited on SIGTERM" || bad "session ignored SIGTERM"
 grep -q "session: exited" "$WORK/session.log" \
   && ok "session logged clean exit" || bad "no clean-exit log line"
 kill -0 "$XVFB_PID" 2>/dev/null \
   && ok "X server survived the session" || bad "X server died during session"
 
-# stragglers?
+# stragglers? (components AND the session process itself)
 sleep 0.3
-STRAGGLERS=$(pgrep -f "$(vb vantage-wm)|$(vb vantage-panel)|$(vb vantage-desktop)" 2>/dev/null | grep -v "^$" | wc -l)
-[ "${STRAGGLERS:-0}" -eq 0 ] && ok "no component stragglers left" \
-  || bad "$STRAGGLERS component process(es) survived shutdown"
+STRAGGLERS=$(pgrep -f "$(vb vantage-wm)|$(vb vantage-panel)|$(vb vantage-desktop)|$(vb vantage-session)" 2>/dev/null | grep -v "^$" | wc -l)
+if [ "${STRAGGLERS:-0}" -eq 0 ]; then
+  ok "no component stragglers left"
+else
+  bad "$STRAGGLERS component process(es) survived shutdown"
+  pgrep -af "$(vb vantage-wm)|$(vb vantage-panel)|$(vb vantage-desktop)|$(vb vantage-session)" 2>/dev/null | head -5
+fi
 
 kill -TERM "$XVFB_PID" 2>/dev/null
 wait "$XVFB_PID" 2>/dev/null

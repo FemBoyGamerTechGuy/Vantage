@@ -20,9 +20,12 @@
 #include <vantage/vt-integrations.h>
 #include <vantage/vt-config.h>
 #include <vantage/vt-wallpaper.h>
+#include <vantage/vt-paths.h>
+#include <vantage/vt-backend.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 vt_diag_t *vt_diag_new(void) {
     return vt_malloc0(sizeof(vt_diag_t));
@@ -30,6 +33,7 @@ vt_diag_t *vt_diag_new(void) {
 void vt_diag_free(vt_diag_t *d) {
     if (!d) return;
     vt_free(d->backend); vt_free(d->renderer);
+    vt_free(d->server); vt_free(d->accel_reason);
     vt_free(d->gpu_vendor); vt_free(d->gpu_device);
     vt_free(d->gpu_driver); vt_free(d->gl_version);
     vt_free(d->egl_version); vt_free(d->vulkan_version);
@@ -56,6 +60,13 @@ int vt_diag_run(vt_diag_t *d) {
         d->gpu_driver = vt_strdup("none");
         d->gpu_device = vt_strdup("none");
         d->hw_accel = false;
+        d->accel_reason = vt_strdup("no GPU detected");
+    }
+    if (!d->hw_accel && !d->accel_reason) {
+        if (access("/dev/dri", F_OK) != 0)
+            d->accel_reason = vt_strdup("no DRM device (/dev/dri absent)");
+        else
+            d->accel_reason = vt_strdup("GPU present but no usable driver");
     }
     vt_gpu_list_free(gpus);
 
@@ -88,9 +99,15 @@ int vt_diag_run(vt_diag_t *d) {
 #endif
     vt_renderer_free(r);
 
-    /* Backend */
-    vt_backend_t *b = vt_backend_new(VT_BACKEND_AUTO);
+    /* Backend (X server implementation is informational: Xorg, XLibre,
+     * Xvfb ... all expose the same X11 API to the X11 backend) */
+    vt_backend_t *b = vt_backend_new(
+        d->kind ? (vt_backend_kind_t)d->kind : VT_BACKEND_AUTO);
     d->backend = vt_strdup(vt_backend_name(b));
+    {
+        const char *srv = vt_backend_server_implementation(b);
+        if (srv) d->server = vt_strdup(srv);
+    }
     d->monitor_count = (int)vt_backend_output_count(b);
     for (size_t i = 0; i < vt_backend_output_count(b) && i < 8; i++) {
         const vt_output_t *o = vt_backend_output_at(b, i);
@@ -122,7 +139,9 @@ int vt_diag_run(vt_diag_t *d) {
 void vt_diag_print(const vt_diag_t *d, FILE *fp) {
     fprintf(fp, "Vantage Diagnostics\n");
     fprintf(fp, "===================\n");
-    fprintf(fp, "Backend:        %s\n", d->backend ? d->backend : "?");
+    fprintf(fp, "Display backend: %s\n", d->backend ? d->backend : "?");
+    if (d->server)
+        fprintf(fp, "X server:       %s (informational)\n", d->server);
     fprintf(fp, "Renderer:       %s\n", d->renderer ? d->renderer : "?");
     fprintf(fp, "GPU vendor:     %s\n", d->gpu_vendor ? d->gpu_vendor : "?");
     fprintf(fp, "GPU device:     %s\n", d->gpu_device ? d->gpu_device : "?");
@@ -130,7 +149,9 @@ void vt_diag_print(const vt_diag_t *d, FILE *fp) {
     fprintf(fp, "GL version:     %s\n", d->gl_version ? d->gl_version : "?");
     fprintf(fp, "EGL version:    %s\n", d->egl_version ? d->egl_version : "?");
     fprintf(fp, "Vulkan version: %s\n", d->vulkan_version ? d->vulkan_version : "n/a");
-    fprintf(fp, "Hardware accel: %s\n", d->hw_accel ? "ENABLED" : "disabled");
+    fprintf(fp, "Hardware accel: %s\n", d->hw_accel ? "ENABLED" : "unavailable");
+    if (!d->hw_accel && d->accel_reason)
+        fprintf(fp, "  Reason:       %s\n", d->accel_reason);
     fprintf(fp, "GBM:             %s\n", d->gbm ? "yes" : "no");
     fprintf(fp, "EGL:             %s\n", d->egl ? "yes" : "no");
     fprintf(fp, "VSync:           %s\n", d->vsync ? "ENABLED" : "disabled");
@@ -162,11 +183,32 @@ void vt_diag_print_machine(const vt_diag_t *d, FILE *fp) {
 }
 
 int main(int argc, char **argv) {
-    (void)argc; (void)argv;
     vt_log_set_level(VT_LOG_INFO);
     vt_diag_t *d = vt_diag_new();
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--machine") == 0) {
+            d->machine = true;
+        } else if (strcmp(argv[i], "--wayland") == 0) {
+            d->kind = VT_BACKEND_WAYLAND;
+        } else if (strcmp(argv[i], "--x11") == 0) {
+            d->kind = VT_BACKEND_X11;
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            printf("Usage: vantage-diagnostics [--wayland|--x11] [--machine]\n"
+                   "       vantage-diagnostics --version\n");
+            return 0;
+        } else if (strcmp(argv[i], "-V") == 0 || strcmp(argv[i], "--version") == 0) {
+            printf("Vantage %s\n", vt_paths_version());
+            return 0;
+        } else {
+            fprintf(stderr, "vantage-diagnostics: unrecognized option '%s'\n",
+                    argv[i]);
+            return 2;
+        }
+    }
+
     vt_diag_run(d);
-    if (argc > 1 && strcmp(argv[1], "--machine") == 0)
+    if (d->machine)
         vt_diag_print_machine(d, stdout);
     else
         vt_diag_print(d, stdout);

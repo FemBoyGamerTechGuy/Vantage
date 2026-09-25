@@ -33,6 +33,7 @@ if dep_x11.found()
     sources : 'vt-x11-testclient.c',
     dependencies : tests_deps + [dep_x11],
     install : true,
+    install_dir : join_paths(vt_libdir, 'vantage', 'tests'),
     install_rpath : vt_extra_rpath,
   )
 endif
@@ -51,6 +52,7 @@ if wl_client_ok
     include_directories : [vantage_includes, include_directories('.')],
     dependencies : tests_deps + [dep_wayland_client],
     install : true,
+    install_dir : join_paths(vt_libdir, 'vantage', 'tests'),
     install_rpath : vt_extra_rpath,
   )
 endif
@@ -69,21 +71,41 @@ endif
 harness_xvfb = find_program('harness-xvfb.sh', required : false)
 if harness_xvfb.found() and prog_xvfb.found() and \
    dep_x11.found() and get_option('tests').enabled()
+  # integration harnesses boot real sessions — never run them in
+  # parallel with each other (meson would otherwise overlap the Xvfb
+  # session with the Wayland compositor and straggler accounting
+  # becomes meaningless)
   test('harness-xvfb', harness_xvfb,
-    args : [meson.build_root()],
+    args : [meson.project_build_root()],
     timeout : 90,
-    suite : 'integration')
+    suite : 'integration',
+    is_parallel : false)
 endif
 
 harness_wayland = find_program('harness-wayland.sh', required : false)
 if harness_wayland.found() and wl_client_ok and \
    dep_wayland_server.found() and get_option('tests').enabled()
   test('harness-wayland', harness_wayland,
-    args : [meson.build_root()],
+    args : [meson.project_build_root()],
     timeout : 60,
-    suite : 'integration')
+    suite : 'integration',
+    is_parallel : false)
 endif
 
 # Install the harnesses next to the docs so users can run them anywhere
-install_data('harness-xvfb.sh', 'harness-wayland.sh',
+install_data('harness-xvfb.sh', 'harness-wayland.sh', 'harness-cli.sh',
   install_dir : join_paths(vt_datadir, 'tests'))
+
+# ------------------------------------------------------------------
+# CLI / distribution-model harness: --help/--version/--wayland/--x11,
+# invalid-flag handling, development-tree execution (repo-root
+# symlinks) and installed-execution via a temporary staging prefix.
+# ------------------------------------------------------------------
+harness_cli = find_program('harness-cli.sh', required : false)
+if harness_cli.found() and get_option('tests').enabled()
+  test('harness-cli', harness_cli,
+    args : [meson.project_build_root(), meson.project_source_root()],
+    timeout : 180,
+    suite : 'integration',
+    is_parallel : false)
+endif

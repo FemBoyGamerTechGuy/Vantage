@@ -3,14 +3,19 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * Vantage supports three native display backends:
- *   - Wayland (native)
- *   - Xorg (native, libxcb/libX11)
- *   - XLibre (native, same X11 code path, modular config)
+ * Vantage has two display backends:
+ *   - Wayland (native compositor on libwayland-server)
+ *   - X11 (client of the running X server, via libX11/libxcb)
  *
- * The backend is selected at session startup based on user config and
- * what is available at runtime. The compositor and WM use the same
- * vt_backend_t interface regardless of which is in use.
+ * The X11 backend talks to the X11 protocol only. Which X server
+ * implementation is underneath — Xorg, XLibre, or anything else that
+ * speaks X11 — is an informational detail, queried at runtime for
+ * diagnostics (vt_backend_server_implementation()), never a separate
+ * Vantage backend.
+ *
+ * The backend is selected at session startup (vantage-session
+ * --wayland | --x11, or automatic detection) and the compositor and WM
+ * use the same vt_backend_t interface regardless of which is in use.
  */
 #ifndef VANTAGE_BACKEND_H
 #define VANTAGE_BACKEND_H
@@ -27,8 +32,7 @@ extern "C" {
 typedef enum {
     VT_BACKEND_AUTO = 0,
     VT_BACKEND_WAYLAND,
-    VT_BACKEND_XORG,
-    VT_BACKEND_XLIBRE,
+    VT_BACKEND_X11,
     VT_BACKEND_HEADLESS,
     VT_BACKEND_INVALID,
 } vt_backend_kind_t;
@@ -86,6 +90,14 @@ typedef struct {
 
 vt_backend_t *vt_backend_new(vt_backend_kind_t preferred);
 void          vt_backend_free(vt_backend_t *b);
+
+/* Informational: the display-server implementation the backend is
+ * talking to. For the X11 backend this is the server vendor
+ * ("Xorg", "XLibre", or the raw vendor string); for the Wayland
+ * backend it is "Vantage" (Vantage *is* the compositor). NULL when
+ * unknown. This never selects code paths — Xorg and XLibre share the
+ * identical X11 code. */
+const char   *vt_backend_server_implementation(const vt_backend_t *b);
 int           vt_backend_init(vt_backend_t *b);
 int           vt_backend_dispatch(vt_backend_t *b, int timeout_ms);
 int           vt_backend_fd(vt_backend_t *b);

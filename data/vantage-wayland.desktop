@@ -2,7 +2,7 @@
 Type=Application
 Name=Vantage Wayland Session
 Comment=Vantage running as a native Wayland compositor
-Exec=vantage-session
+Exec=vantage-session --wayland
 TryExec=vantage-session
 Icon=
 DesktopNames=Vantage;

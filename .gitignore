@@ -1,5 +1,19 @@
-build/
-build-*/
+builddir/
+build-dist/
+build-inst/
+dist/
+
+# repo-root launch symlinks (created by ./build build)
+/vantage-session
+/vantage-wm
+/vantage-panel
+/vantage-desktop
+/vantage-settings
+/vantage-config
+/vantage-renderer
+/vantage-theme
+/vantage-diagnostics
+/vantage-remote
 *.o
 *.a
 *.so

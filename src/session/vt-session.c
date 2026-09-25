@@ -10,6 +10,7 @@
 
 #define VT_LOG_DOMAIN "session"
 #include <vantage/vt-session.h>
+#include <vantage/vt-paths.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -126,9 +127,10 @@ const char *vt_session_get_env(vt_session_t *s, const char *k) {
 int vt_session_autostart_load(vt_session_t *s) {
     if (!s) return VT_ERR_INVAL;
     /* Standard autostart locations */
+    char *res_autostart = vt_paths_resource_find("autostart");
     const char *dirs[] = {
         vt_strprintf("%s/autostart", vt_config_dir()),
-        VT_DATADIR "/autostart",
+        res_autostart ? res_autostart : VT_DATADIR "/autostart",
         "/etc/xdg/autostart",
         NULL,
     };
@@ -202,6 +204,10 @@ int vt_session_autostart_load(vt_session_t *s) {
         }
         vt_free(files);
     }
+    /* dirs[0] is heap (strprintf); dirs[1] is either res_autostart or a
+     * static string; only one of the two must be freed exactly once. */
+    vt_free((char *)dirs[0]);
+    vt_free(res_autostart);
     vt_logi("session: %zu autostart entries", s->autostarts.size);
     return VT_OK;
 }
@@ -303,6 +309,64 @@ bool vt_session_is_running(const vt_session_t *s) {
 }
 
 /* ============================================================ supervisor */
+/* Tokenize `cmd` into argv, honoring "..."/'...' quoting. Returns true
+ * when the line is a *simple* command — words and quotes only, no shell
+ * metacharacters — so the child can exec it directly. Managed
+ * components are always simple commands; arbitrary shell lines
+ * (autostart Exec= values, launch commands) are not.
+ *
+ * Direct exec matters: `sh -c "cmd" usually forks (dash keeps a wrapper
+ * process around), which would make the supervised pid the wrapper's,
+ * break direct signaling of the component, and orphan it on TERM. */
+static bool _cmd_tokenize_simple(const char *cmd, char ***argv_out,
+                                 int *argc_out) {
+    if (!cmd || !*cmd) return false;
+    char **argv = vt_malloc0(sizeof(char *) * 64);
+    int argc = 0;
+    const char *p = cmd;
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        char *tok = vt_malloc(strlen(p) + 1);
+        size_t tn = 0;
+        bool simple = true;
+        while (*p && *p != ' ' && *p != '\t') {
+            if (*p == '"' || *p == '\'') {
+                char q = *p++;
+                while (*p && *p != q) tok[tn++] = *p++;
+                if (*p != q) { simple = false; break; }   /* unterminated */
+                p++;   /* closing quote */
+            } else if (strchr("|&;<> ()$`\\#~{}*?[]", *p)) {
+                simple = false;
+                break;
+            } else {
+                tok[tn++] = *p++;
+            }
+        }
+        tok[tn] = 0;
+        if (!simple || tn == 0) {
+            vt_free(tok);
+            for (int i = 0; i < argc; i++) vt_free(argv[i]);
+            vt_free(argv);
+            return false;
+        }
+        argv[argc++] = tok;
+        if (argc >= 63) {
+            for (int i = 0; i < argc; i++) vt_free(argv[i]);
+            vt_free(argv);
+            return false;
+        }
+    }
+    if (argc == 0) {
+        vt_free(argv);
+        return false;
+    }
+    argv[argc] = NULL;
+    *argv_out = argv;
+    *argc_out = argc;
+    return true;
+}
+
 int vt_session_spawn_managed(vt_session_t *s, const char *name,
                              const char *cmd, bool critical) {
     if (!s || !name || !cmd) return VT_ERR_INVAL;
@@ -315,6 +379,12 @@ int vt_session_spawn_managed(vt_session_t *s, const char *name,
     if (pid < 0) return VT_ERR;
     if (pid == 0) {
         setsid();
+        char **argv = NULL;
+        int argc = 0;
+        if (_cmd_tokenize_simple(cmd, &argv, &argc)) {
+            execvp(argv[0], argv);
+            _exit(127);
+        }
         execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
         _exit(127);
     }
@@ -340,8 +410,12 @@ void vt_session_supervise(vt_session_t *s) {
             if (p->pid == dead) { m = p; break; }
         }
         if (!m) continue; /* autostart child — not managed */
-        vt_logw("session: '%s' (pid %d) exited (status %d)", m->name, dead,
-                WEXITSTATUS(status));
+        if (WIFSIGNALED(status))
+            vt_logw("session: '%s' (pid %d) killed by signal %d",
+                    m->name, dead, WTERMSIG(status));
+        else
+            vt_logw("session: '%s' (pid %d) exited (status %d)", m->name,
+                    dead, WEXITSTATUS(status));
         if (WEXITSTATUS(status) == 127)
             m->cmd_missing = true;   /* exec failed — do not restart */
         m->pid = -1;

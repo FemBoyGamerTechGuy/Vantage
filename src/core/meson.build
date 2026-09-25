@@ -1,6 +1,7 @@
 # libvantage-core: foundational utilities used by every component
 src_core = [
   'vt-core.c',
+  'vt-paths.c',
 ]
 
 lib_vantage_core = static_library('vantage-core',

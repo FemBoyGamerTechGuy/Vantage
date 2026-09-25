@@ -57,9 +57,7 @@ void vt_wm_free(vt_wm_t *wm) {
 
 int vt_wm_start(vt_wm_t *wm) {
     if (!wm) return VT_ERR_INVAL;
-    if (wm->backend &&
-        (wm->backend->kind == VT_BACKEND_XORG ||
-         wm->backend->kind == VT_BACKEND_XLIBRE)) {
+    if (wm->backend && wm->backend->kind == VT_BACKEND_X11) {
         wm->engine = vt_wm_x11_new_impl(wm);
         int rc = vt_wm_x11_start((struct vt_wm_x11 *)wm->engine);
         if (rc != VT_OK) {

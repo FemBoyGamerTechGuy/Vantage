@@ -2,6 +2,7 @@ vantage_includes = include_directories('.')
 
 install_headers(
   'vantage/vt-core.h',
+  'vantage/vt-paths.h',
   'vantage/vt-config.h',
   'vantage/vt-ipc.h',
   'vantage/vt-renderer.h',

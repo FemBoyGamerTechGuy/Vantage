@@ -15,6 +15,7 @@
 
 #define VT_LOG_DOMAIN "config"
 #include <vantage/vt-config.h>
+#include <vantage/vt-paths.h>
 
 #include <sys/inotify.h>
 #include <sys/stat.h>
@@ -83,8 +84,10 @@ const char *vt_config_user_dir(void) {
 }
 const char *vt_config_sysconf_dir(void) { return VT_SYSCONFDIR; }
 const char *vt_config_default_path(void) {
-    static char buf[256];
-    snprintf(buf, sizeof(buf), "%s/vantage.conf", vt_config_user_dir());
+    /* user config -> dev-tree default -> sysconfdir (vt-paths.c);
+     * result cached for the process lifetime */
+    static char *buf = NULL;
+    if (!buf) buf = vt_paths_config_default();
     return buf;
 }
 

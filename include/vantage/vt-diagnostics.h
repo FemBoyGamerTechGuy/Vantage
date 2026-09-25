@@ -19,8 +19,12 @@
 extern "C" {
 #endif
 
+/* Diagnostics can probe an explicit backend (matching the
+ * vantage-session --wayland | --x11 flags) or auto-detect. */
+struct vt_backend;
 typedef struct vt_diag {
     char  *backend;
+    char  *server;            /* X server implementation, informational */
     char  *renderer;
     char  *gpu_vendor;
     char  *gpu_device;
@@ -31,6 +35,7 @@ typedef struct vt_diag {
     int    monitor_count;
     int    refresh_hz[8];
     bool   hw_accel;
+    char  *accel_reason;      /* honest reason when hw_accel is off */
     bool   vsync;
     bool   video_decode;
     bool   gbm;
@@ -41,6 +46,9 @@ typedef struct vt_diag {
     char  *power_backend;
     char  *init_system;
     bool   dbus;
+    /* CLI state */
+    int    kind;              /* vt_backend_kind_t, 0 = auto */
+    bool   machine;
 } vt_diag_t;
 
 vt_diag_t *vt_diag_new(void);

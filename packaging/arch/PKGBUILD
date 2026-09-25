@@ -1,8 +1,8 @@
 # Maintainer: Vantage Desktop Project
 pkgname=vantage
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
-pkgdesc="Lightweight raw-C desktop environment — Wayland + Xorg + XLibre, cross-toolkit Qt6/GTK theming, live video wallpapers"
+pkgdesc="Lightweight raw-C desktop environment — Wayland compositor + X11 backend, cross-toolkit Qt6/GTK theming, live video wallpapers"
 arch=('x86_64' 'aarch64')
 url="https://github.com/FemBoyGamerTechGuy/Vantage"
 license=('GPL-2.0-or-later')
@@ -40,9 +40,12 @@ conflicts=('vantage')
 source=("git+https://github.com/FemBoyGamerTechGuy/Vantage.git")
 sha256sums=('SKIP')
 
+# NOTE: this PKGBUILD is the source-build alternative for AUR-style
+# usage. Vantage's own packaging interface is `./build packages arch`,
+# which produces the .pkg.tar.zst directly (packaging/arch/package.sh).
 build() {
   cd "$srcdir/Vantage"
-  meson setup build --prefix=/usr --buildtype=release
+  meson setup build --prefix=/usr --buildtype=release -Dsysconfdir=/etc
   ninja -C build
 }
 

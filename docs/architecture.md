@@ -27,7 +27,7 @@ implemented from scratch — no XFCE4 source is included or required.
 │           │                                                          │
 │           ▼                                                          │
 │  ┌─────────────────────────────────────────────────────────────┐    │
-│  │             vantage-backend (Wayland / X11 / XLibre)          │    │
+│  │             vantage-backend (Wayland / X11)                 │    │
 │  └─────────────────────────────────────────────────────────────┘    │
 │                                                                       │
 │  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐    │

@@ -1,5 +1,4 @@
-src_backends = ['vt-backend.c', 'vt-backend-x11.c', 'vt-backend-wayland.c',
-                'vt-backend-xlibre.c']
+src_backends = ['vt-backend.c', 'vt-backend-x11.c', 'vt-backend-wayland.c']
 
 backend_deps = [vantage_core_dep]
 backend_cargs = []

@@ -3,12 +3,16 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# Boots vantage-wm as a headless Wayland compositor (libwayland-server,
-# wl_compositor + wl_seat + wl_output + xdg_wm_base) and runs a REAL
-# xdg-shell client against it:
+# Boots vantage-wm --wayland as a native Wayland compositor
+# (libwayland-server, wl_compositor + wl_seat + wl_output +
+# xdg_wm_base) and runs a REAL xdg-shell client against it, then boots
+# the full vantage-session --wayland and repeats the client check:
 #
-#   vantage-wm  (auto → Wayland headless compositor, socket wayland-N)
-#      ↑ vt-wayland-testclient (xdg_toplevel + wl_shm buffer, solid color)
+#   vantage-wm --wayland      (headless compositor, socket wayland-N)
+#      ↑ vt-wayland-testclient (xdg_toplevel + wl_shm buffer, color)
+#
+#   vantage-session --wayland (WM supervised by the session manager)
+#      ↑ vt-wayland-testclient
 #
 # Verifications:
 #   1. compositor started and created its socket
@@ -47,8 +51,8 @@ unset DISPLAY WAYLAND_DISPLAY
 rm -f /tmp/vantage-wayland.ppm
 
 # ------------------------------------------------------------- compositor
-echo "== harness-wayland: starting vantage-wm (headless compositor) =="
-"$(vb vantage-wm)" > "$WORK/wm.log" 2>&1 &
+echo "== harness-wayland: starting vantage-wm --wayland (headless compositor) =="
+"$(vb vantage-wm)" --wayland > "$WORK/wm.log" 2>&1 &
 WM_PID=$!
 
 SOCKET=""
@@ -143,11 +147,92 @@ done
 grep -q "wm: shutting down" "$WORK/wm.log" \
   && ok "WM logged clean shutdown" || bad "no clean-shutdown log line"
 
+# ===================================================================
+# Full session: vantage-session --wayland (session manager + WM)
+# ===================================================================
+echo "== harness-wayland: starting vantage-session --wayland =="
+SESS_LOG="$WORK/session.log"
+rm -f "$SESS_LOG" /tmp/vantage-wayland.ppm
+# the compositor session must not see the earlier export — it creates
+# its own socket (nesting is refused by design)
+unset WAYLAND_DISPLAY
+"$(vb vantage-session)" --wayland > "$SESS_LOG" 2>&1 &
+SESS_PID=$!
+
+SESS_READY=""
+SOCK2=""
+for i in $(seq 1 100); do
+  grep -q "session: ready" "$SESS_LOG" 2>/dev/null && SESS_READY=1
+  SOCK2=$(grep -o 'WAYLAND_DISPLAY=[a-z0-9-]*' "$SESS_LOG" 2>/dev/null | head -1 | cut -d= -f2)
+  if [ -n "$SESS_READY" ] && [ -n "$SOCK2" ] && [ -S "$XDG_RUNTIME_DIR/$SOCK2" ]; then
+    break
+  fi
+  kill -0 "$SESS_PID" 2>/dev/null || break
+  sleep 0.1
+done
+[ -n "$SESS_READY" ] && ok "vantage-session --wayland reached ready state" \
+  || bad "session never became ready"
+[ -n "$SOCK2" ] && [ -S "$XDG_RUNTIME_DIR/$SOCK2" ] \
+  && ok "session's WM created compositor socket ($SOCK2)" \
+  || bad "no compositor socket from the session"
+grep -q "display backend: Wayland" "$SESS_LOG" \
+  && ok "session reported the Wayland backend" \
+  || bad "session did not report the Wayland backend"
+
+if [ -n "$SOCK2" ] && [ -S "$XDG_RUNTIME_DIR/$SOCK2" ]; then
+  CLIENT_LOG2="$WORK/client-session.log"
+  timeout 10 env WAYLAND_DISPLAY="$SOCK2" \
+    "$(tc vt-wayland-testclient)" 0xff3a9a5f 260 180 > "$CLIENT_LOG2" 2>&1 &
+  C2=$!
+  COMMITTED2=""
+  for i in $(seq 1 100); do
+    grep -q "^committed" "$CLIENT_LOG2" 2>/dev/null && { COMMITTED2=1; break; }
+    kill -0 "$C2" 2>/dev/null || break
+    sleep 0.05
+  done
+  [ -n "$COMMITTED2" ] && ok "xdg client committed under the full session" \
+    || bad "client never committed under the session"
+
+  # frame-dump check: SIGUSR1 goes to the WM child (it runs in its own
+  # session after setsid, so signal it directly via its pid from the log)
+  WM_CHILD=$(grep -o "started 'wm' pid=[0-9]*" "$SESS_LOG" | head -1 | cut -d= -f2)
+  if [ -n "${WM_CHILD:-}" ] && kill -0 "$WM_CHILD" 2>/dev/null; then
+    kill -USR1 "$WM_CHILD" 2>/dev/null
+    for i in $(seq 1 20); do
+      [ -s /tmp/vantage-wayland.ppm ] && break
+      sleep 0.05
+    done
+    [ -s /tmp/vantage-wayland.ppm ] \
+      && ok "frame dump written under the full session" \
+      || bad "no frame dump under the session"
+  fi
+  kill -TERM "$SESS_PID" 2>/dev/null
+fi
+
+SESS_EXITED=""
+for i in $(seq 1 60); do
+  kill -0 "$SESS_PID" 2>/dev/null || { SESS_EXITED=1; break; }
+  sleep 0.1
+done
+[ -n "$SESS_EXITED" ] && ok "session exited on SIGTERM" \
+  || bad "session ignored SIGTERM"
+grep -q "session: exited" "$SESS_LOG" \
+  && ok "session logged clean exit" || bad "no clean session-exit log line"
+sleep 0.3
+STRAGGLERS=$(pgrep -f "$(vb vantage-wm)|$(vb vantage-session)" 2>/dev/null | wc -l)
+if [ "${STRAGGLERS:-0}" -eq 0 ]; then
+  ok "no session/WM stragglers left"
+else
+  bad "$STRAGGLERS process(es) survived session shutdown"
+  pgrep -af "$(vb vantage-wm)|$(vb vantage-session)" 2>/dev/null | head -5
+fi
+
 rm -f /tmp/vantage-wayland.ppm
 echo
 echo "============================================"
 echo "harness-wayland: $PASS passed, $FAIL failed"
 echo "artifacts: $WORK"
 echo "============================================"
-[ "$FAIL" -eq 0 ] || { echo "---- wm.log ----"; cat "$WORK/wm.log"; }
+[ "$FAIL" -eq 0 ] || { echo "---- wm.log ----"; cat "$WORK/wm.log"; \
+                        echo "---- session.log ----"; cat "$SESS_LOG"; }
 [ "$FAIL" -eq 0 ]

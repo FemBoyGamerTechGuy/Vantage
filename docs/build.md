@@ -15,58 +15,89 @@ Install on Alpine: `apk add meson ninja gcc pkgconf`
 
 Install on Void: `xbps-install meson ninja gcc pkg-config`
 
-## Required runtime libraries
+## The `./build` entry point
 
-None for the core. The desktop will run in software-rendering, headless
-mode without any optional deps.
+The recommended workflow is Vantage's own build command, which wraps
+meson/ninja, keeps the development tree directly runnable, and drives
+packaging:
 
-## Optional dependencies (recommended for full feature set)
+```sh
+./build                  # help
+./build build            # configure + compile (rootless)
+./build test             # full test suite (unit + integration)
+./build install          # install to ~/.local (rootless)
+./build install --prefix /usr           # or any prefix
+./build packages arch    # build + test + stage + real .pkg.tar.zst
+./build clean            # remove build outputs
+./build distclean        # also remove dist/ artifacts
+```
 
-| Feature                  | Package(s)                |
-|--------------------------|---------------------------|
-| X11 backend              | libxcb, xcb-randr         |
-| Wayland backend          | wayland-client, wayland-protocols |
-| Hardware rendering       | libegl, libgl or libglesv2 |
-| Vulkan renderer          | vulkan-loader              |
-| GPU detection            | libdrm, libudev            |
-| xkb keyboard layouts     | libxkbcommon               |
-| Live video wallpaper     | libavcodec, libavformat, libavutil, libswscale |
-| Image wallpapers         | gdk-pixbuf-2.0, libpng, libjpeg |
-| Audio integration        | pipewire (preferred), or libpulse, or libasound |
-| Network status           | libnm (preferred), or /proc fallback |
-| Power integration       | libsystemd OR libelogind OR direct /sys |
-| UPower battery           | upower-glib                |
-| D-Bus integration        | dbus-1                     |
+Everything except a system-wide install runs **without root**.
 
-## Build steps
+## Run straight from the source tree
+
+After `./build build`, the binaries are directly runnable — no
+installation needed. Repo-root symlinks point at the build tree:
+
+```sh
+./vantage-session --wayland          # native Wayland compositor session
+./vantage-session --x11              # X11 backend on the running $DISPLAY
+./vantage-wm --x11                   # window manager only
+./vantage-diagnostics --x11          # system report
+./vantage-remote list                # talk to a running session
+```
+
+Binaries locate their resources (themes, default config, autostart)
+relative to their own real location first, then via XDG paths, then the
+compiled install prefix — see `src/core/vt-paths.c`. No absolute
+build-machine paths are baked in, and running from the tree behaves the
+same as running installed, apart from where resources are read from.
+
+## Plain meson (advanced)
 
 ```sh
 git clone https://github.com/FemBoyGamerTechGuy/Vantage
 cd Vantage
-meson setup build
-ninja -C build
+meson setup builddir
+ninja -C builddir
+meson test -C builddir
+ninja -C builddir install
 ```
 
-## Run the test suite
-
-```sh
-meson test -C build
-```
-
-## Install system-wide
-
-```sh
-sudo ninja -C build install
-```
-
-This installs:
+This installs (for prefix `/usr/local`):
 
 * binaries in `/usr/local/bin/`
-* session desktop file in `/usr/local/share/xsessions/`
+* session desktop files in `/usr/local/share/xsessions/` and
+  `/usr/local/share/wayland-sessions/`
 * themes in `/usr/local/share/vantage/themes/`
 * default config in `/usr/local/etc/vantage/`
 * headers in `/usr/local/include/vantage-0.1/`
-* libraries in `/usr/local/lib/`
+* test clients in `/usr/local/lib/vantage/tests/`
+
+## Packaging
+
+Vantage ships its own packagers — `makepkg` is not the interface:
+
+```sh
+./build packages arch
+```
+
+configures a release build, runs the test suite, stages the install
+and writes real, installable artifacts into `dist/`:
+
+```text
+dist/arch/
+├── vantage-<version>-<x86_64|aarch64>.pkg.tar.zst
+└── vantage-devel-<version>-<x86_64|aarch64>.pkg.tar.zst
+```
+
+Dependencies in the generated packages are computed from the actual
+link set (`ldd`) of the staged ELF files. Packagers live in
+`packaging/<distro>/package.sh`; adding a distro means adding a
+directory, and `./build packages <distro>` dispatches to it.
+
+Generated artifacts are never committed to the repository (`dist/` is
+git-ignored).
 
 ## Configuration
 
@@ -81,8 +112,7 @@ vantage-config init
 
 | Option              | Default | Description                          |
 |---------------------|---------|--------------------------------------|
-| x11                 | auto    | Build X11 backend                    |
-| xlibre              | auto    | Build XLibre backend                  |
+| x11                 | auto    | Build X11 backend (Xorg, XLibre, …)  |
 | wayland             | auto    | Build Wayland backend                |
 | opengl              | auto    | Build OpenGL/EGL renderer            |
 | vulkan              | disabled| Build Vulkan renderer (advanced)    |
@@ -102,21 +132,21 @@ vantage-config init
 Example: build with minimal feature set for headless use:
 
 ```sh
-meson setup build -Dwayland=disabled -Dx11=disabled -Dopengl=disabled \
-                  -Dvideo-wallpaper=disabled
+meson setup builddir -Dwayland=disabled -Dx11=disabled -Dopengl=disabled \
+                    -Dvideo-wallpaper=disabled
 ```
 
 ## Debug builds
 
 ```sh
-meson setup build --buildtype=debug
+./build build debug
 # OR for max debug + asan
-meson setup build --buildtype=debug -Db_sanitize=address
-ninja -C build
+meson setup builddir --buildtype=debug -Db_sanitize=address
+ninja -C builddir
 ```
 
 Run a specific tool with verbose logging:
 
 ```sh
-VANTAGE_LOG_LEVEL=trace ./build/src/tools/vantage-diagnostics
+VANTAGE_LOG_LEVEL=trace ./builddir/src/tools/vantage-diagnostics
 ```

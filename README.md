@@ -6,16 +6,18 @@ New features, minimal overhead.
 
 > Vantage is a raw-C desktop environment extending the ideas of XFCE with
 > live video wallpapers, cross-toolkit Qt6/GTK theming, and native
-> Wayland + Xorg + XLibre support. Zero Red Hat dependencies. D-Bus
-> optional. Lightweight by design — new features, minimal overhead.
+> Wayland + X11 support (Xorg, XLibre, or any conforming X server).
+> Zero Red Hat dependencies. D-Bus optional. Lightweight by design —
+> new features, minimal overhead.
 
 ## Features
 
 - **Raw C core.** Modern C11/C17, modular, dependency-light. No GLib, no
   systemd, no D-Bus, no Red Hat infrastructure anywhere in the core.
-- **Two native backends, three servers**: a native Wayland compositor
-  (libwayland-server + xdg-shell), and a shared X11 path that talks to
-  both Xorg and XLibre (runtime-detected).
+- **Two display backends**: a native Wayland compositor
+  (libwayland-server + xdg-shell), and an X11 backend that connects to
+  the running X server — Xorg, XLibre, or any conforming
+  implementation (identified at runtime for diagnostics only).
 - **Hardware-accelerated rendering** on NVIDIA (proprietary + NVK),
   AMD (Mesa/radeonsi/radv), and Intel (Mesa/iris/anv). Software
   fallback always available.
@@ -48,29 +50,36 @@ New features, minimal overhead.
 ## Quick start
 
 ```sh
-# Build (meson + ninja)
-meson setup build
-ninja -C build
+./build build              # configure + compile (rootless)
+./build test               # unit tests + Xvfb/Wayland/CLI integration harnesses
+./vantage-session --x11    # run straight from the tree on the running X server
+./vantage-session --wayland# or start the native Wayland compositor session
 
-# Test (unit tests + Xvfb/Wayland integration harnesses)
-meson test -C build
+./build install            # install to ~/.local (still rootless)
+vantage-session --x11      # same binary, same behavior, installed paths
 
-# Install
-sudo ninja -C build install
-
-# Initialize user config
-vantage-config init
-
-# Run (from a display manager, or startx / weston-launch style)
-vantage-session
+./build packages arch      # produce real *.pkg.tar.zst artifacts in dist/
 ```
 
-Manual integration tests (they boot real servers headlessly):
+Backend selection on `vantage-session` (and `vantage-wm`):
+
+```text
+--wayland    native Vantage Wayland compositor session
+--x11        X11 backend: connect to the X server named by $DISPLAY
+(no flag)    automatic: X11 when $DISPLAY is set, else Wayland
+```
+
+The X11 backend works identically on Xorg and XLibre — both speak X11,
+so Vantage has a single X11 code path and reports the server
+implementation informationally (`vantage-diagnostics` prints
+`X server: Xorg` / `X server: XLibre`).
+
+Integration harnesses (they boot real sessions headlessly):
 
 ```sh
-scripts/xvfb-smoke.sh      # WM + compositor + client + screenshot + pixels
-scripts/session-test.sh    # full session (WM+panel+desktop) end-to-end
-scripts/wayland-test.sh    # native Wayland compositor + client + pixels
+tests/harness-xvfb.sh     # full session on Xvfb: WM+panel+desktop+EWMH+pixels
+tests/harness-wayland.sh  # native Wayland compositor + xdg-shell client
+tests/harness-cli.sh      # CLI surface + dev-tree + installed execution
 ```
 
 ## Documentation
@@ -81,8 +90,7 @@ See [`docs/`](docs/) for:
 - [Build instructions](docs/build.md)
 - [Dependencies](docs/dependencies.md)
 - [Wayland backend](docs/wayland-backend.md)
-- [Xorg backend](docs/xorg-backend.md)
-- [XLibre backend](docs/xlibre-backend.md)
+- [X11 backend](docs/x11-backend.md)
 - [GPU acceleration](docs/gpu.md)
 - [NVIDIA setup](docs/nvidia.md)
 - [AMD setup](docs/amd.md)
@@ -162,5 +170,5 @@ D-Bus, NetworkManager, GTK, or Qt. Vantage is built so that:
 
 ## Contributing
 
-PRs welcome. Please run `meson test` and the three integration
-harnesses under `scripts/` before submitting.
+PRs welcome. Please run `./build test` (the unit tests plus the three
+integration harnesses) before submitting.

@@ -4,8 +4,9 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * Internal header (not installed). All X11-flavored components share one
- * Display connection owned by the backend. XLibre uses the same wire
- * protocol, so everything here works for both Xorg and XLibre.
+ * Display connection owned by the backend. Any conforming X11 server
+ * works — Xorg, XLibre, Xvfb, or others; the running implementation is
+ * queried for diagnostics via vt_x11_server_name().
  */
 #ifndef VANTAGE_X11_H
 #define VANTAGE_X11_H
@@ -23,6 +24,10 @@ extern "C" {
 
 /* Returns the process-wide X11 connection (NULL if not initialized). */
 Display *vt_x11_display(void);
+/* Informational: normalized name of the running X server implementation
+ * ("Xorg", "XLibre", Xvfb's vendor, or the raw vendor string).
+ * Never selects code paths — the X11 API is the same for all of them. */
+const char *vt_x11_server_name(void);
 Window   vt_x11_root(void);
 int      vt_x11_screen(void);
 

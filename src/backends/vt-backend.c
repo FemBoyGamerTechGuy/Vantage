@@ -5,27 +5,35 @@
  *
  * Selects and instantiates the appropriate backend based on user config
  * and what is available at runtime. The backend implementations live in
- * vt-backend-wayland.c, vt-backend-x11.c, vt-backend-xlibre.c.
+ * vt-backend-wayland.c (native Wayland compositor) and vt-backend-x11.c
+ * (client of the running X server, Xorg or XLibre alike).
  *
- * Backend structs are heap-allocated by their constructors so that each
- * process owns exactly one live instance with mutable state.
+ * Automatic selection depends only on the display transports present in
+ * the environment ($DISPLAY / $WAYLAND_DISPLAY), never on desktop-
+ * environment variables. Backend structs are heap-allocated by their
+ * constructors so that each process owns exactly one live instance
+ * with mutable state.
  */
 
 #define VT_LOG_DOMAIN "backend"
 #include <vantage/vt-backend.h>
+#include <vantage/vt-x11.h>
 #include <string.h>
 #include <stdlib.h>
+
+#if !defined(VT_HAVE_X11)
+/* defined by the no-X11 stub in vt-backend-x11.c */
+const char *vt_x11_server_name(void);
+#endif
 
 
 vt_backend_t *_vt_backend_wayland_new(void);
 vt_backend_t *_vt_backend_x11_new(void);
-vt_backend_t *_vt_backend_xlibre_new(void);
 
 static const char *const _names[] = {
     [VT_BACKEND_AUTO]    = "auto",
     [VT_BACKEND_WAYLAND] = "wayland",
-    [VT_BACKEND_XORG]    = "xorg",
-    [VT_BACKEND_XLIBRE]  = "xlibre",
+    [VT_BACKEND_X11]     = "x11",
     [VT_BACKEND_HEADLESS]= "headless",
     [VT_BACKEND_INVALID] = "invalid",
 };
@@ -34,6 +42,10 @@ vt_backend_kind_t vt_backend_kind_from_str(const char *s) {
     if (!s) return VT_BACKEND_AUTO;
     for (int i = 0; i < (int)VT_ARRAY_SIZE(_names); i++)
         if (vt_strcaseeq(_names[i], s)) return (vt_backend_kind_t)i;
+    /* legacy spellings: one X11 code path, whatever server runs it */
+    if (vt_strcaseeq("xorg", s) || vt_strcaseeq("xlibre", s) ||
+        vt_strcaseeq("x11l", s))
+        return VT_BACKEND_X11;
     return VT_BACKEND_AUTO;
 }
 const char *vt_backend_kind_str(vt_backend_kind_t k) {
@@ -44,25 +56,30 @@ const char *vt_backend_name(const vt_backend_t *b) {
 }
 
 vt_backend_t *vt_backend_new(vt_backend_kind_t preferred) {
-    /* Probe order: user-specified first, then Wayland (native), then X11.
-     * XLibre shares the X11 code path with a different library flavor. */
-    vt_backend_t *(*candidates[3])(void) = { NULL, NULL, NULL };
+    /* Probe order: the requested backend first; for AUTO, prefer the X11
+     * server that is already running ($DISPLAY) and otherwise start the
+     * native Wayland compositor. Selection never inspects
+     * XDG_CURRENT_DESKTOP and friends. */
+    vt_backend_t *(*candidates[2])(void) = { NULL, NULL };
     int n = 0;
     switch (preferred) {
     case VT_BACKEND_WAYLAND:
         candidates[n++] = _vt_backend_wayland_new;
         break;
-    case VT_BACKEND_XORG:
+    case VT_BACKEND_X11:
         candidates[n++] = _vt_backend_x11_new;
         break;
-    case VT_BACKEND_XLIBRE:
-        candidates[n++] = _vt_backend_xlibre_new;
+    default: {
+        const char *dpy = getenv("DISPLAY");
+        if (dpy && *dpy) {
+            candidates[n++] = _vt_backend_x11_new;
+            candidates[n++] = _vt_backend_wayland_new;
+        } else {
+            candidates[n++] = _vt_backend_wayland_new;
+            candidates[n++] = _vt_backend_x11_new;
+        }
         break;
-    default:
-        candidates[n++] = _vt_backend_wayland_new;
-        candidates[n++] = _vt_backend_x11_new;
-        candidates[n++] = _vt_backend_xlibre_new;
-        break;
+    }
     }
     for (int i = 0; i < n; i++) {
         if (!candidates[i]) continue;
@@ -152,6 +169,18 @@ void vt_backend_emit_event(vt_backend_t *b, void *event) {
 }
 
 void *vt_backend_native(const vt_backend_t *b) {
-    /* The X11 backends store the Display* in priv. */
+    /* The X11 backend stores the Display* in priv. */
     return b ? b->priv : NULL;
+}
+
+const char *vt_backend_server_implementation(const vt_backend_t *b) {
+    if (!b) return NULL;
+    switch (b->kind) {
+    case VT_BACKEND_X11:
+        return vt_x11_server_name();
+    case VT_BACKEND_WAYLAND:
+        return "Vantage";
+    default:
+        return NULL;
+    }
 }

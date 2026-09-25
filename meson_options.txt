@@ -1,5 +1,4 @@
 option('x11',           type : 'feature', value : 'auto',  description : 'Build X11 backend')
-option('xlibre',        type : 'feature', value : 'auto',  description : 'Build XLibre backend (shares X11 code path)')
 option('wayland',       type : 'feature', value : 'auto',  description : 'Build Wayland backend')
 option('opengl',        type : 'feature', value : 'auto',  description : 'Build OpenGL/EGL renderer')
 option('vulkan',        type : 'feature', value : 'disabled', description : 'Build Vulkan renderer (advanced)')

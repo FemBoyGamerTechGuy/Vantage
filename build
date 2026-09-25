@@ -1,0 +1,246 @@
+#!/bin/bash
+# build — Vantage build & packaging entry point
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# The whole development workflow is rootless:
+#
+#   ./build build                      configure + compile (builddir/)
+#   ./build test                       run the full test suite
+#   ./build install [--prefix DIR]     install (default: $HOME/.local)
+#   ./build packages <distro>          build, test, stage and produce
+#                                      installable packages in dist/
+#   ./build clean                      remove build outputs
+#   ./build distclean                  also remove dist/ artifacts
+#
+# After ./build build, the Vantage binaries are directly runnable from
+# the source tree (repo-root symlinks):
+#
+#   ./vantage-session --wayland | --x11
+#   ./vantage-wm --x11
+#
+# Binaries locate their resources (themes, defaults, autostart) relative
+# to their own location first, then XDG, then the compiled prefix — no
+# hardcoded absolute paths. See src/core/vt-paths.c.
+
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")" >/dev/null 2>&1 && pwd)"
+BUILD_DIR_NAME="builddir"
+BUILD="$ROOT/$BUILD_DIR_NAME"
+BUILD_DIST="$ROOT/build-dist"       # release builddir used for packaging
+BUILD_INST="$ROOT/build-inst"       # alternate-prefix install builddir
+DIST="$ROOT/dist"
+
+# Single version source: the meson project version (meson.build).
+vantage_version() {
+    sed -n "s/^  version *: *'\(.*\)',$/\1/p" "$ROOT/meson.build" | head -n1
+}
+
+say()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+err()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; }
+
+need_tools() {
+    local missing=()
+    for t in "$@"; do
+        command -v "$t" >/dev/null 2>&1 || missing+=("$t")
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        err "missing required tools: ${missing[*]}"
+        exit 1
+    fi
+}
+
+# ---------------------------------------------------------------- help
+print_help() {
+    local ver; ver="$(vantage_version)"
+    cat <<EOF
+Vantage build system (version $ver)
+
+Usage:
+  ./build build [BUILDTYPE]     configure and compile (default: debugoptimized)
+  ./build test                  run the full test suite (unit + integration)
+  ./build install [PREFIX]      install Vantage (default prefix: \$HOME/.local)
+  ./build packages DISTRO       build, test and produce installable packages
+                                under dist/DISTRO (e.g. ./build packages arch)
+  ./build clean                 remove build directories and staging area
+  ./build distclean             clean + remove dist/ package artifacts
+  ./build help                  show this help
+
+Development-tree execution (no installation needed):
+  ./vantage-session --wayland         native Wayland compositor session
+  ./vantage-session --x11             X11 backend (uses the running \$DISPLAY)
+  ./vantage-wm --x11                  window manager only
+  ./builddir/src/tools/vantage-*      raw build-tree binaries
+
+Backend selection:
+  --wayland | --x11 | (automatic: X11 when \$DISPLAY is set, else Wayland)
+
+Environment:
+  VT_EXTRA_RPATH     extra RUNPATH baked into installed binaries (for
+                     user-prefix builds where runtime libs live outside
+                     system paths; unset in normal distro builds)
+  VT_BUILDTYPE       default buildtype for ./build build (debugoptimized)
+EOF
+}
+
+# ------------------------------------------------------------- helpers
+meson_prefix_of() {   # $1: builddir -> configured prefix
+    [ -f "$1/.vt-prefix" ] && cat "$1/.vt-prefix" || true
+}
+
+do_setup() {          # $1: builddir, $2: prefix, $3: buildtype, $4..: extra args
+    local bd="$1" prefix="$2" btype="${3:-debugoptimized}"
+    shift 3 || true
+    say "configuring $bd (prefix=$prefix, buildtype=$btype${*:+, extra: $*})"
+    rm -rf "$bd"
+    meson setup "$bd" --prefix="$prefix" --buildtype="$btype" "$@" "$ROOT"
+    printf '%s' "$prefix" > "$bd/.vt-prefix"
+}
+
+ensure_built() {      # $1: builddir, $2: prefix, $3: buildtype, $4..: extra args
+    local bd="$1" prefix="$2" btype="${3:-debugoptimized}"
+    shift 3 || true
+    if [ ! -f "$bd/build.ninja" ] || [ "$(meson_prefix_of "$bd")" != "$prefix" ]; then
+        do_setup "$bd" "$prefix" "$btype" "$@"
+    fi
+    say "compiling $bd"
+    ninja -C "$bd"
+}
+
+# Repo-root symlinks so the project is directly runnable:
+#   ./vantage-session --x11
+link_tree_binaries() {
+    local tools_dir="$BUILD/src/tools"
+    local names="vantage-session vantage-wm vantage-panel vantage-desktop
+                 vantage-settings vantage-config vantage-renderer
+                 vantage-theme vantage-diagnostics vantage-remote"
+    local linked=0
+    for n in $names; do
+        if [ -x "$tools_dir/$n" ]; then
+            ln -sfn "$BUILD_DIR_NAME/src/tools/$n" "$ROOT/$n"
+            linked=$((linked+1))
+        else
+            rm -f "$ROOT/$n"
+        fi
+    done
+    [ "$linked" -gt 0 ] && say "$linked repo-root launch symlinks (./vantage-session …)"
+}
+
+# ---------------------------------------------------------------- cmds
+cmd_build() {
+    need_tools meson ninja
+    local btype="${VT_BUILDTYPE:-debugoptimized}"
+    if [ "${1:-}" = "release" ] || [ "${1:-}" = "debug" ] \
+       || [ "${1:-}" = "debugoptimized" ] || [ "${1:-}" = "plain" ]; then
+        btype="$1"
+    fi
+    ensure_built "$BUILD" "${VT_DEV_PREFIX:-$HOME/.local}" "$btype"
+    link_tree_binaries
+    say "build complete — run ./vantage-session --help (or --wayland / --x11)"
+}
+
+cmd_test() {
+    need_tools meson ninja
+    if [ ! -f "$BUILD/build.ninja" ]; then
+        cmd_build
+    fi
+    say "running test suite"
+    meson test -C "$BUILD" --print-errorlogs
+    say "all tests passed"
+}
+
+cmd_install() {
+    need_tools meson ninja
+    local prefix="${1:-${VT_INSTALL_PREFIX:-$HOME/.local}}"
+    if [ "$(meson_prefix_of "$BUILD")" = "$prefix" ]; then
+        ensure_built "$BUILD" "$prefix" "debugoptimized"
+        say "installing to $prefix"
+        ninja -C "$BUILD" install
+    else
+        ensure_built "$BUILD_INST" "$prefix" "debugoptimized"
+        say "installing to $prefix"
+        ninja -C "$BUILD_INST" install
+    fi
+    say "installed to $prefix — run: $prefix/bin/vantage-session --help"
+}
+
+cmd_packages() {
+    local distro="${1:-}"
+    if [ -z "$distro" ]; then
+        err "usage: ./build packages <distro>   (e.g. ./build packages arch)"
+        exit 2
+    fi
+    local packager="$ROOT/packaging/$distro/package.sh"
+    if [ ! -f "$packager" ]; then
+        err "no packager for '$distro' (expected packaging/$distro/package.sh)"
+        [ -d "$ROOT/packaging" ] && \
+            err "available: $(cd "$ROOT/packaging" && ls -d */ 2>/dev/null | tr -d '/' | tr '\n' ' ')"
+        exit 2
+    fi
+    need_tools meson ninja
+
+    local ver; ver="$(vantage_version)"
+
+    # 1. configure + build (release, distro /usr layout) into build-dist/.
+    #    sysconfdir is absolute (/etc) as distros expect, and the sandbox
+    #    RUNPATH hack is neutralized so packaged binaries stay clean.
+    VT_EXTRA_RPATH="${VT_PACKAGE_EXTRA_RPATH:-}" \
+        ensure_built "$BUILD_DIST" "/usr" "release" -Dsysconfdir=/etc
+
+    # 2. tests
+    say "running test suite (release build)"
+    meson test -C "$BUILD_DIST" --print-errorlogs
+
+    # 3. stage the installation
+    local stage="$DIST/stage"
+    say "staging installation into $stage"
+    rm -rf "$stage"
+    mkdir -p "$stage"
+    DESTDIR="$stage" ninja -C "$BUILD_DIST" install
+
+    # 4. let the distro packager produce the actual artifacts
+    say "packaging for $distro"
+    bash "$packager" "$stage" "$DIST/$distro" "$ver"
+
+    say "done — artifacts in $DIST/$distro"
+}
+
+cmd_clean() {
+    say "removing build outputs"
+    rm -rf "$BUILD" "$BUILD_DIST" "$BUILD_INST" "$DIST/stage"
+    for n in vantage-session vantage-wm vantage-panel vantage-desktop \
+             vantage-settings vantage-config vantage-renderer \
+             vantage-theme vantage-diagnostics vantage-remote; do
+        [ -L "$ROOT/$n" ] && rm -f "$ROOT/$n"
+    done
+}
+
+cmd_distclean() {
+    cmd_clean
+    say "removing dist/ artifacts"
+    rm -rf "$DIST"
+}
+
+# ---------------------------------------------------------------- main
+cd "$ROOT"
+
+case "${1:-help}" in
+    help|-h|--help)      print_help ;;
+    build)               shift; cmd_build "$@" ;;
+    test)                shift; cmd_test "$@" ;;
+    install)
+        shift
+        prefix=""
+        if [ "${1:-}" = "--prefix" ] && [ -n "${2:-}" ]; then
+            prefix="$2"
+        elif [ -n "${1:-}" ]; then
+            prefix="$1"
+        fi
+        cmd_install "$prefix"
+        ;;
+    packages)            shift; cmd_packages "$@" ;;
+    clean)               cmd_clean ;;
+    distclean)           cmd_distclean ;;
+    *)                   err "unknown command '$1'"; print_help; exit 2 ;;
+esac

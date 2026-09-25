@@ -1,5 +1,5 @@
 Name:       vantage
-Version:    0.1.0
+Version:    0.2.0
 Release:    1%{?dist}
 Summary:    Lightweight raw-C Linux desktop environment
 License:    GPL-2.0-or-later
@@ -24,7 +24,7 @@ Requires: %{name}-core%{?_isa} = %{version}-%{release}
 %description
 Vantage is a lightweight Linux desktop environment written primarily in C,
 inspired by XFCE but implemented from scratch. It supports native Wayland,
-Xorg, and XLibre backends, hardware-accelerated rendering (NVIDIA/AMD/Intel),
+X11 (Xorg/XLibre) backends, hardware-accelerated rendering (NVIDIA/AMD/Intel),
 live video wallpapers, cross-toolkit Qt6/GTK theming, and runs without D-Bus
 or systemd if they are not available.
 

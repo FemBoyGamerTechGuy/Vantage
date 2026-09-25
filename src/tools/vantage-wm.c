@@ -18,15 +18,37 @@
 
 #define VT_LOG_DOMAIN "wm"
 #include <vantage/vt-core.h>
+#include <vantage/vt-paths.h>
 #include <vantage/vt-wm.h>
 #include <vantage/vt-backend.h>
 #include <vantage/vt-compositor.h>
 #include <vantage/vt-config.h>
 #include <vantage/vt-ipc.h>
 #include <signal.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+static void _print_usage(FILE *fp, const char *argv0) {
+    fprintf(fp,
+"Vantage %s — window manager / compositor server\n"
+"\n"
+"Usage:\n"
+"  %s [OPTION]...\n"
+"\n"
+"Backend selection:\n"
+"  --wayland        run as the native Wayland compositor\n"
+"  --x11            manage the X server named by $DISPLAY\n"
+"  (none)           automatic: X11 when $DISPLAY is set, else Wayland\n"
+"\n"
+"Options:\n"
+"  --no-composite   disable the compositing manager\n"
+"  -v, --verbose    verbose logging\n"
+"  -h, --help       show this help and exit\n"
+"  -V, --version    show version and exit\n",
+            vt_paths_version(), argv0);
+}
 
 static volatile sig_atomic_t _stop = 0;
 static void _on_sig(int sig) { (void)sig; _stop = 1; }
@@ -381,25 +403,64 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     vt_log_set_level(VT_LOG_INFO);
     bool no_composite = false;
+    vt_backend_kind_t cli_kind = VT_BACKEND_INVALID;
+
     for (int i = 1; i < argc; i++) {
         if (vt_streq(argv[i], "--no-composite")) no_composite = true;
+        else if (vt_streq(argv[i], "--wayland")) cli_kind = VT_BACKEND_WAYLAND;
+        else if (vt_streq(argv[i], "--x11")) cli_kind = VT_BACKEND_X11;
         else if (vt_streq(argv[i], "-v") || vt_streq(argv[i], "--verbose"))
             vt_log_set_level(VT_LOG_DEBUG);
+        else if (vt_streq(argv[i], "-h") || vt_streq(argv[i], "--help")) {
+            _print_usage(stdout, argv[0]);
+            return 0;
+        } else if (vt_streq(argv[i], "-V") || vt_streq(argv[i], "--version")) {
+            printf("Vantage %s\n", vt_paths_version());
+            return 0;
+        } else {
+            fprintf(stderr,
+                    "vantage-wm: unrecognized option '%s'\n"
+                    "Try 'vantage-wm --help' for usage.\n", argv[i]);
+            return 2;
+        }
     }
 
     vt_config_t *cfg = vt_config_new_defaults();
     vt_config_load(cfg, vt_config_default_path());
 
-    vt_backend_kind_t be_kind = vt_backend_kind_from_str(
-        vt_config_get(cfg, "desktop", "backend", "auto"));
+    /* Backend resolution matches vantage-session:
+     * CLI flag > $VANTAGE_BACKEND > configuration > automatic. */
+    vt_backend_kind_t be_kind = cli_kind;
+    if (be_kind == VT_BACKEND_INVALID) {
+        const char *env = getenv("VANTAGE_BACKEND");
+        if (env && *env) be_kind = vt_backend_kind_from_str(env);
+    }
+    if (be_kind == VT_BACKEND_INVALID)
+        be_kind = vt_backend_kind_from_str(
+            vt_config_get(cfg, "desktop", "backend", "auto"));
+    /* VT_BACKEND_AUTO falls through to the factory's own detection
+     * (X11 when $DISPLAY is set, otherwise the Wayland compositor). */
     vt_backend_t *backend = vt_backend_new(be_kind);
     if (backend->kind == VT_BACKEND_HEADLESS) {
-        vt_loge("wm: no display available (DISPLAY/WAYLAND_DISPLAY unset?)");
+        vt_loge("wm: no display backend available: DISPLAY%s%s and the "
+                "Wayland compositor could not start (WAYLAND_DISPLAY%s%s). "
+                "See vantage-session --help.",
+                getenv("DISPLAY") && *getenv("DISPLAY") ? "=" : " is unset (",
+                getenv("DISPLAY") && *getenv("DISPLAY")
+                    ? getenv("DISPLAY") : ")",
+                getenv("WAYLAND_DISPLAY") && *getenv("WAYLAND_DISPLAY")
+                    ? "=" : " is unset (",
+                getenv("WAYLAND_DISPLAY") && *getenv("WAYLAND_DISPLAY")
+                    ? getenv("WAYLAND_DISPLAY") : ")");
         vt_config_free(cfg);
         vt_backend_free(backend);
         return 1;
     }
-    vt_logi("wm: backend=%s", vt_backend_name(backend));
+    const char *srv = vt_backend_server_implementation(backend);
+    if (backend->kind == VT_BACKEND_X11)
+        vt_logi("wm: backend=x11, X server: %s", srv ? srv : "unknown");
+    else
+        vt_logi("wm: backend=wayland (native compositor)");
 
     vt_wm_t *wm = vt_wm_new(backend);
     _ctx_t ctx = { .wm = wm, .comp = NULL, .ipc = NULL };
