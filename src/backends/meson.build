@@ -84,6 +84,17 @@ if dep_freetype.found() and dep_fontconfig.found()
   backend_deps += [dep_freetype, dep_fontconfig]
   backend_cargs += ['-DVT_HAVE_FREETYPE']
 endif
+# compositor-side panel ICONS: vt-wl-panel.c guards its icon loading
+# with VT_HAVE_PNG/VT_HAVE_GDKPIXBUF. These defines were previously
+# only set for the wallpaper library, so the Wayland panel silently
+# compiled its icon support OUT (menu icons never loaded — the
+# _argb_scale "unused" warning was the tell).
+if dep_libpng.found()
+  backend_cargs += ['-DVT_HAVE_PNG']
+endif
+if dep_gdkpixbuf.found()
+  backend_cargs += ['-DVT_HAVE_GDKPIXBUF']
+endif
 
 lib_vantage_backends = static_library('vantage-backends',
   sources : src_backends + lib_vantage_backends_extra_sources,

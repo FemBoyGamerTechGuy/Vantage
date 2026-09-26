@@ -844,16 +844,58 @@ static void _panel_action(vt_wl_panel_t *p, int act) {
 #define _MENU_CAT_W    150
 #define _MENU_W        560
 #define _MENU_SEARCH_H 34
+#define _CAL_CELL      30
+#define _VOL_POP_W     44
+#define _VOL_POP_H     170
 
 static int _apps_menu_h(const vt_wl_panel_t *p) {
     return _MENU_SEARCH_H + p->app_rows * _ROW + 8;
 }
 
+/* Single source of truth for EVERY popup menu's rectangle. The
+ * painter and the click hit-test MUST agree — when they drifted
+ * apart (the session menu was drawn right-aligned but hit-tested at
+ * _rx_user()-168, which slides with the USERNAME LENGTH), clicks fell
+ * outside the hit region and the menu actions became unclickable on
+ * machines with long login names. */
+static void _menu_rect(const vt_wl_panel_t *p, int menu, int *x, int *y,
+                       int *w, int *h) {
+    *y = p->bar_h + 4;
+    switch (menu) {
+    case _WL_MENU_APPS:
+        *x = _MENU_X; *w = _MENU_W;
+        *h = _apps_menu_h(p);
+        break;
+    case _WL_MENU_SESSION:
+        *w = 210;
+        *h = _WL_UA_COUNT * _ROW + 8 + (p->status ? _ROW : 0);
+        /* right-aligned to the panel's right margin — NEVER anchored
+         * to _rx_user(): that slides with the username length */
+        *x = p->w - 8 - *w;
+        if (*x < 4) *x = 4;
+        break;
+    case _WL_MENU_CAL:
+        *w = 7 * _CAL_CELL + 16;
+        *h = 6 * _CAL_CELL + 64;
+        *x = _rx_clock(p) - 40;
+        if (*x < 4) *x = 4;
+        if (*x + *w > p->w - 4) *x = p->w - 4 - *w;
+        break;
+    case _WL_MENU_VOL:
+        *w = _VOL_POP_W; *h = _VOL_POP_H;
+        *x = _rx_vol(p) + _VOL_W / 2 - *w / 2;
+        break;
+    default:
+        *x = 0; *y = 0; *w = 0; *h = 0;
+        break;
+    }
+}
+
 static void _paint_apps_menu(vt_wl_panel_t *p, uint32_t *fb, int fbw,
                              int fbh) {
     _apps_load(p);
-    const int w = _MENU_W, h = _apps_menu_h(p);
-    int x = _MENU_X, y = p->bar_h + 4;
+    int x, y, w, h;
+    _menu_rect(p, _WL_MENU_APPS, &x, &y, &w, &h);
     _fill_rect(fb, fbw, fbh, x, y, w, h, _C_MENU_BG);
 
     /* --- search bar --- */
@@ -945,11 +987,8 @@ static void _paint_apps_menu(vt_wl_panel_t *p, uint32_t *fb, int fbw,
 
 static void _paint_session_menu(vt_wl_panel_t *p, uint32_t *fb, int fbw,
                                 int fbh) {
-    const int w = 210;
-    int h = _WL_UA_COUNT * _ROW + 8 + (p->status ? _ROW : 0);
-    int x = _rx_user(p) - 168;
-    if (x < 4) x = 4;
-    int y = p->bar_h + 4;
+    int x, y, w, h;
+    _menu_rect(p, _WL_MENU_SESSION, &x, &y, &w, &h);
     _fill_rect(fb, fbw, fbh, x, y, w, h, _C_MENU_BG);
     for (int i = 0; i < _WL_UA_COUNT; i++) {
         int ry = y + 4 + i * _ROW;
@@ -964,14 +1003,10 @@ static void _paint_session_menu(vt_wl_panel_t *p, uint32_t *fb, int fbw,
                    p->status, _C_DIM);
 }
 
-#define _CAL_CELL 30
 static void _paint_calendar(vt_wl_panel_t *p, uint32_t *fb, int fbw,
                             int fbh) {
-    const int w = 7 * _CAL_CELL + 16, h = 6 * _CAL_CELL + 64;
-    int x = _rx_clock(p) - 40;
-    if (x < 4) x = 4;
-    if (x + w > fbw - 4) x = fbw - 4 - w;
-    int y = p->bar_h + 4;
+    int x, y, w, h;
+    _menu_rect(p, _WL_MENU_CAL, &x, &y, &w, &h);
     _fill_rect(fb, fbw, fbh, x, y, w, h, _C_MENU_BG);
     static const char *const mon[] = { "January", "February", "March",
         "April", "May", "June", "July", "August", "September", "October",
@@ -1022,13 +1057,11 @@ static void _paint_calendar(vt_wl_panel_t *p, uint32_t *fb, int fbw,
     }
 }
 
-#define _VOL_POP_W 44
-#define _VOL_POP_H 170
 static void _paint_volume(vt_wl_panel_t *p, uint32_t *fb, int fbw,
                           int fbh) {
     _vol_sync(p);
-    int x = _rx_vol(p) + _VOL_W / 2 - _VOL_POP_W / 2;
-    int y = p->bar_h + 4;
+    int x, y, w, h;
+    _menu_rect(p, _WL_MENU_VOL, &x, &y, &w, &h);
     _fill_rect(fb, fbw, fbh, x, y, _VOL_POP_W, _VOL_POP_H, _C_MENU_BG);
     if (!p->vol_avail) {
         _text_draw(fb, fbw, fbh, x + 6, y + 40, "no", _C_DIM);
@@ -1183,31 +1216,9 @@ bool vt_wl_panel_contains(const vt_wl_panel_t *p, int x, int y) {
     if (!p) return false;
     if (y >= 0 && y < p->bar_h) return true;
     if (p->menu == _WL_MENU_NONE) return false;
-    int my = p->bar_h + 4;
-    switch (p->menu) {
-    case _WL_MENU_APPS:
-        return x >= _MENU_X && x < _MENU_X + _MENU_W && y >= my &&
-               y < my + _apps_menu_h(p);
-    case _WL_MENU_SESSION: {
-        const int w = 210;
-        int h = _WL_UA_COUNT * _ROW + 8 + (p->status ? _ROW : 0);
-        int mx = _rx_user(p) - 168;
-        if (mx < 4) mx = 4;
-        return x >= mx && x < mx + w && y >= my && y < my + h;
-    }
-    case _WL_MENU_CAL: {
-        const int w = 7 * _CAL_CELL + 16, h = 6 * _CAL_CELL + 64;
-        int mx = _rx_clock(p) - 40;
-        if (mx < 4) mx = 4;
-        return x >= mx && x < mx + w && y >= my && y < my + h;
-    }
-    case _WL_MENU_VOL: {
-        int mx = _rx_vol(p) + _VOL_W / 2 - _VOL_POP_W / 2;
-        return x >= mx && x < mx + _VOL_POP_W && y >= my &&
-               y < my + _VOL_POP_H;
-    }
-    default: return false;
-    }
+    int mx, my, mw, mh;
+    _menu_rect(p, p->menu, &mx, &my, &mw, &mh);
+    return x >= mx && x < mx + mw && y >= my && y < my + mh;
 }
 
 bool vt_wl_panel_pointer(vt_wl_panel_t *p, int x, int y, int kind,
@@ -1272,6 +1283,12 @@ bool vt_wl_panel_pointer(vt_wl_panel_t *p, int x, int y, int kind,
         }
         int vx = _rx_vol(p);
         if (x >= vx && x < vx + _VOL_W) {
+            if (kind == 1 && button == 2) {
+                /* middle-click on the applet toggles mute (same
+                 * convention as the X11 volume applet) */
+                _vol_toggle(p);
+                return true;
+            }
             if (kind == 1) {
                 if (p->menu == _WL_MENU_VOL) {
                     p->menu = _WL_MENU_NONE;
@@ -1364,9 +1381,8 @@ bool vt_wl_panel_pointer(vt_wl_panel_t *p, int x, int y, int kind,
         return true;
     }
     case _WL_MENU_SESSION: {
-        const int mw = 210;
-        int mx = _rx_user(p) - 168;
-        if (mx < 4) mx = 4;
+        /* rows resolve from y alone; x-bounds were already enforced by
+         * vt_wl_panel_contains() via _menu_rect (single geometry source) */
         int ly = y - my;
         if (kind == 0) {
             int ri = (ly - 4) / _ROW;
@@ -1382,18 +1398,16 @@ bool vt_wl_panel_pointer(vt_wl_panel_t *p, int x, int y, int kind,
         } else {
             p->menu = _WL_MENU_NONE;
         }
-        (void)mw;
         return true;
     }
     case _WL_MENU_CAL: {
-        const int mw = 7 * _CAL_CELL + 16;
-        int mx = _rx_clock(p) - 40;
-        if (mx < 4) mx = 4;
-        int lx = x - mx, ly = y - my;
+        int mxx, myy, mww, mhh;
+        _menu_rect(p, _WL_MENU_CAL, &mxx, &myy, &mww, &mhh);
+        int lx = x - mxx, ly = y - my;
         if ((kind == 2 || kind == 1) && ly < 38) {
             if (lx < 32) {
                 if (--p->cal_mon < 0) { p->cal_mon = 11; p->cal_year--; }
-            } else if (lx > mw - 32) {
+            } else if (lx > mww - 32) {
                 if (++p->cal_mon > 11) { p->cal_mon = 0; p->cal_year++; }
             } else {
                 p->menu = _WL_MENU_NONE;
@@ -1404,8 +1418,9 @@ bool vt_wl_panel_pointer(vt_wl_panel_t *p, int x, int y, int kind,
         return true;
     }
     case _WL_MENU_VOL: {
-        int mx = _rx_vol(p) + _VOL_W / 2 - _VOL_POP_W / 2;
-        int lx = x - mx, ly = y - my;
+        int mxx, myy, mww, mhh;
+        _menu_rect(p, _WL_MENU_VOL, &mxx, &myy, &mww, &mhh);
+        int lx = x - mxx, ly = y - my;
         if (!p->vol_avail) {
             if (kind == 1) p->menu = _WL_MENU_NONE;
             return true;

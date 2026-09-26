@@ -31,7 +31,7 @@
 set -u
 PASS=0; FAIL=0
 ok()  { echo "  PASS: $1"; PASS=$((PASS+1)); }
-bad() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
+bad() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); printf '  FAIL: %s\n' "$1" >> "$FAILS"; }
 
 # ---------------------------------------------------------------- paths
 BUILD="${1:-${VT_BUILD_DIR:-}}"
@@ -53,6 +53,10 @@ command -v Xvfb >/dev/null 2>&1 || { echo "Xvfb not found"; exit 77; }
 
 # --------------------------------------------------------- isolated env
 WORK=$(mktemp -d /tmp/vantage-xvfb.XXXXXX)
+# failures are recorded so the TAIL of a truncated meson log (which
+# only keeps the last 100 lines — after any log dumps) still shows
+# exactly WHICH checks failed
+FAILS="$WORK/fails.txt"; : > "$FAILS"
 mkdir -p "$WORK/run" "$WORK/config/vantage" "$WORK/share/applications" \
          "$WORK/data-dirs"
 export XDG_RUNTIME_DIR="$WORK/run"
@@ -73,9 +77,39 @@ cat > "$XDG_DATA_HOME/applications/vt-harness-probe.desktop" <<'DESK'
 Type=Application
 Name=Zz Harness Probe
 Exec=/bin/sh -c 'echo launched > $WORK/x11-launch-marker'
+Icon=vt-harness-probe
 Categories=Utility;
 DESK
 sed -i "s|\$WORK|$WORK|g" "$XDG_DATA_HOME/applications/vt-harness-probe.desktop"
+# deterministic ICON: private icon theme + solid-color PNG — proves the
+# X11 launcher's icon-theme lookup → PNG decode → ARGB → XRender path
+ICON_DIR="$XDG_DATA_HOME/icons/vt-harness-theme/24x24/apps"
+mkdir -p "$ICON_DIR"
+python3 - "$ICON_DIR/vt-harness-probe.png" <<'PYICON'
+import struct, zlib, sys
+w = h = 24
+rgb = (0xc0, 0x40, 0x80)   # unique pink-magenta: used nowhere else
+raw = b''.join(b'\x00' + bytes(rgb) * w for _ in range(h))
+def chunk(t, d):
+    c = t + d
+    return struct.pack('>I', len(d)) + c + struct.pack(
+        '>I', zlib.crc32(c) & 0xffffffff)
+ihdr = struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)
+data = (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr) +
+        chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+open(sys.argv[1], 'wb').write(data)
+PYICON
+cat > "$XDG_DATA_HOME/icons/vt-harness-theme/index.theme" <<'EOF'
+[Icon Theme]
+Name=vt-harness-theme
+Directories=24x24/apps
+
+[24x24/apps]
+Size=24
+Context=Applications
+Type=Fixed
+EOF
+export VANTAGE_ICON_THEME=vt-harness-theme
 cat > "$XDG_DATA_HOME/applications/vt-harness-term.desktop" <<'DESK'
 [Desktop Entry]
 Type=Application
@@ -345,12 +379,21 @@ pix = data[pos:pos + w*h*3]
 # 0x2a2e35 is opaque → exactly matchable
 band = pix[(38*w)*3 : (72*w)*3]
 search_bg = band.count(bytes((0x2a, 0x2e, 0x35)))
+# text presence must be FONT-INDEPENDENT (Xft renders with the system
+# 'sans' font): count LIGHT pixels instead of exact text-color pixels —
+# thinner fonts (Carlito/Noto) antialias to fewer exact-color pixels
+# and broke the exact-count variant on real machines.
 menu_area = pix[(38*w)*3 : (250*w)*3]
-white = menu_area.count(bytes((255, 255, 255)))
-text = menu_area.count(bytes((0xec, 0xee, 0xf0)))
-print(f"menu: search-bg={search_bg} white={white} text={text}")
-# search field + rendered text = the REAL Programs menu
-sys.exit(0 if search_bg > 2000 and (white + text) > 40 else 1)
+light = 0
+for i in range(0, len(menu_area), 3):
+    if menu_area[i] >= 0x90 and menu_area[i+1] >= 0x90 and menu_area[i+2] >= 0x90:
+        light += 1
+# the probe application's ICON (solid 0xc04080 PNG) must render in
+# the app row — icon-theme lookup + decode + XRender compositing
+icon_px = pix.count(bytes((0xc0, 0x40, 0x80)))
+print(f"menu: search-bg={search_bg} light-text={light} icon-px={icon_px}")
+# search field + rendered text + rendered icon = the REAL Programs menu
+sys.exit(0 if search_bg > 2000 and light > 120 and icon_px > 200 else 1)
 PYMENU
   [ $? -eq 0 ] && ok "Programs menu opened (search bar + text rendered)" \
     || bad "Programs menu did not open/render"
@@ -438,5 +481,6 @@ echo "=========================================="
 echo "harness-xvfb: $PASS passed, $FAIL failed"
 echo "artifacts: $WORK"
 echo "=========================================="
-[ "$FAIL" -eq 0 ] || { echo "---- session.log ----"; cat "$WORK/session.log"; }
+[ "$FAIL" -eq 0 ] || { echo "---- session.log ----"; cat "$WORK/session.log"; \
+                        echo "---- failed checks ----"; cat "$FAILS"; }
 [ "$FAIL" -eq 0 ]

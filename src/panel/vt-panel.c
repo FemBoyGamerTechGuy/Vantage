@@ -310,11 +310,14 @@ void vt_pctx_draw_argb_pic(Display *dpy, Picture dst, int dx, int dy,
             int sx = (int)((int64_t)x * sw / dw);
             if (sx >= sw) sx = sw - 1;
             uint32_t p = argb[sy * sw + sx];
-            /* X ZPixmap little-endian: BGRX byte order */
-            row[x] = ((p & 0xff000000u) >> 24) << 24 |
-                     ((p & 0x000000ffu) << 16) |
-                     (p & 0x0000ff00u) |
-                     ((p & 0x00ff0000u) >> 16);
+            /* p is 0xAARRGGBB. X11 ZPixmap on little-endian machines
+             * stores a 32-bit pixel as bytes B,G,R,A — which read back
+             * as the SAME 0xAARRGGBB uint32. The conversion is the
+             * IDENTITY: the previous "byte order fix" swapped red and
+             * blue, tinting every composited icon wrongly (a solid
+             * 0xc04080 icon rendered as 0x8040c0 — caught by the
+             * harness's exact-color icon assertion). */
+            row[x] = p;
         }
     }
     Pixmap px = XCreatePixmap(dpy, DefaultRootWindow(dpy),

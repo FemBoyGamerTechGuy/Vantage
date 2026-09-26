@@ -25,7 +25,7 @@
 set -u
 PASS=0; FAIL=0
 ok()  { echo "  PASS: $1"; PASS=$((PASS+1)); }
-bad() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
+bad() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); printf '  FAIL: %s\n' "$1" >> "$FAILS"; }
 
 BUILD="${1:-${VT_BUILD_DIR:-}}"
 if [ -n "$BUILD" ] && [ -x "$BUILD/src/tools/vantage-wm" ]; then
@@ -57,6 +57,10 @@ wait_ppm() {
 
 WORK=$(mktemp -d /tmp/vantage-wl.XXXXXX)
 mkdir -p "$WORK/run"
+# failures are recorded so the TAIL of a truncated meson log (which
+# only keeps the last 100 lines — after the wm/session log dumps)
+# still shows exactly WHICH checks failed
+FAILS="$WORK/fails.txt"; : > "$FAILS"
 export XDG_RUNTIME_DIR="$WORK/run"
 chmod 700 "$XDG_RUNTIME_DIR"
 
@@ -76,9 +80,41 @@ cat > "$WORK/data/applications/vt-harness-probe.desktop" <<'DESK'
 Type=Application
 Name=Zz Harness Probe
 Exec=/bin/sh -c 'echo launched > $WORK/wl-launch-marker'
+Icon=vt-harness-probe
 Categories=Utility;
 DESK
 sed -i "s|\$WORK|$WORK|g" "$WORK/data/applications/vt-harness-probe.desktop"
+# deterministic ICON: a private icon theme in the isolated XDG tree with
+# a solid-color PNG — proves the panel's icon-theme lookup + PNG decode
+# + ARGB scale + row rendering end to end (this code path was silently
+# compiled out when the backends target missed the VT_HAVE_PNG defines)
+ICON_DIR="$WORK/data/icons/vt-harness-theme/24x24/apps"
+mkdir -p "$ICON_DIR"
+python3 - "$ICON_DIR/vt-harness-probe.png" <<'PYICON'
+import struct, zlib, sys
+w = h = 24
+rgb = (0xc0, 0x40, 0x80)   # unique pink-magenta: used nowhere else
+raw = b''.join(b'\x00' + bytes(rgb) * w for _ in range(h))
+def chunk(t, d):
+    c = t + d
+    return struct.pack('>I', len(d)) + c + struct.pack(
+        '>I', zlib.crc32(c) & 0xffffffff)
+ihdr = struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)
+data = (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr) +
+        chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+open(sys.argv[1], 'wb').write(data)
+PYICON
+cat > "$WORK/data/icons/vt-harness-theme/index.theme" <<'EOF'
+[Icon Theme]
+Name=vt-harness-theme
+Directories=24x24/apps
+
+[24x24/apps]
+Size=24
+Context=Applications
+Type=Fixed
+EOF
+export VANTAGE_ICON_THEME=vt-harness-theme
 cat > "$WORK/data/applications/vt-harness-term.desktop" <<'DESK'
 [Desktop Entry]
 Type=Application
@@ -400,11 +436,24 @@ pix = data[pos:pos + w*h*3]
 # search-field background 0x2a2e35 (opaque) in the menu header band
 band = pix[(38*w)*3 : (72*w)*3]
 search_bg = band.count(bytes((0x2a, 0x2e, 0x35)))
-# white text pixels present in the whole menu area
+# text presence must be FONT-INDEPENDENT: the panel renders menu text
+# with the system 'sans' font at 13px, antialiased. Counting EXACT
+# text-color pixels (0xeceef0) worked with DejaVu but broke with
+# thinner fonts (Carlito/Noto measured 47 exact px vs DejaVu's 101 —
+# a real Arch box failed the check with a fully rendered menu).
+# Light-pixel counting (> 0xa0 in R,G,B — brighter than every fill in
+# the menu: bg 0x1a1c22, search 0x2a2e35, accent 0x4f9adc, warn
+# 0xe07a50) measures "text is visibly rendered" for ANY font.
 menu = pix[(38*w)*3 : (200*w)*3]
-white = menu.count(bytes((255, 255, 255))) + menu.count(bytes((0xec,0xee,0xf0)))
-print(f"menu: search-bg={search_bg} white-ish={white}")
-sys.exit(0 if search_bg > 3000 and white > 60 else 1)
+light = 0
+for i in range(0, len(menu), 3):
+    if menu[i] >= 0x90 and menu[i+1] >= 0x90 and menu[i+2] >= 0x90:
+        light += 1
+# the probe application's ICON (solid 0xc04080 PNG from the isolated
+# icon theme, scaled to 18x18 in the app row) must actually be rendered
+icon_px = pix.count(bytes((0xc0, 0x40, 0x80)))
+print(f"menu: search-bg={search_bg} light-text={light} icon-px={icon_px}")
+sys.exit(0 if search_bg > 3000 and light > 120 and icon_px > 200 else 1)
 PYEOF3
   [ $? -eq 0 ] && ok "Programs menu opened (search bar + content visible)"     || bad "Programs menu did not render"
 else
@@ -587,6 +636,13 @@ if ! kill -0 "$SESS_PID" 2>/dev/null; then
   grep -q "intentional logout, ending the session" "$SESS_LOG" \
     && ok "supervisor recognized the intentional logout" \
     || bad "no intentional-logout policy log line"
+else
+  # NEVER silently skip a broken real-input path: the remote-logout
+  # fallback below would still end the session and every later check
+  # would pass — hiding the fact that the panel's session menu did
+  # not react to clicks (exactly what a long-username machine hit
+  # when the menu was anchored to the username applet).
+  bad "panel Log Out did NOT end the session (session-menu click path broken)"
 fi
 
 echo "== harness-wayland: vantage-remote logout round-trip =="
@@ -634,5 +690,6 @@ echo "harness-wayland: $PASS passed, $FAIL failed"
 echo "artifacts: $WORK"
 echo "============================================"
 [ "$FAIL" -eq 0 ] || { echo "---- wm.log ----"; cat "$WORK/wm.log"; \
-                        echo "---- session.log ----"; cat "$SESS_LOG"; }
+                        echo "---- session.log ----"; cat "$SESS_LOG"; \
+                        echo "---- failed checks ----"; cat "$FAILS"; }
 [ "$FAIL" -eq 0 ]
