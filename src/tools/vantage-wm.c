@@ -134,6 +134,110 @@ static void _on_desktop(vt_wm_t *wm, int d) {
     vt_free(line);
 }
 
+/* ------------------------------------------------ wayland event sink */
+
+/* Mirror xdg_shell windows from the Wayland backend into the WM model so
+ * vantage-remote list / focus / close work identically on both backends. */
+static vt_window_t *_wl_mirror_new(vt_wm_t *wm,
+                                   const vt_backend_wl_event_t *ev) {
+    vt_window_t *w = vt_malloc0(sizeof(*w));
+    w->id = (uint32_t)ev->window_id;
+    w->title = vt_strdup(ev->title ? ev->title : "");
+    w->app_id = vt_strdup(ev->app_id ? ev->app_id : "");
+    w->class_str = vt_strdup("wayland");
+    w->x = ev->x; w->y = ev->y;
+    w->w = ev->w > 0 ? ev->w : 1;
+    w->h = ev->h > 0 ? ev->h : 1;
+    w->workspace = vt_wm_workspace_current(wm);
+    w->focused = ev->focused;
+    w->maximized = ev->maximized;
+    w->fullscreen = ev->fullscreen;
+    vt_vec_push(&wm->windows, &w);
+    return w;
+}
+
+static vt_window_t *_wl_mirror_find(vt_wm_t *wm, uint64_t id) {
+    return vt_wm_lookup(wm, (uint32_t)id);
+}
+
+static void _wl_event_sink(void *ud, void *event) {
+    _ctx_t *ctx = ud;
+    vt_wm_t *wm = ctx->wm;
+    const vt_backend_wl_event_t *ev = event;
+    if (!wm || !ev) return;
+    switch (ev->kind) {
+    case VT_BACKEND_WL_EVENT_WIN_MAP: {
+        vt_window_t *w = _wl_mirror_new(wm, ev);
+        vt_logi("wm: wayland window %u '%s' mapped", w->id,
+                w->title ? w->title : "");
+        if (wm->on_window_event)
+            wm->on_window_event(wm, w, VT_WM_EVENT_OPEN);
+        break;
+    }
+    case VT_BACKEND_WL_EVENT_WIN_UNMAP: {
+        vt_window_t *w = _wl_mirror_find(wm, ev->window_id);
+        if (!w) break;
+        if (wm->on_window_event)
+            wm->on_window_event(wm, w, VT_WM_EVENT_CLOSE);
+        vt_wm_remove_window(wm, w);
+        vt_free(w->title); vt_free(w->app_id);
+        vt_free(w->class_str); vt_free(w);
+        break;
+    }
+    case VT_BACKEND_WL_EVENT_WIN_TITLE: {
+        vt_window_t *w = _wl_mirror_find(wm, ev->window_id);
+        if (!w) break;
+        vt_free(w->title);
+        w->title = vt_strdup(ev->title ? ev->title : "");
+        if (wm->on_window_event)
+            wm->on_window_event(wm, w, VT_WM_EVENT_TITLE);
+        break;
+    }
+    case VT_BACKEND_WL_EVENT_WIN_STATE: {
+        vt_window_t *w = _wl_mirror_find(wm, ev->window_id);
+        if (!w) break;
+        w->maximized = ev->maximized;
+        w->fullscreen = ev->fullscreen;
+        w->minimized = ev->minimized;
+        if (wm->on_window_event)
+            wm->on_window_event(wm, w, VT_WM_EVENT_STATE);
+        break;
+    }
+    case VT_BACKEND_WL_EVENT_WIN_GEOMETRY: {
+        vt_window_t *w = _wl_mirror_find(wm, ev->window_id);
+        if (!w) break;
+        w->x = ev->x; w->y = ev->y;
+        if (ev->w > 0) w->w = ev->w;
+        if (ev->h > 0) w->h = ev->h;
+        if (wm->on_window_event)
+            wm->on_window_event(wm, w, VT_WM_EVENT_GEOMETRY);
+        break;
+    }
+    case VT_BACKEND_WL_EVENT_WIN_FOCUS: {
+        vt_window_t *w = _wl_mirror_find(wm, ev->window_id);
+        if (!w || w->focused) break;
+        for (size_t i = 0; i < wm->windows.size; i++) {
+            vt_window_t *p = *(vt_window_t **)vt_vec_at(&wm->windows, i);
+            if (p) p->focused = (p == w);
+        }
+        if (wm->on_window_event)
+            wm->on_window_event(wm, w, VT_WM_EVENT_FOCUS);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+/* compositor hotkey hook: consult the WM shortcut table. The WM pointer
+ * travels through the backend's user_data (set after vt_wm_new). */
+static bool _wl_hotkey(vt_backend_t *backend, const char *combo) {
+    if (!backend || !backend->get_user_data) return false;
+    vt_wm_t *wm = backend->get_user_data(backend);
+    if (!wm) return false;
+    return vt_wm_shortcut_handle(wm, combo);
+}
+
 /* ---------------------------------------------------------- handlers */
 static int _h_wm_query(vt_ipc_t *ipc, const vt_ipc_msg_t *req,
                        vt_ipc_msg_t *resp, void *ud) {
@@ -293,6 +397,24 @@ static int _h_ping(vt_ipc_t *ipc, const vt_ipc_msg_t *req,
     const char *pong = "pong";
     resp->payload = (uint8_t *)vt_strdup(pong);
     resp->len = 4;
+    return 0;
+}
+
+/* Clean logout for a standalone compositor run (no session manager):
+ * stop the main loop — teardown restores the CRTC, returns the VT to
+ * text mode and exits 0. No SIGKILL anywhere. */
+static int _h_logout(vt_ipc_t *ipc, const vt_ipc_msg_t *req,
+                     vt_ipc_msg_t *resp, void *ud) {
+    (void)ipc; (void)req; (void)resp;
+    _ctx_t *ctx = ud;
+    const char *action = "logout";
+    if (req && req->payload && req->len)
+        action = (const char *)req->payload;
+    vt_logi("wm: logout requested (%s) — shutting down cleanly", action);
+    if (ctx && ctx->wm)
+        vt_logi("wm: policy: graceful stop (SIGTERM-style unwind; "
+                "logout never uses SIGKILL)");
+    _stop = 1;
     return 0;
 }
 
@@ -469,6 +591,20 @@ int main(int argc, char **argv) {
     wm->on_desktop_changed = _on_desktop;
     wm->hooks_ud = &ctx;
 
+    /* Wayland: mirror xdg windows into the WM model, route compositor
+     * hotkeys through the shortcut table, and honour the [wayland]
+     * scanout configuration (auto|gbm|dumb). */
+    if (backend->kind == VT_BACKEND_WAYLAND) {
+        const char *scanout = vt_config_get(cfg, "wayland", "scanout",
+                                            "auto");
+        if (scanout && *scanout && !getenv("VANTAGE_WAYLAND_SCANOUT"))
+            setenv("VANTAGE_WAYLAND_SCANOUT", scanout, 1);
+        vt_backend_add_event_sink(backend, _wl_event_sink, &ctx);
+        if (backend->set_user_data)
+            backend->set_user_data(backend, wm);
+        backend->hotkey = _wl_hotkey;
+    }
+
     _register_defaults(wm);
 
     if (vt_wm_start(wm) != VT_OK) {
@@ -521,6 +657,7 @@ int main(int argc, char **argv) {
     vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_WS_SWITCH,_h_ws_switch, &ctx);
     vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_WS_MOVE,  _h_ws_move, &ctx);
     vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_LAUNCH,   _h_launch, &ctx);
+    vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_LOGOUT,  _h_logout, &ctx);
     vt_logi("wm: ipc server at %s", vt_ipc_get_path(ctx.ipc));
 
     while (!_stop) {

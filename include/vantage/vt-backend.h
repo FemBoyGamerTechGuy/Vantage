@@ -58,6 +58,29 @@ typedef struct vt_input_dev {
     bool       active;
 } vt_input_dev_t;
 
+/* Wayland backend window lifecycle events, emitted through the
+ * backend event-sink mechanism so the WM layer can mirror xdg_shell
+ * windows into its backend-agnostic model (vantage-remote list,
+ * window-close IPC etc.). */
+typedef enum {
+    VT_BACKEND_WL_EVENT_NONE = 0,
+    VT_BACKEND_WL_EVENT_WIN_MAP,
+    VT_BACKEND_WL_EVENT_WIN_UNMAP,
+    VT_BACKEND_WL_EVENT_WIN_TITLE,
+    VT_BACKEND_WL_EVENT_WIN_STATE,
+    VT_BACKEND_WL_EVENT_WIN_FOCUS,
+    VT_BACKEND_WL_EVENT_WIN_GEOMETRY,
+} vt_backend_wl_event_kind_t;
+
+typedef struct {
+    vt_backend_wl_event_kind_t kind;
+    uint64_t    window_id;   /* compositor-assigned, stable */
+    const char *title;       /* may be NULL/"" */
+    const char *app_id;      /* may be NULL/"" */
+    int         x, y, w, h;
+    bool        focused, maximized, fullscreen, minimized;
+} vt_backend_wl_event_t;
+
 typedef struct vt_backend {
     vt_backend_kind_t kind;
     void  *priv;
@@ -75,6 +98,13 @@ typedef struct vt_backend {
     bool     (*can_swap_buffers)(struct vt_backend *self);
     void     (*set_user_data)(struct vt_backend *self, void *ud);
     void    *(*get_user_data)(struct vt_backend *self);
+    /* Ask the backend to close a native window (xdg_toplevel close on
+     * Wayland; X11 goes through its WM engine instead). Optional. */
+    int      (*close_window)(struct vt_backend *self, uint64_t window_id);
+    /* Optional: compositor-side hotkey dispatch, set by the WM host.
+     * Returns true when the combo was consumed (do not forward the key
+     * to the focused client). */
+    bool     (*hotkey)(struct vt_backend *self, const char *combo);
 } vt_backend_t;
 
 /* Native event sink: receives backend-native events (XEvent* on X11,

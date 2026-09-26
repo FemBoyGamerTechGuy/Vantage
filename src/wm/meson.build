@@ -6,6 +6,10 @@ if dep_x11.found()
   src_wm += ['vt-wm-x11.c']
   wm_deps += [dep_x11]
   wm_cargs += ['-DVT_HAVE_X11']
+  if dep_xcursor.found()
+    wm_deps += [dep_xcursor]
+    wm_cargs += ['-DVT_HAVE_XCURSOR']
+  endif
 endif
 
 lib_vantage_wm = static_library('vantage-wm',

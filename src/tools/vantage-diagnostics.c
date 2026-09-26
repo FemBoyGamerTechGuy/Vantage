@@ -182,19 +182,113 @@ void vt_diag_print_machine(const vt_diag_t *d, FILE *fp) {
     fprintf(fp, "vantage.dbus=%s\n", d->dbus ? "1" : "0");
 }
 
+/* ------------------------------------------------- wayland-session probe */
+
+/* Readiness check for the native Wayland compositor session: does the
+ * environment actually grant a seat, a VT and DRM access? Reports every
+ * ingredient with where it came from, so `vantage-session --wayland`
+ * failures become diagnosable BEFORE starting the compositor. */
+static int _wayland_session_probe(FILE *fp, FILE *mp) {
+    int ready = 1;
+    const char *rd = getenv("XDG_RUNTIME_DIR");
+    const char *vt_env = getenv("VANTAGE_VT");
+    const char *vtnr = getenv("XDG_VTNR");
+    const char *seat = getenv("XDG_SEAT");
+
+    fprintf(fp, "Wayland session readiness:\n");
+    if (rd && *rd) {
+        fprintf(fp, "  XDG_RUNTIME_DIR: %s\n", rd);
+        fprintf(mp, "wl.runtime_dir=1\n");
+    } else {
+        fprintf(fp, "  XDG_RUNTIME_DIR: MISSING (no session manager ran; "
+                "the compositor will create /tmp/vantage-<uid>)\n");
+        fprintf(mp, "wl.runtime_dir=0\n");
+    }
+    fprintf(fp, "  seat:            %s\n",
+            (seat && *seat) ? seat : "seat0 (default)");
+    fprintf(mp, "wl.seat=%s\n", (seat && *seat) ? seat : "seat0");
+
+    int vt = -1;
+    if (vt_env && *vt_env) vt = atoi(vt_env);
+    else if (vtnr && *vtnr) vt = atoi(vtnr);
+    if (vt <= 0) {
+        FILE *f = fopen("/sys/class/tty/tty0/active", "r");
+        if (f) {
+            char buf[32] = {0};
+            if (fgets(buf, sizeof(buf), f) && strncmp(buf, "tty", 3) == 0)
+                vt = atoi(buf + 3);
+            fclose(f);
+        }
+    }
+    if (vt > 0) {
+        fprintf(fp, "  VT:              %d\n", vt);
+        fprintf(mp, "wl.vt=%d\n", vt);
+    } else {
+        fprintf(fp, "  VT:              unknown (no VANTAGE_VT/XDG_VTNR, "
+                "not on a TTY)\n");
+        fprintf(mp, "wl.vt=-1\n");
+        ready = 0;
+    }
+
+    /* session managers */
+    const char *seat_mgr = "none (direct VT ioctls)";
+    if (access("/run/systemd/seats/", F_OK) == 0)
+        seat_mgr = "logind/elogind (seat dir present)";
+    else if (access("/run/seatd.sock", F_OK) == 0)
+        seat_mgr = "seatd (/run/seatd.sock)";
+    fprintf(fp, "  seat manager:    %s\n", seat_mgr);
+    fprintf(mp, "wl.seat_manager=%s\n", seat_mgr);
+
+    /* DRM cards */
+    int cards = 0, connected = 0;
+    char first_card[32] = {0};
+    for (int i = 0; i < 8; i++) {
+        char path[32];
+        snprintf(path, sizeof(path), "/dev/dri/card%d", i);
+        if (access(path, F_OK) != 0) continue;
+        cards++;
+        if (!first_card[0]) snprintf(first_card, sizeof(first_card), "%s", path);
+        if (access(path, R_OK | W_OK) == 0) connected++;
+    }
+    if (cards > 0) {
+        fprintf(fp, "  DRM cards:       %d found, %d openable (%s%s)\n",
+                cards, connected, first_card,
+                connected ? "" : " — permission denied, needs the seat "
+                "or a drm group");
+        fprintf(mp, "wl.drm_cards=%d\nwl.drm_openable=%d\n", cards,
+                connected);
+        if (!connected) ready = 0;
+    } else {
+        fprintf(fp, "  DRM cards:       none under /dev/dri\n");
+        fprintf(mp, "wl.drm_cards=0\n");
+        ready = 0;
+    }
+    fprintf(fp, "  verdict:         %s\n",
+            ready ? "READY — vantage-session --wayland from a TTY should "
+                    "acquire the display" :
+                    "NOT READY — the compositor will fall back to the "
+                    "honest HEADLESS framebuffer");
+    fprintf(mp, "wl.ready=%d\n", ready);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     vt_log_set_level(VT_LOG_INFO);
     vt_diag_t *d = vt_diag_new();
+    bool wl_session_probe = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--machine") == 0) {
             d->machine = true;
         } else if (strcmp(argv[i], "--wayland") == 0) {
             d->kind = VT_BACKEND_WAYLAND;
+        } else if (strcmp(argv[i], "--wayland-session") == 0) {
+            wl_session_probe = true;
         } else if (strcmp(argv[i], "--x11") == 0) {
             d->kind = VT_BACKEND_X11;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             printf("Usage: vantage-diagnostics [--wayland|--x11] [--machine]\n"
+                   "       vantage-diagnostics --wayland-session [--machine]\n"
                    "       vantage-diagnostics --version\n");
             return 0;
         } else if (strcmp(argv[i], "-V") == 0 || strcmp(argv[i], "--version") == 0) {
@@ -205,6 +299,26 @@ int main(int argc, char **argv) {
                     argv[i]);
             return 2;
         }
+    }
+
+    if (wl_session_probe) {
+        /* human mode: report + machine lines discarded; --machine:
+         * only the machine lines (clean for scripts). */
+        FILE *fp, *mp;
+        if (d->machine) {
+            mp = stdout;
+            fp = fopen("/dev/null", "w");
+            if (!fp) fp = stdout;
+        } else {
+            fp = stdout;
+            mp = fopen("/dev/null", "w");
+            if (!mp) mp = stdout;
+        }
+        int rc = _wayland_session_probe(fp, mp);
+        if (fp != stdout) fclose(fp);
+        if (mp != stdout) fclose(mp);
+        vt_diag_free(d);
+        return rc;
     }
 
     vt_diag_run(d);

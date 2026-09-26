@@ -1,4 +1,5 @@
-src_backends = ['vt-backend.c', 'vt-backend-x11.c', 'vt-backend-wayland.c']
+src_backends = ['vt-backend.c', 'vt-backend-x11.c', 'vt-backend-wayland.c',
+                'vt-seat.c', 'vt-kms.c']
 
 backend_deps = [vantage_core_dep]
 backend_cargs = []
@@ -43,6 +44,39 @@ else
     backend_deps += [dep_wayland_client]
     backend_cargs += ['-DVT_HAVE_WAYLAND']
   endif
+endif
+
+# KMS/seat/input support for the native Wayland compositor
+if dep_libdrm.found()
+  backend_deps += [dep_libdrm]
+  backend_cargs += ['-DVT_HAVE_LIBDRM']
+endif
+if dep_gbm.found()
+  backend_deps += [dep_gbm]
+  backend_cargs += ['-DVT_HAVE_GBM']
+endif
+if dep_egl.found()
+  backend_deps += [dep_egl]
+  backend_cargs += ['-DVT_HAVE_EGL']
+  if dep_glesv2.found()
+    backend_deps += [dep_glesv2]
+    backend_cargs += ['-DVT_HAVE_GLES']
+  endif
+endif
+if dep_libseat.found()
+  backend_deps += [dep_libseat]
+  backend_cargs += ['-DVT_HAVE_LIBSEAT']
+endif
+if dep_libinput.found() and dep_udev.found()
+  backend_deps += [dep_libinput, dep_udev]
+  backend_cargs += ['-DVT_HAVE_LIBINPUT']
+endif
+if dep_xcursor.found()
+  backend_deps += [dep_xcursor]
+  backend_cargs += ['-DVT_HAVE_XCURSOR']
+endif
+if dep_xkbcommon.found()
+  backend_cargs += ['-DVT_HAVE_XKBCOMMON']
 endif
 
 lib_vantage_backends = static_library('vantage-backends',

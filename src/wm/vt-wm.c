@@ -116,6 +116,13 @@ void vt_wm_close(vt_wm_t *wm, vt_window_t *w) {
         vt_wm_x11_close_id((struct vt_wm_x11 *)wm->engine, w->id);
         return;
     }
+    /* Wayland: ask the compositor to close the xdg_toplevel — the
+     * resulting unmap event removes it from the model. */
+    if (wm->backend && wm->backend->kind == VT_BACKEND_WAYLAND &&
+        wm->backend->close_window) {
+        wm->backend->close_window(wm->backend, w->id);
+        return;
+    }
     vt_wm_remove_window(wm, w);
 }
 

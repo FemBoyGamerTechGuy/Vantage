@@ -131,6 +131,27 @@ static int _preflight_backend(vt_backend_kind_t kind, const char **server_out) {
                     "  display manager or a TTY instead.", wd);
             return -1;
         }
+        /* A live X session would lose its DRM master to us (or we to
+         * it): refuse instead of silently fighting over the card. */
+        const char *dpy = getenv("DISPLAY");
+        if (dpy && *dpy) {
+            vt_backend_t *probe = vt_backend_new(VT_BACKEND_X11);
+            bool live = probe && probe->kind == VT_BACKEND_X11;
+            if (probe) vt_backend_free(probe);
+            if (live) {
+                vt_loge("session: DISPLAY='%s' points at a running X\n"
+                        "  server — starting the native Wayland compositor\n"
+                        "  now would try to take over its DRM master.\n"
+                        "  Log into a TTY (Ctrl+Alt+F2..F6) and run\n"
+                        "    vantage-session --wayland\n"
+                        "  there, or let a display manager start it.",
+                        dpy);
+                return -1;
+            }
+            vt_logw("session: DISPLAY is set ('%s') but unreachable —\n"
+                    "  passing it through untouched (stale variable?)",
+                    dpy);
+        }
         return 0;
     }
     vt_loge("session: internal error: invalid backend kind %d", (int)kind);
@@ -262,6 +283,15 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* Children (wm/panel/desktop) inherit the environment; give the
+     * compositor a hint about the VT this session was started on so the
+     * direct (no-session-manager) seat path can find it. */
+    if (!getenv("VANTAGE_VT")) {
+        const char *vtnr = getenv("XDG_VTNR");
+        if (vtnr && *vtnr)
+            setenv("VANTAGE_VT", vtnr, 1);
+    }
+
     static const char *src_name[] = { "command line", "environment",
                                       "configuration", "auto-detection" };
     vt_logi("session: display backend: %s [source: %s]",
@@ -352,7 +382,9 @@ int main(int argc, char **argv) {
     }
 
     /* shutdown: TERM children, wait briefly, KILL stragglers */
-    vt_logi("session: stopping children");
+    vt_logi("session: stopping children (policy: SIGTERM + %d ms grace; "
+            "SIGKILL only as the documented last resort for survivors)",
+            30 * 100);
     vt_session_end(s, VT_SESSION_END_LOGOUT);  /* enter SHUTDOWN stage:
                                                   no more restarts */
     vt_session_term_children(s);

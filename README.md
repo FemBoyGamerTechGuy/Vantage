@@ -15,9 +15,13 @@ New features, minimal overhead.
 - **Raw C core.** Modern C11/C17, modular, dependency-light. No GLib, no
   systemd, no D-Bus, no Red Hat infrastructure anywhere in the core.
 - **Two display backends**: a native Wayland compositor
-  (libwayland-server + xdg-shell), and an X11 backend that connects to
-  the running X server — Xorg, XLibre, or any conforming
-  implementation (identified at runtime for diagnostics only).
+  (libwayland-server + xdg-shell) that acquires the seat, VT and DRM
+  master itself (libseat → logind/elogind/seatd, with a direct-VT
+  fallback when no session manager runs) and mode-sets real outputs via
+  KMS with async page flips, libinput + xkbcommon input and a hardware
+  cursor plane; and an X11 backend that connects to the running X
+  server — Xorg, XLibre, or any conforming implementation (identified
+  at runtime for diagnostics only).
 - **Hardware-accelerated rendering** on NVIDIA (proprietary + NVK),
   AMD (Mesa/radeonsi/radv), and Intel (Mesa/iris/anv). Software
   fallback always available.

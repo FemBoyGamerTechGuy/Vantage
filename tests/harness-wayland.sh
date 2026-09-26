@@ -72,6 +72,41 @@ else
 fi
 export WAYLAND_DISPLAY="$SOCKET"
 
+# ----------------------------------------------------- stage markers
+# The container has no /dev/dri: the honest headless contract is a
+# complete, ordered diagnostic trace. seat/vt depend on the environment
+# (libseat-builtin can even answer in a container): assert they REPORT,
+# and assert the rest of the skipped-chain exactly.
+echo "== harness-wayland: startup stage markers (headless contract) =="
+for st in 'session: ok' 'drm: skipped' \
+          'drm-master: skipped' 'gbm: skipped' 'egl: skipped' \
+          'renderer: skipped' 'outputs: skipped' 'crtc: skipped' \
+          'scanout: skipped' 'input: skipped' 'socket: ok' \
+          'compositor: READY' 'desktop: ready'; do
+  if grep -qF "[wayland] $st" "$WORK/wm.log"; then
+    ok "stage marker: $st"
+  else
+    bad "missing stage marker: [wayland] $st"
+  fi
+done
+for st in 'seat:' 'vt:'; do
+  if grep -qF "[wayland] $st" "$WORK/wm.log"; then
+    ok "stage marker present: $st (environment-dependent outcome)"
+  else
+    bad "missing stage marker: [wayland] $st"
+  fi
+done
+if grep -qF '[wayland] NOTICE: HEADLESS mode' "$WORK/wm.log"; then
+  ok "honest HEADLESS fallback notice present"
+else
+  bad "no HEADLESS notice — the fallback would be silent (lied about KMS)"
+fi
+if grep -qE 'renderer: (ok|skipped)' "$WORK/wm.log"; then
+  ok "renderer stage reported honestly"
+else
+  bad "renderer stage not reported"
+fi
+
 # ------------------------------------------------------------- client
 echo "== harness-wayland: xdg-shell client =="
 CLIENT_LOG="$WORK/client.log"
@@ -94,6 +129,28 @@ grep -q "^configured" "$CLIENT_LOG" && ok "xdg_surface configure received" \
   || bad "no xdg configure"
 grep -q "^committed" "$CLIENT_LOG" && ok "wl_shm buffer committed" \
   || bad "no buffer commit"
+
+# ------------------------------------------------- window-list mirror
+# The xdg window must appear in the WM model (vantage-remote list works
+# on Wayland exactly like on X11).
+echo "== harness-wayland: WM window-list mirror (vantage-remote list) =="
+sleep 0.3   # let the map event reach the sink
+if "$(vb vantage-remote)" list > "$WORK/wl-list.txt" 2>"$WORK/wl-list.err"; then
+  if grep -q "Vantage Wayland Test" "$WORK/wl-list.txt"; then
+    ok "wayland window mirrored into the WM model"
+    if grep -q "vantage.wltest" "$WORK/wl-list.txt"; then
+      ok "app_id propagated to the window list"
+    else
+      bad "app_id missing from the window list"
+    fi
+  else
+    bad "window list does not contain the wayland window:
+$(cat "$WORK/wl-list.txt")"
+  fi
+else
+  bad "vantage-remote list failed on the wayland WM:
+$(cat "$WORK/wl-list.err")"
+fi
 
 # ------------------------------------------------------------- pixels
 echo "== harness-wayland: compositor frame-dump check =="
@@ -136,16 +193,26 @@ else
 fi
 
 # ------------------------------------------------------------- shutdown
-echo "== harness-wayland: clean shutdown =="
-kill -TERM "$WM_PID" 2>/dev/null
+# Ctrl+C (SIGINT) takes the same clean-unwind path as SIGTERM: restore,
+# unwind, exit 0. Assert the exit STATUS and the cleanup logs.
+echo "== harness-wayland: clean shutdown (SIGINT == Ctrl+C) =="
+kill -INT "$WM_PID" 2>/dev/null
 EXITED=""
 for i in $(seq 1 50); do
   kill -0 "$WM_PID" 2>/dev/null || { EXITED=1; break; }
   sleep 0.1
 done
-[ -n "$EXITED" ] && ok "compositor exited on SIGTERM" || bad "WM ignored SIGTERM"
+[ -n "$EXITED" ] && ok "compositor exited on SIGINT (Ctrl+C)" \
+  || bad "WM ignored SIGINT"
+WM_RC=0
+wait "$WM_PID" 2>/dev/null || WM_RC=$?
+[ "$WM_RC" -eq 0 ] && ok "Ctrl+C exit status is 0 (clean unwind)" \
+  || bad "Ctrl+C exit status $WM_RC (expected 0)"
 grep -q "wm: shutting down" "$WORK/wm.log" \
   && ok "WM logged clean shutdown" || bad "no clean-shutdown log line"
+grep -qF '[wayland] compositor: exited cleanly' "$WORK/wm.log" \
+  && ok "compositor logged full unwind" \
+  || bad "no compositor-exited-cleanly marker"
 
 # ===================================================================
 # Full session: vantage-session --wayland (session manager + WM)
@@ -206,16 +273,38 @@ if [ -n "$SOCK2" ] && [ -S "$XDG_RUNTIME_DIR/$SOCK2" ]; then
       && ok "frame dump written under the full session" \
       || bad "no frame dump under the session"
   fi
-  kill -TERM "$SESS_PID" 2>/dev/null
+  # NOTE: do NOT terminate the session here — the logout round-trip
+  # below must be the thing that stops it.
 fi
 
+# ------------------------------------------------- logout round-trip
+# vantage-remote logout → session IPC → graceful child shutdown
+# (SIGTERM + grace, no SIGKILL) → exit 0.
+echo "== harness-wayland: vantage-remote logout round-trip =="
+if [ -n "${SESS_PID:-}" ] && kill -0 "$SESS_PID" 2>/dev/null; then
+  LOGOUT_RC=0
+  "$(vb vantage-remote)" logout > "$WORK/logout.txt" 2>&1 || LOGOUT_RC=$?
+  [ "$LOGOUT_RC" -eq 0 ] && ok "vantage-remote logout accepted" \
+    || bad "vantage-remote logout failed ($(cat "$WORK/logout.txt"))"
+  for i in $(seq 1 60); do
+    kill -0 "$SESS_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+fi
 SESS_EXITED=""
 for i in $(seq 1 60); do
   kill -0 "$SESS_PID" 2>/dev/null || { SESS_EXITED=1; break; }
   sleep 0.1
 done
-[ -n "$SESS_EXITED" ] && ok "session exited on SIGTERM" \
-  || bad "session ignored SIGTERM"
+[ -n "$SESS_EXITED" ] && ok "session exited after logout" \
+  || bad "session ignored logout"
+SESS_RC=0
+wait "$SESS_PID" 2>/dev/null || SESS_RC=$?
+[ "$SESS_RC" -eq 0 ] && ok "session logout exit status is 0 (no SIGKILL)" \
+  || bad "session exit status $SESS_RC (SIGKILLed?)"
+grep -q "policy: SIGTERM" "$SESS_LOG" \
+  && ok "session logged the graceful shutdown policy" \
+  || bad "no shutdown-policy log line"
 grep -q "session: exited" "$SESS_LOG" \
   && ok "session logged clean exit" || bad "no clean session-exit log line"
 sleep 0.3

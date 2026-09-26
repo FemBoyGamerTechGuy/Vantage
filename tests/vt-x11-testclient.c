@@ -12,11 +12,20 @@
  *     Reads _NET_SUPPORTING_WM_CHECK from the root window and _NET_WM_NAME
  *     from the WM-check window; prints "ewmh-wm-name=<name>" and exits 0
  *     only when a conforming EWMH WM is running.
+ *
+ *   vt-x11-testclient --cursor-probe
+ *     Verifies a VISIBLE cursor: XQueryPointer for position, then
+ *     XFixesGetCursorImage at the pointer position; counts opaque
+ *     pixels. Prints cursor-pos=X,Y cursor-size=WxH cursor-opaque=N and
+ *     exits 0 only when N > 0 (an invisible/empty cursor fails).
  */
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/Xatom.h>
+#if defined(VT_HAVE_XFIXES)
+#include <X11/extensions/Xfixes.h>
+#endif
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -85,16 +94,68 @@ int main(int argc, char **argv) {
     const char *shot = NULL;
     const char *title = "Vantage Test";
     bool ewmh_only = false;
+    bool cursor_only = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--seconds") && i + 1 < argc) seconds = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--screenshot") && i + 1 < argc) shot = argv[++i];
         else if (!strcmp(argv[i], "--title") && i + 1 < argc) title = argv[++i];
         else if (!strcmp(argv[i], "--ewmh-probe")) ewmh_only = true;
+        else if (!strcmp(argv[i], "--cursor-probe")) cursor_only = true;
     }
     Display *d = XOpenDisplay(NULL);
     if (!d) { fprintf(stderr, "cannot open display\n"); return 1; }
     printf("connected %s\n", DisplayString(d));
     fflush(stdout);
+
+    if (cursor_only) {
+        int s = DefaultScreen(d);
+        Window root = RootWindow(d, s);
+        Window r_ret, c_ret;
+        int rx, ry, wx, wy;
+        unsigned int mask;
+        if (!XQueryPointer(d, root, &r_ret, &c_ret, &rx, &ry,
+                           &wx, &wy, &mask)) {
+            printf("cursor-pos=offscreen\n");
+            XCloseDisplay(d);
+            return 1;
+        }
+        printf("cursor-pos=%d,%d\n", rx, ry);
+#if defined(VT_HAVE_XFIXES)
+        int ev_base = 0, err_base = 0;
+        if (!XFixesQueryExtension(d, &ev_base, &err_base)) {
+            printf("cursor-image=no-xfixes\n");
+            printf("cursor-opaque=-1\n");
+            XCloseDisplay(d);
+            return 1;
+        }
+        XFixesCursorImage *ci = XFixesGetCursorImage(d);
+        if (!ci) {
+            printf("cursor-image=none\n");
+            printf("cursor-opaque=0\n");
+            XCloseDisplay(d);
+            return 1;
+        }
+        long opaque = 0;
+        for (unsigned short y = 0; y < ci->height; y++) {
+            for (unsigned short x = 0; x < ci->width; x++) {
+                unsigned long px = (unsigned long)
+                    ci->pixels[(size_t)y * ci->width + x];
+                if ((px & 0xff000000UL) != 0) opaque++;
+            }
+        }
+        printf("cursor-size=%hux%hu\n", ci->width, ci->height);
+        printf("cursor-opaque=%ld\n", opaque);
+        fflush(stdout);
+        XFree(ci);
+        XCloseDisplay(d);
+        return opaque > 0 ? 0 : 1;
+#else
+        printf("cursor-image=no-xfixes-build\n");
+        printf("cursor-opaque=-1\n");
+        XCloseDisplay(d);
+        return 1;
+#endif
+    }
 
     if (ewmh_only) {
         char *name = ewmh_wm_name(d);

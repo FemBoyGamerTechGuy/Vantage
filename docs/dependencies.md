@@ -28,8 +28,12 @@ config/diagnostic testing on remote machines).
 | libxcb          | libxcb1-dev              | X11 backend core                 |
 | libxcb-randr    | libxcb-randr0-dev        | RandR multi-monitor             |
 | libxkbcommon    | libxkbcommon-dev         | Keyboard layout (X11 + Wayland) |
-| libwayland-client | libwayland-dev         | Native Wayland backend           |
-| libwayland-server | libwayland-dev         | (future: Vantage compositor server) |
+| libwayland-client | libwayland-dev         | Wayland clients / test tooling   |
+| libwayland-server | libwayland-dev         | Native Vantage Wayland compositor |
+| libseat           | libseat-dev            | seat/session (logind, elogind, seatd) |
+| libinput          | libinput-dev           | compositor input (udev backend)  |
+| libudev           | libudev-dev            | input device discovery (see GPU section for gbm/drm) |
+| libxcursor        | libxcursor-dev         | compositor + X11 cursor theming  |
 
 ### Rendering / GPU
 
@@ -103,8 +107,8 @@ preferred by the user via the renderer config option.
 
 ```sh
 pacman -S meson ninja gcc pkg-config \
-          libxcb libxkbcommon wayland wayland-protocols \
-          libegl libgl libglvnd libdrm libudev \
+          libxcb libxkbcommon wayland wayland-protocols libseat libinput \
+          libegl libgl libglvnd libdrm libudev libxcursor \
           json-c gdk-pixbuf2 libpng libjpeg-turbo ffmpeg \
           pipewire libpulse alsa-lib libnm upower \
           dbus libsystemd
@@ -115,9 +119,9 @@ pacman -S meson ninja gcc pkg-config \
 ```sh
 apt install meson ninja-build gcc pkg-config \
             libxcb1-dev libxcb-randr0-dev libxkbcommon-dev \
-            libwayland-dev libwayland-protocols \
+            libwayland-dev wayland-protocols \
             libegl-dev libgl-dev libgles2-mesa-dev \
-            libgbm-dev libdrm-dev libudev-dev \
+            libgbm-dev libdrm-dev libudev-dev libseat-dev libinput-dev \
             libjson-c-dev libgdk-pixbuf2.0-dev libpng-dev libjpeg-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
             libpipewire-0.3-dev libpulse-dev libasound2-dev \

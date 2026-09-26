@@ -29,9 +29,16 @@ testclient_deps = [tests_deps]
 testclient_cargs = []
 
 if dep_x11.found()
+  x11_testclient_deps = tests_deps + [dep_x11]
+  x11_testclient_cargs = []
+  if dep_xfixes.found()
+    x11_testclient_deps += [dep_xfixes]
+    x11_testclient_cargs += ['-DVT_HAVE_XFIXES']
+  endif
   x11_testclient = executable('vt-x11-testclient',
     sources : 'vt-x11-testclient.c',
-    dependencies : tests_deps + [dep_x11],
+    dependencies : x11_testclient_deps,
+    c_args : x11_testclient_cargs,
     install : true,
     install_dir : join_paths(vt_libdir, 'vantage', 'tests'),
     install_rpath : vt_extra_rpath,

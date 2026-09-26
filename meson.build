@@ -102,6 +102,8 @@ dep_opengl          = dependency('opengl',         required : false)
 dep_gbm             = dependency('gbm',            required : false)
 dep_libdrm          = dependency('libdrm',         required : false)
 dep_udev            = dependency('libudev',       required : false)
+dep_libseat         = dependency('libseat',        required : false)
+dep_libinput        = dependency('libinput',       required : false)
 dep_vulkan          = dependency('vulkan',         required : false)
 
 # Wallpaper video pipeline -- optional
@@ -146,6 +148,9 @@ summary({
   'vulkan'         : dep_vulkan.found(),
   'gbm'            : dep_gbm.found(),
   'libdrm'         : dep_libdrm.found(),
+  'libseat'        : dep_libseat.found(),
+  'libinput'       : dep_libinput.found(),
+  'libudev'        : dep_udev.found(),
   'ffmpeg (video wallpaper)' : dep_libavcodec.found(),
   'gdk-pixbuf'     : dep_gdkpixbuf.found(),
   'json-c'         : dep_jsonc.found(),

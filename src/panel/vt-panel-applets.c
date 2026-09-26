@@ -514,7 +514,7 @@ static void _wsp_render(vt_applet_env_t *env) {
             ? (vt_pcol_t){ 0x4f, 0x9a, 0xdc, 0xff }
             : (vt_pcol_t){ 0x26, 0x28, 0x2e, 0xff };
         vt_pctx_rounded_rect(ctx, x, env->area.y, WSP_BTN, env->area.h, 4, bg);
-        char n[4];
+        char n[16];
         snprintf(n, sizeof(n), "%d", i + 1);
         int ty = env->area.y + env->area.h / 2 + vt_pctx_text_height(ctx) / 2 - 2;
         vt_pctx_text(ctx, x + WSP_BTN / 2 - 3, ty, n, false,
@@ -686,7 +686,8 @@ static void _net_read(_net_t *n) {
         vt_free(p);
         if (state && vt_strstartswith(state, "up")) {
             n->up = true;
-            snprintf(n->name, sizeof(n->name), "%s", de->d_name);
+            snprintf(n->name, sizeof(n->name), "%.*s",
+                     (int)sizeof(n->name) - 1, de->d_name);
             /* wireless quality */
             p = vt_strprintf("/proc/net/wireless");
             char *w = vt_file_read_all(p, &len);

@@ -107,6 +107,7 @@ int main(int argc, char **argv) {
     struct xdg_toplevel *tl = xdg_surface_get_toplevel(xs);
     xdg_toplevel_add_listener(tl, &_toplevel_listener, NULL);
     xdg_toplevel_set_title(tl, "Vantage Wayland Test");
+    xdg_toplevel_set_app_id(tl, "vantage.wltest");
     wl_surface_commit(surf);
     /* wait for the initial configure */
     while (!configured) wl_display_roundtrip(d);

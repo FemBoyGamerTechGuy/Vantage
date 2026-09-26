@@ -8,30 +8,27 @@ url="https://github.com/FemBoyGamerTechGuy/Vantage"
 license=('GPL-2.0-or-later')
 depends=(
   'glibc'
+  # native Wayland compositor session (seat/VT/DRM/input)
+  'wayland' 'libxkbcommon' 'seatd' 'libinput' 'libdrm' 'mesa'
+  # X11 backend
+  'libx11' 'libxcb' 'libxcomposite' 'libxdamage' 'libxext' 'libxft'
+  'libxi' 'libxrandr' 'libxrender' 'libxcursor'
+  # shared runtime bits
+  'json-c' 'systemd-libs'
 )
 makedepends=(
-  'meson' 'ninja' 'gcc' 'pkg-config'
+  'meson' 'ninja' 'gcc' 'pkg-config' 'wayland-protocols'
 )
 optdepends=(
-  'libxcb: X11 core protocol'
-  'libxkbcommon: keyboard layouts'
-  'wayland: Wayland backend'
-  'libglvnd: OpenGL/EGL'
-  'mesa: OpenGL/EGL/GBM'
+  'elogind: logind/elogind seat on systemd-free systems'
   'vulkan-icd-loader: Vulkan renderer (optional)'
-  'libdrm: GPU detection'
-  'json-c: theme JSON parser'
   'gdk-pixbuf2: image wallpaper'
-  'libpng: PNG wallpaper'
-  'libjpeg-turbo: JPEG wallpaper'
   'ffmpeg: video wallpaper'
   'pipewire: audio (preferred)'
   'libpulse: audio (alternative)'
   'alsa-lib: audio (fallback)'
   'networkmanager: network status'
   'upower: power + battery'
-  'systemd-libs: power via logind (systemd)'
-  'elogind: power via logind (systemd-free)'
   'dbus: optional D-Bus integration'
 )
 provides=("vantage=$pkgver")

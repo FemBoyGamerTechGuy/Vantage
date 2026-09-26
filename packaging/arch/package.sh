@@ -124,6 +124,7 @@ declare -A SONAME_MAP=(
     [libsystemd.so]=systemd-libs [libudev.so]=systemd-libs
     [libelogind.so]=elogind   [libdbus-1.so]=dbus
     [libinput.so]=libinput    [libnm.so]=networkmanager
+    [libseat.so]=seatd
     [libupower-glib.so]=upower
 )
 

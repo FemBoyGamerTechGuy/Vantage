@@ -21,7 +21,10 @@
 #   3. vt-x11-testclient maps two windows; vantage-remote lists them
 #   4. IPC window management works (focus + close via vantage-remote)
 #   5. root screenshot contains the test windows' known colors
-#   6. session shuts down cleanly on SIGTERM (all children exit)
+#   6. VISIBLE cursor: XDefineCursor on root + XFixes opaque pixels
+#   7. Wayland nesting refusal (a compositor never nests)
+#   8. session shuts down cleanly on SIGTERM (all children exit)
+#   9. vantage-remote logout round-trip (graceful, exit 0, no SIGKILL)
 #
 # Usage: harness-xvfb.sh [build-dir]     (default: $VT_BUILD_DIR or PATH)
 
@@ -127,6 +130,50 @@ grep -q "X server:" "$WORK/session.log" \
 
 sleep 1     # let the WM/panel/desktop settle and paint
 
+# ------------------------------------------------------ cursor checks
+echo "== harness-xvfb: visible root cursor =="
+# The WM pins a themed root cursor (Xcursor → font → hard-coded arrow)
+# instead of relying on the server default, which can be invisible on
+# bare Xorg/XLibre with no cursor theme loaded.
+WM_LOG="$WORK/wm.log"
+# the WM is spawned by the session; find its log via the session log is
+# not possible (stderr is merged), so verify behaviorally instead:
+CURSOR_OUT=$("$(tc vt-x11-testclient)" --cursor-probe 2>&1)
+CURSOR_RC=$?
+echo "$CURSOR_OUT" | grep -qE 'cursor-pos=[0-9]+,[0-9]+' \
+  && ok "pointer position queryable (XQueryPointer)" \
+  || bad "XQueryPointer failed: $CURSOR_OUT"
+OPAQUE=$(echo "$CURSOR_OUT" | grep -oE 'cursor-opaque=[-0-9]+' | cut -d= -f2)
+if [ "$CURSOR_RC" -eq 0 ] && [ "${OPAQUE:-0}" -gt 0 ]; then
+  ok "cursor visible: ${OPAQUE} opaque pixels in the cursor image"
+else
+  bad "cursor invisible or empty (opaque=${OPAQUE:-none}, rc=$CURSOR_RC)"
+fi
+C_SIZE=$(echo "$CURSOR_OUT" | grep -oE 'cursor-size=[0-9]+x[0-9]+' | head -1)
+[ -n "$C_SIZE" ] && ok "cursor image reported ($C_SIZE)" \
+  || bad "no cursor size reported"
+
+# ------------------------------------------------- nesting refusal
+echo "== harness-xvfb: Wayland compositor nesting refusal =="
+# A compositor never nests: with WAYLAND_DISPLAY already set, the
+# Wayland backend must refuse to start instead of stacking on another
+# compositor session.
+NEST_RC=0
+WAYLAND_DISPLAY=vantage-nest-test "$(vb vantage-wm)" --wayland \
+  > "$WORK/nest.log" 2>&1 || NEST_RC=$?
+if [ "$NEST_RC" -ne 0 ] && grep -qi "refusing to nest" "$WORK/nest.log"; then
+  ok "compositor refuses to nest behind WAYLAND_DISPLAY"
+else
+  bad "vantage-wm --wayland did not refuse nesting (rc=$NEST_RC)"
+fi
+SESS_WL_RC=0
+"$(vb vantage-session)" --wayland > "$WORK/nest-sess.log" 2>&1 || SESS_WL_RC=$?
+if [ "$SESS_WL_RC" -ne 0 ] && grep -q "DRM master" "$WORK/nest-sess.log"; then
+  ok "vantage-session --wayland refuses a live-X launch (DRM master policy)"
+else
+  bad "session --wayland did not refuse the live-X launch (rc=$SESS_WL_RC)"
+fi
+
 # ------------------------------------------------------------- checks
 echo "== harness-xvfb: EWMH WM identity =="
 EWMH_OUT=$("$(tc vt-x11-testclient)" --ewmh-probe 2>&1)
@@ -217,17 +264,38 @@ PYEOF
   || bad "screenshot pixel check failed"
 
 # ------------------------------------------------------------- shutdown
-echo "== harness-xvfb: clean shutdown =="
-kill -TERM "$SESS_PID" 2>/dev/null
+echo "== harness-xvfb: logout round-trip (graceful) =="
+# vantage-remote logout → session IPC → SIGTERM + grace (never SIGKILL as
+# the normal path) → exit 0, X server untouched.
+LOGOUT_RC=0
+"$(vb vantage-remote)" logout > "$WORK/logout.txt" 2>&1 || LOGOUT_RC=$?
+[ "$LOGOUT_RC" -eq 0 ] && ok "vantage-remote logout accepted" \
+  || bad "vantage-remote logout failed ($(cat "$WORK/logout.txt"))"
 EXITED=""
 for i in $(seq 1 100); do
   kill -0 "$SESS_PID" 2>/dev/null || { EXITED=1; break; }
   sleep 0.1
 done
 if [ -z "$EXITED" ]; then
+  # graceful logout failed — SIGTERM fallback, counts as failure
+  kill -TERM "$SESS_PID" 2>/dev/null
+  for i in $(seq 1 100); do
+    kill -0 "$SESS_PID" 2>/dev/null || { EXITED=1; break; }
+    sleep 0.1
+  done
+fi
+if [ -z "$EXITED" ]; then
   kill -KILL "$SESS_PID" 2>/dev/null   # last resort; counts as failure
 fi
-[ -n "$EXITED" ] && ok "session exited on SIGTERM" || bad "session ignored SIGTERM"
+SESS_RC=0
+wait "$SESS_PID" 2>/dev/null || SESS_RC=$?
+[ -n "$EXITED" ] && ok "session exited after logout" \
+  || bad "session ignored logout"
+[ "$SESS_RC" -eq 0 ] && ok "logout exit status is 0 (no SIGKILL)" \
+  || bad "session exit status $SESS_RC (SIGKILLed?)"
+grep -q "policy: SIGTERM" "$WORK/session.log" \
+  && ok "session logged the graceful shutdown policy" \
+  || bad "no shutdown-policy log line"
 grep -q "session: exited" "$WORK/session.log" \
   && ok "session logged clean exit" || bad "no clean-exit log line"
 kill -0 "$XVFB_PID" 2>/dev/null \

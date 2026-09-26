@@ -134,7 +134,7 @@ int vt_power_battery_pct(vt_power_t *p) {
     struct dirent *e;
     while ((e = readdir(d))) {
         if (!vt_strstartswith(e->d_name, "BAT")) continue;
-        char path[256];
+        char path[320];
         snprintf(path, sizeof(path), "/sys/class/power_supply/%s/capacity", e->d_name);
         FILE *fp = fopen(path, "r");
         if (!fp) continue;
@@ -153,7 +153,7 @@ bool vt_power_on_ac(vt_power_t *p) {
     struct dirent *e;
     while ((e = readdir(d))) {
         if (!vt_strstartswith(e->d_name, "AC")) continue;
-        char path[256];
+        char path[320];
         snprintf(path, sizeof(path), "/sys/class/power_supply/%s/online", e->d_name);
         FILE *fp = fopen(path, "r");
         if (!fp) continue;

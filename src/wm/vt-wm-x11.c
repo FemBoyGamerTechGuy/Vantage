@@ -35,6 +35,10 @@
 #include <unistd.h>
 #include <signal.h>
 
+#if defined(VT_HAVE_XCURSOR)
+#include <X11/Xcursor/Xcursor.h>
+#endif
+
 /* ------------------------------------------------------------- client */
 typedef struct _client {
     vt_window_t      model;        /* embedded public model; id == Window */
@@ -68,6 +72,8 @@ typedef struct vt_wm_x11 {
     bool             sloppy_focus;
     bool             snap_enabled;
     Cursor           cur_move, cur_resize;
+    Cursor           cur_default;      /* themed root cursor */
+    bool             cur_default_set;
     /* interactive move/resize */
     bool             in_op;
     int              op_mode;         /* 0=move 1=resize */
@@ -1227,6 +1233,112 @@ static bool _detect_other_wm(vt_wm_x11_t *e) {
     return _probe_bad_access != 0;
 }
 
+/* ------------------------------------------------------ root cursor */
+
+/* The classic 16x16 arrow as hard-coded bits — the last-resort cursor
+ * that needs no cursor font and no Xcursor theme, so the pointer is
+ * visible even on a bare Xorg/XLibre with nothing else installed. */
+static const char *const _arrow_rows[] = {
+    "X...............",
+    "XX..............",
+    "XOX.............",
+    "XOOX............",
+    "XOOOX...........",
+    "XOOOOX..........",
+    "XOOOOOX.........",
+    "XOOOOOOX........",
+    "XOOOOOOOX.......",
+    "XOOOOXXXX.......",
+    "XOOXOX..........",
+    "XOX.XOX.........",
+    "XX...XOX........",
+    "X.....XOX.......",
+    "......XOX.......",
+    ".......X........",
+};
+
+static Cursor _cursor_default_init(vt_wm_x11_t *e, bool *set_out) {
+    Display *dpy = e->dpy;
+    *set_out = false;
+    if (!dpy) return None;
+
+    /* 1. Xcursor themed arrow (XCURSOR_THEME / XCURSOR_SIZE aware,
+     *    'default' theme fallback) */
+#if defined(VT_HAVE_XCURSOR)
+    {
+        const char *theme = getenv("XCURSOR_THEME");
+        const char *szs = getenv("XCURSOR_SIZE");
+        int size = szs && *szs ? atoi(szs) : 24;
+        if (size <= 0 || size > 128) size = 24;
+        const char *t = (theme && *theme) ? theme : "default";
+        Cursor c = XcursorLibraryLoadCursor(dpy, "left_ptr");
+        if (c == None)
+            c = XcursorLibraryLoadCursor(dpy, "arrow");
+        if (c != None) {
+            *set_out = true;
+            vt_logi("wm-x11: root cursor: Xcursor theme '%s' "
+                    "(left_ptr)", t);
+            (void)size;
+            return c;
+        }
+        vt_logi("wm-x11: root cursor: Xcursor found no 'left_ptr' image "
+                "in theme '%s' — trying the cursor font", t);
+    }
+#endif
+
+    /* 2. classic cursor-font arrow (built into the X server) */
+    {
+        Cursor c = XCreateFontCursor(dpy, XC_left_ptr);
+        if (c != None) {
+            *set_out = true;
+            vt_logi("wm-x11: root cursor: cursor-font left_ptr");
+            return c;
+        }
+        vt_logw("wm-x11: root cursor: XCreateFontCursor failed — "
+                "falling back to the hard-coded arrow");
+    }
+
+    /* 3. hand-coded bitmap arrow (works with nothing but core X11) */
+    {
+        const int n = 16;
+        unsigned char bits[(n * n) / 8];
+        unsigned char mask[(n * n) / 8];
+        memset(bits, 0, sizeof(bits));
+        memset(mask, 0, sizeof(mask));
+        for (int y = 0; y < n; y++) {
+            for (int x = 0; x < n; x++) {
+                char ch = _arrow_rows[y][x];
+                if (ch == 'X' || ch == 'O') {
+                    int bit = y * n + x;
+                    mask[bit / 8] |= (unsigned char)(1u << (bit % 8));
+                    if (ch == 'X')
+                        bits[bit / 8] |= (unsigned char)(1u << (bit % 8));
+                }
+            }
+        }
+        Pixmap src = XCreateBitmapFromData(dpy, e->root,
+                                           (const char *)bits, n, n);
+        Pixmap msk = XCreateBitmapFromData(dpy, e->root,
+                                           (const char *)mask, n, n);
+        if (src != None && msk != None) {
+            XColor fg = { .red = 0, .green = 0, .blue = 0 };
+            XColor bg = { .red = 0xffff, .green = 0xffff, .blue = 0xffff };
+            Cursor c = XCreatePixmapCursor(dpy, src, msk, &fg, &bg, 0, 0);
+            XFreePixmap(dpy, src);
+            XFreePixmap(dpy, msk);
+            if (c != None) {
+                *set_out = true;
+                vt_logi("wm-x11: root cursor: hard-coded 16x16 arrow "
+                        "(no font, no theme)");
+                return c;
+            }
+        }
+        vt_logw("wm-x11: root cursor: could not create any cursor — the "
+                "pointer may be invisible");
+    }
+    return None;
+}
+
 int vt_wm_x11_start(struct vt_wm_x11 *eng) {
     vt_wm_x11_t *e = (vt_wm_x11_t *)eng;
     if (!e || !e->dpy) return VT_ERR_INVAL;
@@ -1275,6 +1387,16 @@ int vt_wm_x11_start(struct vt_wm_x11 *eng) {
 
     e->cur_move = XCreateFontCursor(dpy, XC_fleur);
     e->cur_resize = XCreateFontCursor(dpy, XC_bottom_right_corner);
+    e->cur_default = _cursor_default_init(e, &e->cur_default_set);
+    if (e->cur_default_set) {
+        /* The root window has no cursor of its own — without an explicit
+         * XDefineCursor the server falls back to the parent's, which on
+         * a bare Xorg/XLibre with no cursor theme loaded can render as
+         * an invisible pointer. Pin a real arrow on the root AND on our
+         * WM check window so the pointer is always visible. */
+        XDefineCursor(dpy, e->root, e->cur_default);
+        XDefineCursor(dpy, e->wmwin, e->cur_default);
+    }
 
     /* register shortcuts as XGrabs */
     for (size_t i = 0; i < e->wm->shortcuts.size; i++) {
@@ -1321,6 +1443,13 @@ int vt_wm_x11_start(struct vt_wm_x11 *eng) {
 void vt_wm_x11_stop(struct vt_wm_x11 *eng) {
     vt_wm_x11_t *e = (vt_wm_x11_t *)eng;
     if (!e) return;
+    if (e->cur_default_set) {
+        /* hand the pointer back to the server default (theme unload) */
+        XUndefineCursor(e->dpy, e->root);
+        XUndefineCursor(e->dpy, e->wmwin);
+        XFreeCursor(e->dpy, e->cur_default);
+        e->cur_default_set = false;
+    }
     if (e->wm->backend && e->sink_id > 0)
         vt_backend_remove_event_sink(e->wm->backend, e->sink_id);
 }

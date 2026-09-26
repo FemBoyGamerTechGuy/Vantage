@@ -55,6 +55,9 @@ static void _print_usage(FILE *f) {
         "  ws [n|next|prev]        workspace info / switch\n"
         "  ws-move <id> <n>        move window to workspace (1-based)\n"
         "  launch <cmd...>         spawn command\n"
+        "  logout                  end the session cleanly\n"
+        "  reboot|shutdown|        power actions (session manager,\n"
+        "  suspend|hibernate         logind-powered when available)\n"
         "  status                  session version/stage/children\n"
         "  watch                   stream WM events\n");
 }
@@ -161,6 +164,38 @@ int main(int argc, char **argv) {
         int rc = _do_call(ipc, VT_IPC_MSG_WM_LAUNCH, payload, &resp);
         vt_free(payload);
         vt_ipc_msg_free(&resp);
+        vt_ipc_free(ipc);
+        return rc;
+    }
+    if (vt_streq(cmd, "logout") || vt_streq(cmd, "reboot") ||
+        vt_streq(cmd, "shutdown") || vt_streq(cmd, "suspend") ||
+        vt_streq(cmd, "hibernate")) {
+        /* Session-managed run: the session manager owns the child
+         * supervision and the shutdown policy (SIGTERM + grace period;
+         * SIGKILL only as a documented last resort). Standalone WM run:
+         * the compositor itself performs the clean unwind (CRTC
+         * restore, VT back to text). */
+        char *sock = vt_strprintf("%s/vantage-session.sock",
+                                  vt_runtime_dir());
+        vt_ipc_t *sipc = vt_ipc_new_client(sock);
+        vt_free(sock);
+        vt_ipc_t *target = sipc ? sipc : ipc;
+        vt_ipc_msg_t resp = {0};
+        int rc = _do_call(target, VT_IPC_MSG_WM_LOGOUT, cmd, &resp);
+        vt_ipc_msg_free(&resp);
+        if (sipc) {
+            vt_ipc_free(sipc);
+            if (rc == 0) printf("%s requested from the session manager\n",
+                                cmd);
+            else printf("%s\n",
+                        "session manager unreachable — trying the WM");
+            if (rc != 0) {
+                rc = _do_call(ipc, VT_IPC_MSG_WM_LOGOUT, cmd, &resp);
+                vt_ipc_msg_free(&resp);
+            }
+        } else {
+            if (rc == 0) printf("%s requested from the compositor\n", cmd);
+        }
         vt_ipc_free(ipc);
         return rc;
     }
