@@ -137,9 +137,24 @@ scanout=auto        ; auto | gbm | dumb
 |----------------------------|------------------------------------------------|
 | `VANTAGE_WAYLAND_SCANOUT`  | `auto` (GBM, dumb fallback), `gbm`, `dumb`    |
 | `VANTAGE_WAYLAND_REQUIRE_KMS` | `1` = fail hard instead of the headless fallback |
+| `VANTAGE_WAYLAND_FORCE_HEADLESS` | `1` = skip seat/vt/drm outright — deterministic tests/CI that never touch the host GPU/VT (what `meson test` uses) |
 | `VT_SEAT_BACKEND`          | force the seat backend (see table above)       |
 | `XCURSOR_THEME` / `XCURSOR_SIZE` | cursor theme for the compositor's cursor |
 | `XKB_DEFAULT_*`            | keyboard layout (libxkbcommon defaults)        |
+
+### `meson test` runs forced-headless (by design)
+
+The integration harness exports `VANTAGE_WAYLAND_FORCE_HEADLESS=1`, so
+the 15-stage trace is identical on a CI container, a desktop shell and
+a machine with a real GPU: `seat`, `vt` and `drm` report
+`skipped — forced headless` and `/dev/dri` is never opened — a test
+must not grab the developer's VT or poke the card the running desktop
+owns. Green tests therefore prove the headless contract (socket,
+xdg-shell clients, compositing, IPC, logout) and say **nothing** about
+real scanout. Without the knob, a launch from a desktop terminal
+honestly reports `drm: FAILED — DRM master refused` (the running X
+server owns the card); the real KMS path is exercised only by a TTY
+launch (method 1 above).
 
 ## Cursor
 

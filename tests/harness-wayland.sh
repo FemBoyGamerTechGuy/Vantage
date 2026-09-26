@@ -48,6 +48,14 @@ chmod 700 "$XDG_RUNTIME_DIR"
 
 # The Wayland backend refuses to nest: make sure neither variable is set
 unset DISPLAY WAYLAND_DISPLAY
+# Determinism + host safety: never acquire the host's real seat/VT/GPU
+# from a test. The backend then reports seat/vt/drm as "skipped —
+# forced headless", so the stage-marker trace below is IDENTICAL on a
+# container, a desktop shell and a real-GPU machine (a real /dev/dri
+# would otherwise log "drm: FAILED — DRM master refused", which is the
+# honest outcome on a desktop but a nondeterministic test). The real
+# KMS path is exercised by a genuine TTY launch (docs/wayland-backend.md).
+export VANTAGE_WAYLAND_FORCE_HEADLESS=1
 rm -f /tmp/vantage-wayland.ppm
 
 # ------------------------------------------------------------- compositor
@@ -73,12 +81,14 @@ fi
 export WAYLAND_DISPLAY="$SOCKET"
 
 # ----------------------------------------------------- stage markers
-# The container has no /dev/dri: the honest headless contract is a
-# complete, ordered diagnostic trace. seat/vt depend on the environment
-# (libseat-builtin can even answer in a container): assert they REPORT,
-# and assert the rest of the skipped-chain exactly.
-echo "== harness-wayland: startup stage markers (headless contract) =="
-for st in 'session: ok' 'drm: skipped' \
+# VANTAGE_WAYLAND_FORCE_HEADLESS=1 (exported above) makes the whole
+# 15-stage trace deterministic on every machine: every hardware stage
+# is skipped-with-reason, so each marker is asserted EXACTLY. This is
+# what keeps `meson test` green on developer boxes with a real GPU —
+# the harness must not depend on the machine it runs on, and it must
+# never touch the host's GPU, VT or session manager.
+echo "== harness-wayland: startup stage markers (forced-headless contract) =="
+for st in 'session: ok' 'seat: skipped' 'vt: skipped' 'drm: skipped' \
           'drm-master: skipped' 'gbm: skipped' 'egl: skipped' \
           'renderer: skipped' 'outputs: skipped' 'crtc: skipped' \
           'scanout: skipped' 'input: skipped' 'socket: ok' \
@@ -89,22 +99,10 @@ for st in 'session: ok' 'drm: skipped' \
     bad "missing stage marker: [wayland] $st"
   fi
 done
-for st in 'seat:' 'vt:'; do
-  if grep -qF "[wayland] $st" "$WORK/wm.log"; then
-    ok "stage marker present: $st (environment-dependent outcome)"
-  else
-    bad "missing stage marker: [wayland] $st"
-  fi
-done
 if grep -qF '[wayland] NOTICE: HEADLESS mode' "$WORK/wm.log"; then
   ok "honest HEADLESS fallback notice present"
 else
   bad "no HEADLESS notice — the fallback would be silent (lied about KMS)"
-fi
-if grep -qE 'renderer: (ok|skipped)' "$WORK/wm.log"; then
-  ok "renderer stage reported honestly"
-else
-  bad "renderer stage not reported"
 fi
 
 # ------------------------------------------------------------- client

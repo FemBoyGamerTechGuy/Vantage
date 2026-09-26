@@ -23,7 +23,9 @@
  * ioctls) + DRM/KMS/GBM scanout with async page flips on real
  * hardware; an honest HEADLESS framebuffer fallback when no KMS output
  * can be acquired (VANTAGE_WAYLAND_REQUIRE_KMS=1 turns that fallback
- * into a hard failure).
+ * into a hard failure). VANTAGE_WAYLAND_FORCE_HEADLESS=1 skips the
+ * seat/vt/drm stages outright — deterministic tests/CI that never
+ * touch the host's real session, VT or GPU.
  *
  * XLibre/Xorg users never touch this file; Wayland users get a native
  * compositor with zero X dependencies.
@@ -101,6 +103,14 @@ static void _stage_fail(int n, const char *fmt, ...) {
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     vt_loge("[wayland] %s: FAILED — %s", _stages[n], buf);
+}
+
+/* Truthy env flag: 1/true/yes/on (case-insensitive), else false. */
+static bool _env_flag(const char *name) {
+    const char *v = getenv(name);
+    if (!v || !*v) return false;
+    return vt_strcaseeq(v, "1") || vt_strcaseeq(v, "true") ||
+           vt_strcaseeq(v, "yes") || vt_strcaseeq(v, "on");
 }
 
 /* ------------------------------------------------------------ surfaces */
@@ -1696,6 +1706,11 @@ static int _wl_init(vt_backend_t *self) {
         return -1;
     }
 
+    /* Tests/CI knob: never acquire the host's real seat/VT/GPU, so the
+     * 15-stage trace is identical on every machine. The real path is
+     * exercised by a genuine TTY launch (docs/wayland-backend.md). */
+    bool force_headless = _env_flag("VANTAGE_WAYLAND_FORCE_HEADLESS");
+
     _wl_state_t *st = vt_malloc0(sizeof(*st));
     self->priv = st;
     st->backend_self = self;
@@ -1734,15 +1749,21 @@ static int _wl_init(vt_backend_t *self) {
 
     /* ---- stage 2/15: seat ------------------------------------------ */
     _stage_begin(1, "libseat (logind → elogind-compatible → seatd) or direct VT");
-    st->seat = vt_seat_acquire();
-    if (st->seat) {
-        vt_seat_set_notify(st->seat, _seat_notify, st);
-        _stage_ok(1, "%s, seat '%s', VT %d",
-                  vt_seat_mode_str(st->seat), vt_seat_name(st->seat),
-                  vt_seat_vt(st->seat));
+    if (force_headless) {
+        _stage_skip(1, "forced headless (VANTAGE_WAYLAND_FORCE_HEADLESS) — "
+                       "no seat/VT is acquired, the host session is not "
+                       "touched");
     } else {
-        _stage_skip(1, "no session manager and no usable TTY — headless "
-                       "operation follows");
+        st->seat = vt_seat_acquire();
+        if (st->seat) {
+            vt_seat_set_notify(st->seat, _seat_notify, st);
+            _stage_ok(1, "%s, seat '%s', VT %d",
+                      vt_seat_mode_str(st->seat), vt_seat_name(st->seat),
+                      vt_seat_vt(st->seat));
+        } else {
+            _stage_skip(1, "no session manager and no usable TTY — headless "
+                           "operation follows");
+        }
     }
 
     /* ---- stage 3/15: vt -------------------------------------------- */
@@ -1768,9 +1789,18 @@ static int _wl_init(vt_backend_t *self) {
                        *getenv("VANTAGE_WAYLAND_REQUIRE_KMS") == '1';
     const char *picked_path = "(none)";
     _stage_begin(3, "/dev/dri card discovery");
+    if (force_headless && require_kms) {
+        _stage_fail(3, "VANTAGE_WAYLAND_FORCE_HEADLESS and "
+                       "VANTAGE_WAYLAND_REQUIRE_KMS are both set — pick one");
+        goto fail_no_kms;
+    }
     vt_kms_card_t cards[8];
-    int nc = vt_kms_discover_cards(cards, 8);
-    if (nc == 0) {
+    int nc = force_headless ? 0 : vt_kms_discover_cards(cards, 8);
+    if (force_headless) {
+        _stage_skip(3, "forced headless (VANTAGE_WAYLAND_FORCE_HEADLESS) — "
+                       "/dev/dri is not touched");
+        st->headless = true;
+    } else if (nc == 0) {
         if (require_kms) {
             _stage_fail(3, "no DRM cards under /dev/dri and "
                            "VANTAGE_WAYLAND_REQUIRE_KMS=1");
@@ -1824,8 +1854,11 @@ static int _wl_init(vt_backend_t *self) {
                   vt_kms_out_height(st->kms, 0),
                   vt_kms_out_refresh(st->kms, 0));
     } else {
-        const char *why = nc == 0 ? "no DRM cards" :
-                          "card unusable (see [kms] logs above)";
+        const char *why = "card unusable (see [kms] logs above)";
+        if (force_headless)
+            why = "forced headless (VANTAGE_WAYLAND_FORCE_HEADLESS)";
+        else if (nc == 0)
+            why = "no DRM cards";
         _stage_skip(4, "%s (headless)", why);
         _stage_skip(5, "%s (headless)", why);
         _stage_skip(6, "%s (headless)", why);

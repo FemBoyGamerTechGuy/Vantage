@@ -147,6 +147,12 @@ cmd_test() {
     need_tools meson ninja
     if [ ! -f "$BUILD/build.ninja" ]; then
         cmd_build
+    else
+        # never test a stale build: recompile whatever changed since the
+        # last build (meson test itself does NOT rebuild)
+        say "ensuring $BUILD is up to date"
+        ninja -C "$BUILD"
+        link_tree_binaries
     fi
     say "running test suite"
     meson test -C "$BUILD" --print-errorlogs

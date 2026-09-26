@@ -115,7 +115,8 @@ fi
 
 echo "== harness-cli: installed execution (temporary staging prefix) =="
 STAGE="$WORK/stage"
-if DESTDIR="$STAGE" ninja -C "$BUILD" install >/dev/null 2>&1; then
+STAGE_LOG="$WORK/staging-install.log"
+if DESTDIR="$STAGE" ninja -C "$BUILD" install > "$STAGE_LOG" 2>&1; then
   INST_SESS="$(find "$STAGE" -type f -name vantage-session -perm -111 | head -n1)"
   if [ -n "$INST_SESS" ]; then
     INST_DIR="$(dirname "$INST_SESS")"
@@ -143,6 +144,8 @@ if DESTDIR="$STAGE" ninja -C "$BUILD" install >/dev/null 2>&1; then
   fi
 else
   bad "DESTDIR staging install failed"
+  # no silent failures: show what ninja actually said
+  tail -n 6 "$STAGE_LOG" 2>/dev/null | sed 's/^/    /'
 fi
 
 # ------------------------------------------------------------- summary
