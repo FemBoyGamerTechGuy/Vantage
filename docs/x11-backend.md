@@ -67,7 +67,9 @@ reparented into a WM-owned frame with a 26px title bar and a 2px accent
 border — visible on Kitty, Mirage and every other client regardless of
 their toolkit:
 
-* title (UTF-8 via Xft, truncated with an ellipsis when long)
+* title (UTF-8 via Xft with per-codepoint font fallback — Cyrillic and
+  CJK titles render even when the primary sans face lacks the glyphs —
+  truncated with an ellipsis when long)
 * close / maximize / minimize buttons (right end of the title bar)
 * double-click the title bar toggles maximize
 * drag the title bar to move; drag any border/corner to resize
@@ -84,6 +86,31 @@ The default is **click-to-focus**: hovering a window NEVER steals
 keyboard focus — focus moves only on a click anywhere in the window
 (client area, title bar or frame border). Users who prefer
 focus-follows-mouse can set `[wm] focus=sloppy`.
+
+## The panel
+
+* LEFT: **Programs** button → application menu from the SHARED vt-apps
+  database (the same `.desktop` parser, locale-aware name selection and
+  category table the Wayland panel uses — Russian `Name[ru]` lines are
+  resolved per locale instead of leaking into English sessions) with a
+  **search bar** (click the field, type to filter; BackSpace edits,
+  Escape clears/closes), **wheel scrolling**, icon-theme icons and a
+  Quit Session entry; window/task list for the CURRENT workspace
+  (titles with ellipsis, `_NET_WM_ICON` window icons, focused/minimized
+  states, click focuses, middle-click or click-on-focused minimizes,
+  right-click closes)
+* RIGHT: workspace buttons (glow follows `_NET_CURRENT_DESKTOP` via the
+  WM's workspace-changed broadcast), network indicator (real
+  `/sys/class/net` + `/proc/net/wireless` state), volume (native ALSA,
+  real mixer values, wheel + popup slider), clock (date AND time) with
+  the calendar popup, username + session menu
+* Icons come from the user's icon theme (`gtk-icon-theme-name` from
+  gtk-3.0/gtk-4.0 settings.ini, or `$VANTAGE_ICON_THEME`) via a real
+  icon-theme-spec lookup (index.theme Directories + Inherits chain +
+  hicolor + pixmaps fallback) — nothing is hard-coded to one theme.
+* Window placement cascades within the workarea; when a panel docks
+  (strut changes) existing windows that would end up hidden behind it
+  are nudged back inside the new workarea.
 
 ## Dependencies
 

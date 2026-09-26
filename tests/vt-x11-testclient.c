@@ -110,6 +110,7 @@ int main(int argc, char **argv) {
     int seconds = 4;
     const char *shot = NULL;
     const char *title = "Vantage Test";
+    const char *click = NULL;         /* "x,y" before the screenshot */
     bool ewmh_only = false;
     bool cursor_only = false;
     bool frame_only = false;
@@ -118,6 +119,7 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--seconds") && i + 1 < argc) seconds = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--screenshot") && i + 1 < argc) shot = argv[++i];
         else if (!strcmp(argv[i], "--title") && i + 1 < argc) title = argv[++i];
+        else if (!strcmp(argv[i], "--click") && i + 1 < argc) click = argv[++i];
         else if (!strcmp(argv[i], "--ewmh-probe")) ewmh_only = true;
         else if (!strcmp(argv[i], "--cursor-probe")) cursor_only = true;
         else if (!strcmp(argv[i], "--frame-probe")) frame_only = true;
@@ -330,6 +332,27 @@ int main(int argc, char **argv) {
         }
         msleep(100);
         XFlush(d);
+    }
+
+    if (click) {
+        /* XTest click at root coordinates (panel-button probing for
+         * the integration harness — exercises the REAL input path
+         * through the X server, the WM and the panel) */
+        int cx = 0, cy = 0;
+        sscanf(click, "%d,%d", &cx, &cy);
+        int evb = 0, errb = 0, vmaj = 0, vmin = 0;
+        if (XTestQueryExtension(d, &evb, &errb, &vmaj, &vmin)) {
+            XTestFakeMotionEvent(d, -1, cx, cy, CurrentTime);
+            XSync(d, False);
+            XTestFakeButtonEvent(d, 1, True, CurrentTime);
+            XTestFakeButtonEvent(d, 1, False, CurrentTime);
+            XSync(d, False);
+            printf("clicked %d,%d\n", cx, cy);
+            fflush(stdout);
+            /* the panel reacts asynchronously (separate process):
+             * give it time to open the menu before the screenshot */
+            msleep(500);
+        }
     }
 
     if (shot) {

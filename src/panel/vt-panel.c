@@ -134,6 +134,113 @@ static XftColor *_xft_color(vt_pctx_t *ctx, vt_pcol_t c, XftColor *out) {
     return out;
 }
 
+/* ---- per-codepoint font fallback --------------------------------
+ * A single XftFont covers a limited charset; when the panel's default
+ * sans lacks a glyph (Cyrillic on Cantarell-primary systems, CJK on
+ * Western systems) the character would render as nothing. The helper
+ * below picks, per codepoint, the first face that actually has the
+ * glyph: the primary font, then lazily-opened fontconfig matches for
+ * the specific character. This is what makes Russian .desktop names
+ * render correctly without bundling a font. */
+#define _VT_FB_FACES 4
+
+static XftFont *_fb_face(vt_pctx_t *ctx, FcChar32 cp) {
+    static XftFont *faces[_VT_FB_FACES];
+    static FcChar32 cps[_VT_FB_FACES];
+    static int n_faces;
+    for (int i = 0; i < n_faces; i++)
+        if (cps[i] == cp) return faces[i];
+    if (n_faces >= _VT_FB_FACES) return faces[0];
+    /* fontconfig: any sans font that actually covers this codepoint */
+    FcPattern *pat = FcNameParse((const FcChar8 *)"sans");
+    if (!pat) return NULL;
+    FcCharSet *cs = FcCharSetCreate();
+    FcCharSetAddChar(cs, cp);
+    FcPatternAddCharSet(pat, FC_CHARSET, cs);
+    FcPatternAddInteger(pat, FC_SIZE, ctx->font ? 10 : 10);
+    FcConfigSubstitute(NULL, pat, FcMatchPattern);
+    FcDefaultSubstitute(pat);
+    FcResult res = FcResultNoMatch;
+    FcPattern *mat = FcFontMatch(NULL, pat, &res);
+    XftFont *f = NULL;
+    if (mat) {
+        f = XftFontOpenPattern(ctx->dpy, mat);
+        if (f && !XftCharExists(ctx->dpy, f, cp)) {
+            XftFontClose(ctx->dpy, f);
+            f = NULL;
+        } else if (f == NULL) {
+            FcPatternDestroy(mat);
+        }
+    }
+    FcPatternDestroy(pat);
+    FcCharSetDestroy(cs);
+    if (!f) return NULL;
+    faces[n_faces] = f;
+    cps[n_faces] = cp;
+    n_faces++;
+    return f;
+}
+
+static XftFont *_font_for_cp(vt_pctx_t *ctx, XftFont *primary, FcChar32 cp) {
+    if (!primary || XftCharExists(ctx->dpy, primary, cp)) return primary;
+    XftFont *fb = _fb_face(ctx, cp);
+    return fb ? fb : primary;
+}
+
+/* decode one UTF-8 codepoint; returns bytes consumed */
+static int _utf8_cp(const char *s, FcChar32 *out) {
+    const unsigned char *u = (const unsigned char *)s;
+    if ((u[0] & 0x80) == 0) { *out = u[0]; return 1; }
+    if ((u[0] & 0xe0) == 0xc0 && (u[1] & 0xc0) == 0x80) {
+        *out = ((FcChar32)(u[0] & 0x1f) << 6) | (u[1] & 0x3f);
+        return 2;
+    }
+    if ((u[0] & 0xf0) == 0xe0 && (u[1] & 0xc0) == 0x80 &&
+        (u[2] & 0xc0) == 0x80) {
+        *out = ((FcChar32)(u[0] & 0x0f) << 12) |
+               ((FcChar32)(u[1] & 0x3f) << 6) | (u[2] & 0x3f);
+        return 3;
+    }
+    if ((u[0] & 0xf8) == 0xf0 && (u[1] & 0xc0) == 0x80 &&
+        (u[2] & 0xc0) == 0x80 && (u[3] & 0xc0) == 0x80) {
+        *out = ((FcChar32)(u[0] & 0x07) << 18) |
+               ((FcChar32)(u[1] & 0x3f) << 12) |
+               ((FcChar32)(u[2] & 0x3f) << 6) | (u[3] & 0x3f);
+        return 4;
+    }
+    *out = u[0];
+    return 1;
+}
+
+/* run-splitting draw core: works on any XftDraw target (the panel
+ * back buffer, popup menu windows, …) so EVERY text surface gets the
+ * same per-codepoint glyph fallback */
+static int _text_fallback_draw(vt_pctx_t *ctx, XftDraw *dst, int x, int y,
+                               const char *utf8, XftFont *f, XftColor *c) {
+    int x0 = x;
+    const char *p = utf8;
+    while (*p) {
+        FcChar32 cp;
+        int n = _utf8_cp(p, &cp);
+        XftFont *rf = _font_for_cp(ctx, f, cp);
+        const char *run = p;
+        int runlen = n;
+        p += n;
+        while (*p) {
+            FcChar32 cp2;
+            int n2 = _utf8_cp(p, &cp2);
+            if (_font_for_cp(ctx, f, cp2) != rf) break;
+            runlen += n2;
+            p += n2;
+        }
+        XftDrawStringUtf8(dst, c, rf, x, y, (const FcChar8 *)run, runlen);
+        XGlyphInfo gi;
+        XftTextExtentsUtf8(ctx->dpy, rf, (const FcChar8 *)run, runlen, &gi);
+        x += gi.xOff;
+    }
+    return x - x0;
+}
+
 int vt_pctx_text(vt_pctx_t *ctx, int x, int y, const char *utf8, bool bold,
                  vt_pcol_t col) {
     if (!utf8 || !*utf8) return 0;
@@ -142,18 +249,94 @@ int vt_pctx_text(vt_pctx_t *ctx, int x, int y, const char *utf8, bool bold,
     if (!f) return 0;
     XftColor c;
     _xft_color(ctx, col, &c);
-    XftDrawStringUtf8(ctx->xft, &c, f, x, y, (const FcChar8 *)utf8,
-                      (int)strlen(utf8));
-    return vt_pctx_text_width(ctx, utf8, bold);
+    return _text_fallback_draw(ctx, ctx->xft, x, y, utf8, f, &c);
+}
+
+int vt_pctx_menu_text(vt_pctx_t *ctx, XftDraw *dst, int x, int y,
+                      const char *utf8, bool bold, vt_pcol_t col) {
+    if (!ctx || !dst || !utf8 || !*utf8) return 0;
+    XftFont *f = bold ? ctx->font_bold : ctx->font;
+    if (!f) f = ctx->font;
+    if (!f) return 0;
+    XftColor c;
+    _xft_color(ctx, col, &c);
+    return _text_fallback_draw(ctx, dst, x, y, utf8, f, &c);
 }
 
 int vt_pctx_text_width(vt_pctx_t *ctx, const char *utf8, bool bold) {
     XftFont *f = bold ? ctx->font_bold : ctx->font;
     if (!f || !utf8) return 0;
-    XGlyphInfo gi;
-    XftTextExtentsUtf8(ctx->dpy, f, (const FcChar8 *)utf8,
-                       (int)strlen(utf8), &gi);
-    return gi.xOff;
+    int x = 0;
+    const char *p = utf8;
+    while (*p) {
+        FcChar32 cp;
+        int n = _utf8_cp(p, &cp);
+        XftFont *rf = _font_for_cp(ctx, f, cp);
+        const char *run = p;
+        int runlen = n;
+        p += n;
+        while (*p) {
+            FcChar32 cp2;
+            int n2 = _utf8_cp(p, &cp2);
+            if (_font_for_cp(ctx, f, cp2) != rf) break;
+            runlen += n2;
+            p += n2;
+        }
+        XGlyphInfo gi;
+        XftTextExtentsUtf8(ctx->dpy, rf, (const FcChar8 *)run, runlen, &gi);
+        x += gi.xOff;
+    }
+    return x;
+}
+
+/* Draw an ARGB-8888 image (with alpha) onto any XRender Picture
+ * target (panel back buffer, menu windows …). Used for application
+ * and window icons resolved from the user's icon theme. */
+void vt_pctx_draw_argb_pic(Display *dpy, Picture dst, int dx, int dy,
+                           int dw, int dh, const uint32_t *argb,
+                           int sw, int sh) {
+    if (!dpy || !dst || !argb || sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0)
+        return;
+    /* nearest-neighbor rescale into a depth-32 XImage */
+    XImage *img = XCreateImage(dpy, NULL, 32, ZPixmap, 0, NULL,
+                               (unsigned)dw, (unsigned)dh, 32, 0);
+    if (!img) return;
+    img->data = vt_malloc((size_t)dw * dh * 4);
+    for (int y = 0; y < dh; y++) {
+        int sy = (int)((int64_t)y * sh / dh);
+        if (sy >= sh) sy = sh - 1;
+        uint32_t *row = (uint32_t *)(img->data + (size_t)y * img->bytes_per_line);
+        for (int x = 0; x < dw; x++) {
+            int sx = (int)((int64_t)x * sw / dw);
+            if (sx >= sw) sx = sw - 1;
+            uint32_t p = argb[sy * sw + sx];
+            /* X ZPixmap little-endian: BGRX byte order */
+            row[x] = ((p & 0xff000000u) >> 24) << 24 |
+                     ((p & 0x000000ffu) << 16) |
+                     (p & 0x0000ff00u) |
+                     ((p & 0x00ff0000u) >> 16);
+        }
+    }
+    Pixmap px = XCreatePixmap(dpy, DefaultRootWindow(dpy),
+                              (unsigned)dw, (unsigned)dh, 32);
+    GC gc = XCreateGC(dpy, px, 0, NULL);
+    XPutImage(dpy, px, gc, img, 0, 0, 0, 0, (unsigned)dw, (unsigned)dh);
+    XFreeGC(dpy, gc);
+    XDestroyImage(img);
+    XRenderPictFormat *fmt =
+        XRenderFindStandardFormat(dpy, PictStandardARGB32);
+    Picture pic = XRenderCreatePicture(dpy, px, fmt, 0, NULL);
+    XRenderComposite(dpy, PictOpOver, pic, None, dst,
+                     0, 0, 0, 0, dx, dy, (unsigned)dw, (unsigned)dh);
+    XRenderFreePicture(dpy, pic);
+    XFreePixmap(dpy, px);
+}
+
+void vt_pctx_draw_argb(vt_pctx_t *ctx, int dx, int dy, int dw, int dh,
+                       const uint32_t *argb, int sw, int sh) {
+    if (!ctx) return;
+    vt_pctx_draw_argb_pic(ctx->dpy, ctx->back_pic, dx, dy, dw, dh,
+                          argb, sw, sh);
 }
 
 int vt_pctx_text_height(vt_pctx_t *ctx) {

@@ -22,6 +22,18 @@ test_ipc = executable('test-ipc',
 )
 test('ipc', test_ipc)
 
+test_apps = executable('test-apps',
+  sources : 'test-apps.c',
+  dependencies : tests_deps,
+)
+test('apps', test_apps)
+
+test_icons = executable('test-icons',
+  sources : 'test-icons.c',
+  dependencies : tests_deps + [vantage_wallpaper_dep],
+)
+test('icons', test_icons)
+
 # ------------------------------------------------------------------
 # Integration test clients (used by harness-xvfb.sh / harness-wayland.sh)
 # ------------------------------------------------------------------

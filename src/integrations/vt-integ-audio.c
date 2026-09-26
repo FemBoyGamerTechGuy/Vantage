@@ -49,15 +49,12 @@ void vt_audio_free(vt_audio_t *a) {
 }
 
 vt_audio_backend_t vt_audio_detect(void) {
-#if defined(VT_HAVE_PIPEWIRE)
-    if (getenv("PIPEWIRE_RUNTIME_DIR") || getenv("PIPEWIRE_CORE"))
-        return VT_AUDIO_BACKEND_PIPEWIRE;
-#endif
-#if defined(VT_HAVE_PULSE)
-    /* PulseAudio: check PULSE_SERVER or default socket */
-    if (getenv("PULSE_SERVER")) return VT_AUDIO_BACKEND_PULSE;
-    return VT_AUDIO_BACKEND_PULSE;
-#endif
+    /* The only backend with a REAL implementation here is ALSA (direct
+     * mixer). PipeWire is consumed through pipewire-alsa, and plain
+     * PulseAudio through its ALSA plugin — both surface as "default"
+     * ALSA mixers, so ALSA-first detection covers them. Reporting
+     * pulse/pipewire without an implementation would produce fake
+     * volume numbers, which Vantage never does. */
 #if defined(VT_HAVE_ALSA)
     return VT_AUDIO_BACKEND_ALSA;
 #endif
@@ -73,25 +70,60 @@ const char *vt_audio_backend_str(vt_audio_backend_t b) {
     }
 }
 
+#if defined(VT_HAVE_ALSA)
+static snd_mixer_elem_t *_alsa_elem(vt_audio_t *a) {
+    if (!a->alsa_mixer) return NULL;
+    static const char *const names[] = { "Master", "PCM", "Front",
+                                         "Headphone", NULL };
+    snd_mixer_selem_id_t *sid = NULL;
+    snd_mixer_selem_id_alloca(&sid);
+    for (int i = 0; names[i]; i++) {
+        snd_mixer_selem_id_set_index(sid, 0);
+        snd_mixer_selem_id_set_name(sid, names[i]);
+        snd_mixer_elem_t *el = snd_mixer_find_selem(a->alsa_mixer, sid);
+        if (el && snd_mixer_selem_has_playback_volume(el)) return el;
+    }
+    return NULL;
+}
+static bool _alsa_open(vt_audio_t *a) {
+    if (a->alsa_mixer) return true;
+    if (snd_mixer_open(&a->alsa_mixer, 0) < 0) return false;
+    if (snd_mixer_attach(a->alsa_mixer, "default") < 0 ||
+        snd_mixer_selem_register(a->alsa_mixer, NULL, NULL) < 0 ||
+        snd_mixer_load(a->alsa_mixer) < 0) {
+        snd_mixer_close(a->alsa_mixer);
+        a->alsa_mixer = NULL;
+        return false;
+    }
+    return true;
+}
+#endif
+
 int vt_audio_init(vt_audio_t *a) {
     if (!a) return VT_ERR_INVAL;
     a->backend = vt_audio_detect();
     if (a->backend == VT_AUDIO_BACKEND_NONE) {
-        vt_logi("audio: no backend available");
+        vt_logi("audio: no mixer backend available");
         return VT_ERR_NOTSUPP;
     }
-    vt_logi("audio: backend = %s", vt_audio_backend_str(a->backend));
 #if defined(VT_HAVE_ALSA)
-    if (a->backend == VT_AUDIO_BACKEND_ALSA) {
-        if (snd_mixer_open(&a->alsa_mixer, 0) == 0) {
-            snd_mixer_attach(a->alsa_mixer, "default");
-            snd_mixer_selem_register(a->alsa_mixer, NULL, NULL);
-            snd_mixer_load(a->alsa_mixer);
-        }
+    if (!_alsa_open(a) || !_alsa_elem(a)) {
+        vt_logi("audio: no usable ALSA mixer element "
+                "(Master/PCM/Front) — volume display disabled");
+        if (a->alsa_mixer) { snd_mixer_close(a->alsa_mixer);
+                             a->alsa_mixer = NULL; }
+        a->backend = VT_AUDIO_BACKEND_NONE;
+        return VT_ERR_NOTSUPP;
     }
-#endif
-    a->volume_pct = 50; a->muted = false;
+    vt_logi("audio: backend = alsa (real mixer values)");
+    a->volume_pct = 50;
+    a->muted = false;
     return VT_OK;
+#else
+    vt_logi("audio: built without ALSA — volume display disabled");
+    a->backend = VT_AUDIO_BACKEND_NONE;
+    return VT_ERR_NOTSUPP;
+#endif
 }
 
 int vt_audio_set_volume(vt_audio_t *a, int pct) {
@@ -100,32 +132,53 @@ int vt_audio_set_volume(vt_audio_t *a, int pct) {
     if (pct > 100) pct = 100;
     a->volume_pct = pct;
 #if defined(VT_HAVE_ALSA)
-    if (a->backend == VT_AUDIO_BACKEND_ALSA && a->alsa_mixer) {
-        snd_mixer_selem_id_t *sid;
-        snd_mixer_selem_id_alloca(&sid);
-        snd_mixer_selem_id_set_name(sid, "Master");
-        snd_mixer_elem_t *e = snd_mixer_find_selem(a->alsa_mixer, sid);
-        if (e) {
-            long min, max;
-            snd_mixer_selem_get_playback_volume_range(e, &min, &max);
-            long v = min + (max - min) * pct / 100;
-            snd_mixer_selem_set_playback_volume_all(e, v);
+    if (a->backend == VT_AUDIO_BACKEND_ALSA) {
+        if (!_alsa_open(a)) return VT_ERR_NOTSUPP;
+        snd_mixer_elem_t *el = _alsa_elem(a);
+        if (el) {
+            long mn = 0, mx = 0;
+            snd_mixer_selem_get_playback_volume_range(el, &mn, &mx);
+            long v = mn + (mx - mn) * pct / 100;
+            snd_mixer_selem_set_playback_volume_all(el, v);
         }
     }
 #endif
-    return VT_OK;
+    return a->backend == VT_AUDIO_BACKEND_NONE ? VT_ERR_NOTSUPP : VT_OK;
 }
 
 int vt_audio_get_volume(vt_audio_t *a, int *pct) {
     if (!a) return VT_ERR_INVAL;
+#if defined(VT_HAVE_ALSA)
+    if (a->backend == VT_AUDIO_BACKEND_ALSA) {
+        if (!_alsa_open(a)) return VT_ERR_NOTSUPP;
+        snd_mixer_elem_t *el = _alsa_elem(a);
+        if (!el) return VT_ERR_NOTSUPP;
+        long mn = 0, mx = 0, lv = 0;
+        int sw = 1;
+        snd_mixer_selem_get_playback_volume_range(el, &mn, &mx);
+        snd_mixer_selem_get_playback_volume(el, 0, &lv);
+        if (snd_mixer_selem_has_playback_switch(el))
+            snd_mixer_selem_get_playback_switch(el, 0, &sw);
+        a->volume_pct = mx > mn ? (int)((lv - mn) * 100 / (mx - mn)) : 0;
+        a->muted = !sw;
+    }
+#endif
     if (pct) *pct = a->volume_pct;
-    return VT_OK;
+    return a->backend == VT_AUDIO_BACKEND_NONE ? VT_ERR_NOTSUPP : VT_OK;
 }
 
 int vt_audio_set_mute(vt_audio_t *a, bool mute) {
     if (!a) return VT_ERR_INVAL;
     a->muted = mute;
-    return VT_OK;
+#if defined(VT_HAVE_ALSA)
+    if (a->backend == VT_AUDIO_BACKEND_ALSA) {
+        if (!_alsa_open(a)) return VT_ERR_NOTSUPP;
+        snd_mixer_elem_t *el = _alsa_elem(a);
+        if (el && snd_mixer_selem_has_playback_switch(el))
+            snd_mixer_selem_set_playback_switch_all(el, mute ? 0 : 1);
+    }
+#endif
+    return a->backend == VT_AUDIO_BACKEND_NONE ? VT_ERR_NOTSUPP : VT_OK;
 }
 bool vt_audio_get_mute(vt_audio_t *a) { return a ? a->muted : false; }
 

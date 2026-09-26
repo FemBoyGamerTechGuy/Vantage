@@ -38,13 +38,73 @@ typedef struct {
     int ws;
     bool focused, minimized, maximized, fullscreen, urgent;
     char cls[32];
+    uint32_t *icon;            /* 16x16 ARGB from _NET_WM_ICON */
 } _twin_t;
 
 typedef struct {
     vt_vec_t wins;
     int cur_ws;
     int ws_count;
+    vt_vec_t icons;        /* _iconent_t: xid → 16x16 ARGB */
 } _tasklist_t;
+
+typedef struct {
+    uint32_t xid;
+    uint32_t *px;          /* 16x16 ARGB, NULL when none */
+} _iconent_t;
+
+/* Read _NET_WM_ICON (CARDINAL[]: w,h,ARGB… repeated) and return a
+ * scaled 16x16 ARGB icon, or NULL. Uses the panel's own connection. */
+static uint32_t *_net_wm_icon_16(Display *dpy, Window win) {
+    Atom prop = XInternAtom(dpy, "_NET_WM_ICON", False);
+    Atom actual;
+    int fmt;
+    unsigned long nitems = 0, bytes = 0;
+    unsigned char *data = NULL;
+    if (XGetWindowProperty(dpy, win, prop, 0, 1 << 20, False, XA_CARDINAL,
+                           &actual, &fmt, &nitems, &bytes, &data)
+            != Success || !data || nitems < 3)
+        { if (data) XFree(data); return NULL; }
+    unsigned long *card = (unsigned long *)(void *)data;
+    /* pick the icon whose size is closest to 32px */
+    unsigned long best = 0, best_dist = ~0UL;
+    for (unsigned long i = 0; i + 2 <= nitems;) {
+        unsigned long w = card[i], h = card[i + 1];
+        if (w == 0 || h == 0 || i + 2 + w * h > nitems) break;
+        unsigned long dist = w > 32 ? w - 32 : 32 - w;
+        if (dist < best_dist) { best_dist = dist; best = i; }
+        i += 2 + w * h;
+    }
+    uint32_t *out = NULL;
+    if (best_dist != ~0UL) {
+        int w = (int)card[best], h = (int)card[best + 1];
+        uint32_t *src = vt_malloc(sizeof(uint32_t) * (size_t)w * h);
+        for (int i = 0; i < w * h; i++)
+            src[i] = (uint32_t)card[best + 2 + i];
+        out = vt_malloc(sizeof(uint32_t) * 16 * 16);
+        for (int y = 0; y < 16; y++) {
+            int sy = y * h / 16;
+            for (int x = 0; x < 16; x++) {
+                int sx = x * w / 16;
+                out[y * 16 + x] = src[sy * w + sx];
+            }
+        }
+        vt_free(src);
+    }
+    XFree(data);
+    return out;
+}
+
+static uint32_t *_task_icon(_tasklist_t *t, Display *dpy, uint32_t xid) {
+    for (size_t i = 0; i < t->icons.size; i++) {
+        _iconent_t *e = vt_vec_at(&t->icons, i);
+        if (e->xid == xid) return e->px;
+    }
+    _iconent_t e = { .xid = xid, .px = NULL };
+    e.px = _net_wm_icon_16(dpy, (Window)xid);
+    vt_vec_push(&t->icons, &e);
+    return e.px;
+}
 
 static void _task_parse_line(const char *line, _twin_t *w) {
     /* format: id\ttitle\tws\tflags\tclass\tappid */
@@ -56,6 +116,7 @@ static void _task_parse_line(const char *line, _twin_t *w) {
          tok = strtok_r(NULL, "\t", &save))
         fields[nf++] = tok;
     if (nf >= 4) {
+        w->icon = NULL;
         w->id = (uint32_t)strtoul(fields[0], NULL, 0);
         w->title = vt_strdup(fields[1] ? fields[1] : "");
         w->ws = atoi(fields[2]);
@@ -103,6 +164,7 @@ static void _tasklist_refresh(vt_applet_env_t *env) {
 static void _tasklist_init(vt_applet_env_t *env) {
     _tasklist_t *t = vt_malloc0(sizeof(*t));
     vt_vec_init(&t->wins, sizeof(_twin_t), 8);
+    vt_vec_init(&t->icons, sizeof(_iconent_t), 16);
     env->state = t;
     _tasklist_refresh(env);
 }
@@ -112,6 +174,11 @@ static void _tasklist_fini(vt_applet_env_t *env) {
     if (!t) return;
     _tasklist_clear(t);
     vt_vec_fini(&t->wins);
+    for (size_t i = 0; i < t->icons.size; i++) {
+        _iconent_t *e = vt_vec_at(&t->icons, i);
+        vt_free(e->px);
+    }
+    vt_vec_fini(&t->icons);
     vt_free(t);
 }
 
@@ -144,11 +211,18 @@ static void _tasklist_render(vt_applet_env_t *env) {
         vt_pcol_t tc = w->focused ? (vt_pcol_t){ 0xec, 0xee, 0xf0, 0xff }
                                   : (vt_pcol_t){ 0x90, 0x93, 0x99, 0xff };
         if (w->minimized) tc.a = 0x90;
+        int tx_off = 10;
+        uint32_t *icon = _task_icon(t, ctx->dpy, w->id);
+        if (icon) {
+            int iy = env->area.y + (h - 16) / 2;
+            vt_pctx_draw_argb(ctx, x + 8, iy, 16, 16, icon, 16, 16);
+            tx_off = 30;
+        }
         char *label = vt_strdup(w->title ? w->title : "");
         int tw = vt_pctx_text_width(ctx, label, false);
-        if (tw > bw - 24) {
+        if (tw > bw - 16 - tx_off) {
             /* truncate with ellipsis */
-            while (tw > bw - 30 && *label) {
+            while (tw > bw - 22 - tx_off && *label) {
                 size_t ll = strlen(label);
                 if (ll < 4) break;
                 label[ll - 1] = 0;
@@ -157,7 +231,7 @@ static void _tasklist_render(vt_applet_env_t *env) {
             }
         }
         int ty = env->area.y + h / 2 + vt_pctx_text_height(ctx) / 2 - 2;
-        vt_pctx_text(ctx, x + 10, ty, label, false, tc);
+        vt_pctx_text(ctx, x + tx_off, ty, label, false, tc);
         vt_free(label);
         w->id = w->id; /* keep */
         x += bw;
@@ -377,13 +451,13 @@ static void _clock_cal_paint(vt_applet_env_t *env) {
     XftColor fc;
     XftColorAllocValue(dpy, DefaultVisual(dpy, DefaultScreen(dpy)),
                        DefaultColormap(dpy, DefaultScreen(dpy)), &white, &fc);
-    XftDrawStringUtf8(k->draw, &fc, ctx->font_bold, 44, 24,
-                      (const FcChar8 *)head, (int)strlen(head));
+    vt_pctx_menu_text(ctx, k->draw, 44, 24, head, true,
+                      (vt_pcol_t){ 0xec, 0xee, 0xf0, 0xff });
     /* month arrows */
-    XftDrawStringUtf8(k->draw, &fc, ctx->font_bold, 12, 24,
-                      (const FcChar8 *)"\xe2\x80\xb9", 3);
-    XftDrawStringUtf8(k->draw, &fc, ctx->font_bold, _CAL_W - 20, 24,
-                      (const FcChar8 *)"\xe2\x80\xba", 3);
+    vt_pctx_menu_text(ctx, k->draw, 12, 24, "\xe2\x80\xb9", true,
+                      (vt_pcol_t){ 0xec, 0xee, 0xf0, 0xff });
+    vt_pctx_menu_text(ctx, k->draw, _CAL_W - 20, 24, "\xe2\x80\xba", true,
+                      (vt_pcol_t){ 0xec, 0xee, 0xf0, 0xff });
 
     /* weekday header (Monday-first, locale-independent) */
     static const char *const wd[] = { "Mo", "Tu", "We", "Th", "Fr", "Sa",
@@ -394,8 +468,8 @@ static void _clock_cal_paint(vt_applet_env_t *env) {
     XftColorAllocValue(dpy, DefaultVisual(dpy, DefaultScreen(dpy)),
                        DefaultColormap(dpy, DefaultScreen(dpy)), &dim, &fd);
     for (int i = 0; i < 7; i++)
-        XftDrawStringUtf8(k->draw, &fd, ctx->font, 8 + i * _CAL_CELL + 6, 48,
-                          (const FcChar8 *)wd[i], (int)strlen(wd[i]));
+        vt_pctx_menu_text(ctx, k->draw, 8 + i * _CAL_CELL + 6, 48, wd[i],
+                          false, (vt_pcol_t){ 0x90, 0x93, 0x99, 0xff });
 
     /* day grid */
     struct tm first = { .tm_year = k->view_year - 1900,
@@ -444,10 +518,18 @@ static void _clock_cal_paint(vt_applet_env_t *env) {
         XftColorAllocValue(dpy, DefaultVisual(dpy, DefaultScreen(dpy)),
                            DefaultColormap(dpy, DefaultScreen(dpy)), &tc,
                            &fday);
-        XftDrawStringUtf8(k->draw, today ? &fday : &fc,
-                          today ? ctx->font_bold : ctx->font,
-                          cx + _CAL_CELL / 2 - 3, cy + _CAL_CELL - 9,
-                          (const FcChar8 *)ds, (int)strlen(ds));
+        int dw = ctx ? 6 : 6;
+        {
+            XGlyphInfo gi;
+            XftTextExtentsUtf8(ctx->dpy, today ? ctx->font_bold : ctx->font,
+                               (const FcChar8 *)ds, (int)strlen(ds), &gi);
+            dw = gi.xOff;
+        }
+        vt_pctx_menu_text(ctx, k->draw,
+                          cx + (_CAL_CELL - 4 - dw) / 2, cy + _CAL_CELL - 9,
+                          ds, today,
+                          today ? (vt_pcol_t){ 0xff, 0xff, 0xff, 0xff }
+                                : (vt_pcol_t){ 0xec, 0xee, 0xf0, 0xff });
     }
     XRenderFreePicture(dpy, pic);
 }
@@ -881,6 +963,8 @@ static void _net_read(_net_t *n) {
         vt_free(p);
         if (state && vt_strstartswith(state, "up")) {
             n->up = true;
+            n->wifi = -1;      /* wired until /proc/net/wireless proves
+                                  otherwise */
             snprintf(n->name, sizeof(n->name), "%.*s",
                      (int)sizeof(n->name) - 1, de->d_name);
             /* wireless quality */
@@ -938,6 +1022,7 @@ static void _net_tick(vt_applet_env_t *env, uint64_t now) {
 }
 static void _net_init(vt_applet_env_t *env) {
     _net_t *n = vt_malloc0(sizeof(*n));
+    n->wifi = -1;              /* -1 = wired/unknown, 0..100 = wireless */
     env->state = n;
     _net_read(n);
 }
@@ -1256,9 +1341,14 @@ static void _user_menu_paint(vt_applet_env_t *env) {
                                DefaultColormap(dpy, DefaultScreen(dpy)),
                                &warn, &fc);
         }
-        XftDrawStringUtf8(u->draw, &fc, ctx->font, 10, ry + _UM_ROW - 7,
-                          (const FcChar8 *)_user_actions[i],
-                          (int)strlen(_user_actions[i]));
+        {
+            vt_pcol_t rowc = sel ? (vt_pcol_t){ 0xff, 0xff, 0xff, 0xff }
+                                 : (vt_pcol_t){ 0xec, 0xee, 0xf0, 0xff };
+            if (i >= _UA_REBOOT && !sel)
+                rowc = (vt_pcol_t){ 0xe0, 0x7a, 0x50, 0xff };
+            vt_pctx_menu_text(ctx, u->draw, 10, ry + _UM_ROW - 7,
+                              _user_actions[i], sel, rowc);
+        }
     }
     if (u->status) {
         XRenderColor dim = { .red = 0x9090, .green = 0x9393, .blue = 0x9999,
@@ -1267,10 +1357,9 @@ static void _user_menu_paint(vt_applet_env_t *env) {
         XftColorAllocValue(dpy, DefaultVisual(dpy, DefaultScreen(dpy)),
                            DefaultColormap(dpy, DefaultScreen(dpy)), &dim,
                            &fd);
-        XftDrawStringUtf8(u->draw, &fd, ctx->font, 10,
-                          4 + _UA_COUNT * _UM_ROW + _UM_ROW - 7,
-                          (const FcChar8 *)u->status,
-                          (int)strlen(u->status));
+        vt_pctx_menu_text(ctx, u->draw, 10,
+                          4 + _UA_COUNT * _UM_ROW + _UM_ROW - 7, u->status,
+                          false, (vt_pcol_t){ 0x90, 0x93, 0x99, 0xff });
     }
     XRenderFreePicture(dpy, pic);
 }

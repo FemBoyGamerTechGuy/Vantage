@@ -36,6 +36,7 @@
 #include <vantage/vt-backend.h>
 #include <vantage/vt-seat.h>
 #include <vantage/vt-kms.h>
+#include <vantage/vt-ipc.h>
 
 #if defined(VT_HAVE_WAYLAND)
 
@@ -121,6 +122,7 @@ typedef struct _wl_surf {
     struct wl_resource *buf_res;      /* current wl_buffer */
     uint32_t *pixels;                 /* mapped shm contents (BGRA/XRGB) */
     int32_t  w, h;
+    int32_t  stride;                  /* row stride in uint32 units */
     int32_t  dx, dy;                  /* attach offset */
     int      x, y;                    /* composited position */
     int      ws;                      /* workspace (all if sticky-ish) */
@@ -132,6 +134,11 @@ typedef struct _wl_surf {
     /* cursor-surface duties (wl_pointer.set_cursor) */
     bool     is_cursor;
     int      hotspot_x, hotspot_y;
+    /* wl_subsurface duties: children are painted relative to this
+     * surface, in their own stacking order (place_above/below) */
+    struct _wl_surf *parent;
+    struct wl_list  subs;             /* child subsurfaces */
+    struct wl_list  sub_link;
 } _wl_surf_t;
 
 typedef struct _xdg_toplevel {
@@ -177,6 +184,8 @@ typedef struct {
     struct wl_global *seat_g;
     struct wl_global *output_g;
     struct wl_global *xdg_g;
+    struct wl_global *subcomp_g;
+    struct wl_global *ddm_g;
     struct wl_listener client_created;
     struct wl_list surfaces;          /* bottom→top */
     vt_backend_t *backend_self;       /* for event emission */
@@ -222,6 +231,9 @@ typedef struct {
     _xdg_toplevel_t *focused_toplevel;
     uint64_t next_win_id;
 
+    /* clipboard */
+    struct wl_list data_devs;        /* _data_dev_t */
+    struct _data_src *selection;
     /* cursor sprite */
     uint32_t cursor_img[64 * 64];
     int cur_img_w, cur_img_h, cur_img_hx, cur_img_hy;
@@ -308,6 +320,11 @@ static void _surf_commit(struct wl_client *cli, struct wl_resource *res) {
             s->pixels = (uint32_t *)wl_shm_buffer_get_data(shm);
             s->w = wl_shm_buffer_get_width(shm);
             s->h = wl_shm_buffer_get_height(shm);
+            /* the client's row stride is NOT width*4 in general —
+             * toolkits pad rows. Reading with w as the stride shears
+             * the whole window into a diagonal smear. */
+            int32_t bytes = wl_shm_buffer_get_stride(shm);
+            s->stride = bytes / 4 >= s->w ? bytes / 4 : s->w;
         }
         if (!s->mapped && s->w > 0 && s->h > 0) {
             s->mapped = true;
@@ -407,6 +424,10 @@ static const struct wl_surface_interface _surf_impl = {
 static void _surf_resource_destroy(struct wl_resource *res) {
     _wl_surf_t *s = wl_resource_get_user_data(res);
     if (!s) return;
+    if (s->parent) {
+        wl_list_remove(&s->sub_link);
+        s->parent = NULL;
+    }
     if (s->mapped) {
         wl_list_remove(&s->link);
         if (_wls) {
@@ -437,6 +458,8 @@ static void _compositor_create_surface(struct wl_client *cli,
     _wl_surf_t *s = vt_malloc0(sizeof(*s));
     if (!s) { wl_client_post_no_memory(cli); return; }
     wl_list_init(&s->frame_cbs);
+    wl_list_init(&s->subs);
+    wl_list_init(&s->sub_link);
     struct wl_resource *sr = wl_resource_create(cli, &wl_surface_interface,
                                                 wl_resource_get_version(res),
                                                 id);
@@ -458,6 +481,333 @@ static void _bind_compositor(struct wl_client *cli, void *data,
         &wl_compositor_interface, version < 4 ? version : 4, id);
     if (!res) { wl_client_post_no_memory(cli); return; }
     wl_resource_set_implementation(res, &_compositor_impl, NULL, NULL);
+}
+
+/* ------------------------------------------------ wl_subcompositor */
+/* Real clients (GTK/Qt/kitty) use subsurfaces for menus, overlays and
+ * sometimes video planes. Without the global they abort surface
+ * creation. Children paint relative to their parent, above it, in the
+ * order place_above/place_below established. */
+static void _subsurface_destroy(struct wl_client *cli,
+                                struct wl_resource *res) {
+    (void)cli;
+    wl_resource_destroy(res);
+}
+static void _subsurface_set_position(struct wl_client *cli,
+                                     struct wl_resource *res,
+                                     int32_t x, int32_t y) {
+    (void)cli;
+    _wl_surf_t *s = wl_resource_get_user_data(res);
+    if (!s) return;
+    /* store relative offsets in dx/dy reuse */
+    s->dx = x;
+    s->dy = y;
+    if (_wls) _wls->dirty = true;
+}
+static void _subsurface_place(struct wl_resource *res,
+                              struct wl_resource *sib_res, bool above) {
+    _wl_surf_t *s = wl_resource_get_user_data(res);
+    _wl_surf_t *sib = sib_res ?
+        wl_resource_get_user_data(sib_res) : NULL;
+    if (!s || !s->parent || !sib || sib->parent != s->parent) return;
+    wl_list_remove(&s->sub_link);
+    if (above) wl_list_insert(&sib->sub_link, &s->sub_link);
+    else wl_list_insert(sib->sub_link.prev, &s->sub_link);
+    if (_wls) _wls->dirty = true;
+}
+static void _subsurface_place_above(struct wl_client *cli,
+                                    struct wl_resource *res,
+                                    struct wl_resource *sib) {
+    (void)cli;
+    _subsurface_place(res, sib, true);
+}
+static void _subsurface_place_below(struct wl_client *cli,
+                                    struct wl_resource *res,
+                                    struct wl_resource *sib) {
+    (void)cli;
+    _subsurface_place(res, sib, false);
+}
+static void _subsurface_set_sync(struct wl_client *cli,
+                                 struct wl_resource *res) {
+    /* every commit repaints the whole scene, so synchronized
+     * semantics are what we always provide */
+    (void)cli; (void)res;
+}
+static void _subsurface_set_desync(struct wl_client *cli,
+                                   struct wl_resource *res) {
+    (void)cli; (void)res;
+}
+static const struct wl_subsurface_interface _subsurface_impl = {
+    .destroy = _subsurface_destroy,
+    .set_position = _subsurface_set_position,
+    .place_above = _subsurface_place_above,
+    .place_below = _subsurface_place_below,
+    .set_sync = _subsurface_set_sync,
+    .set_desync = _subsurface_set_desync,
+};
+
+static void _subsurface_res_destroy(struct wl_resource *res) {
+    _wl_surf_t *s = wl_resource_get_user_data(res);
+    if (s) s->parent = NULL;   /* link removal happens in the surface
+                                  destroy path */
+}
+
+static void _subcompositor_get_subsurface(struct wl_client *cli,
+                                          struct wl_resource *res,
+                                          uint32_t id,
+                                          struct wl_resource *surface,
+                                          struct wl_resource *parent) {
+    (void)res;
+    _wl_surf_t *s = wl_resource_get_user_data(surface);
+    _wl_surf_t *p = wl_resource_get_user_data(parent);
+    if (!s || !p || s == p || s->parent) {
+        wl_resource_post_error(res, WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE,
+                               "invalid subsurface");
+        return;
+    }
+    struct wl_resource *r = wl_resource_create(
+        cli, &wl_subsurface_interface,
+        wl_resource_get_version(res), id);
+    if (!r) { wl_client_post_no_memory(cli); return; }
+    wl_resource_set_implementation(r, &_subsurface_impl, s,
+                                   _subsurface_res_destroy);
+    s->parent = p;
+    /* children start on top of the parent */
+    wl_list_insert(p->subs.prev, &s->sub_link);
+    if (_wls) _wls->dirty = true;
+}
+
+static void _subcompositor_destroy(struct wl_client *cli,
+                                   struct wl_resource *res) {
+    (void)cli;
+    wl_resource_destroy(res);
+}
+
+static const struct wl_subcompositor_interface _subcompositor_impl = {
+    .destroy = _subcompositor_destroy,
+    .get_subsurface = _subcompositor_get_subsurface,
+};
+
+static void _bind_subcompositor(struct wl_client *cli, void *data,
+                                uint32_t version, uint32_t id) {
+    (void)data;
+    struct wl_resource *res = wl_resource_create(
+        cli, &wl_subcompositor_interface, version < 1 ? 1 : 1, id);
+    if (!res) { wl_client_post_no_memory(cli); return; }
+    wl_resource_set_implementation(res, &_subcompositor_impl, NULL, NULL);
+}
+
+/* -------------------------------------------------- wl_data_device_manager */
+/* In-session clipboard: one selection source at a time; the focused
+ * client receives the selection offer on focus change and on
+ * set_selection. Copy/paste between Vantage clients works; there is
+ * no X11/mime bridging here (nothing outside the session to bridge
+ * with). */
+typedef struct _data_src {
+    struct wl_resource *res;         /* wl_data_source */
+    struct wl_client  *cli;
+    vt_vec_t          mimes;         /* char* */
+    bool              dead;
+} _data_src_t;
+
+typedef struct _data_dev {
+    struct wl_resource *res;         /* wl_data_device */
+    struct wl_client  *cli;
+    struct wl_list     link;
+} _data_dev_t;
+
+static void _offer_destroy(struct wl_client *cli, struct wl_resource *res) {
+    (void)cli;
+    wl_resource_destroy(res);
+}
+static void _offer_receive(struct wl_client *cli, struct wl_resource *res,
+                           const char *mime, int32_t fd) {
+    (void)cli;
+    /* the receiving client wants the data: forward to the source */
+    _wl_state_t *st = _wls;
+    if (!st || !st->selection || st->selection->dead) { close(fd); return; }
+    wl_data_source_send_send(st->selection->res, mime, fd);
+}
+static void _offer_finish(struct wl_client *cli, struct wl_resource *res) {
+    (void)cli; (void)res;
+}
+static void _offer_accept(struct wl_client *cli, struct wl_resource *res,
+                          uint32_t serial, const char *mime) {
+    (void)cli; (void)res; (void)serial; (void)mime;
+}
+static void _offer_set_actions(struct wl_client *cli,
+                               struct wl_resource *res, uint32_t dnd,
+                               uint32_t ask) {
+    (void)cli; (void)res; (void)dnd; (void)ask;
+}
+static const struct wl_data_offer_interface _offer_impl = {
+    .accept = _offer_accept,
+    .receive = _offer_receive,
+    .destroy = _offer_destroy,
+    .finish = _offer_finish,
+    .set_actions = _offer_set_actions,
+};
+
+static void _send_selection(_wl_state_t *st, struct wl_resource *dev_res) {
+    if (!st->selection || st->selection->dead) {
+        wl_data_device_send_selection(dev_res, NULL);
+        return;
+    }
+    struct wl_resource *offer = wl_resource_create(
+        wl_resource_get_client(dev_res), &wl_data_offer_interface,
+        wl_resource_get_version(dev_res), 0);
+    if (!offer) return;
+    wl_resource_set_implementation(offer, &_offer_impl, NULL, NULL);
+    for (size_t i = 0; i < st->selection->mimes.size; i++) {
+        const char *m = *(const char *const *)
+            vt_vec_at(&st->selection->mimes, i);
+        wl_data_device_send_data_offer(dev_res, offer);
+        wl_data_offer_send_offer(offer, m);
+    }
+    wl_data_device_send_selection(dev_res, offer);
+}
+
+static void _broadcast_selection(_wl_state_t *st) {
+    if (!st || !st->kbd_focus || !st->kbd_focus->res) return;
+    _data_dev_t *d;
+    wl_list_for_each(d, &st->data_devs, link) {
+        if (d->cli == wl_resource_get_client(st->kbd_focus->res))
+            _send_selection(st, d->res);
+    }
+}
+
+static void _src_offer(struct wl_client *cli, struct wl_resource *res,
+                       const char *mime) {
+    (void)cli;
+    _data_src_t *s = wl_resource_get_user_data(res);
+    if (!s) return;
+    char *m = vt_strdup(mime ? mime : "");
+    vt_vec_push(&s->mimes, &m);
+}
+static void _src_destroy(struct wl_client *cli, struct wl_resource *res) {
+    (void)cli;
+    _data_src_t *s = wl_resource_get_user_data(res);
+    if (s) s->dead = true;
+    wl_resource_destroy(res);
+}
+static void _src_set_actions(struct wl_client *cli, struct wl_resource *res,
+                             uint32_t dnd) {
+    (void)cli; (void)res; (void)dnd;
+}
+static const struct wl_data_source_interface _data_src_impl = {
+    .offer = _src_offer,
+    .destroy = _src_destroy,
+    .set_actions = _src_set_actions,
+};
+
+static void _src_res_destroy(struct wl_resource *res) {
+    _data_src_t *s = wl_resource_get_user_data(res);
+    if (!s) return;
+    if (_wls && _wls->selection == s) {
+        _wls->selection = NULL;
+        _broadcast_selection(_wls);     /* selection cleared */
+    }
+    for (size_t i = 0; i < s->mimes.size; i++) {
+        char **m = vt_vec_at(&s->mimes, i);
+        vt_free(*m);
+    }
+    vt_vec_fini(&s->mimes);
+    vt_free(s);
+}
+
+static void _dev_set_selection(struct wl_client *cli,
+                               struct wl_resource *res,
+                               struct wl_resource *src, uint32_t serial) {
+    (void)cli; (void)serial;
+    _wl_state_t *st = _wls;
+    if (!st) return;
+    _data_src_t *s = src ? wl_resource_get_user_data(src) : NULL;
+    if (s && s->dead) s = NULL;
+    if (st->selection && st->selection != s && !st->selection->dead)
+        wl_data_source_send_cancelled(st->selection->res);
+    st->selection = s;
+    _broadcast_selection(st);
+}
+static void _dev_start_drag(struct wl_client *cli, struct wl_resource *res,
+                            struct wl_resource *src, struct wl_resource *orig,
+                            struct wl_resource *icon, uint32_t serial) {
+    (void)cli; (void)res; (void)src; (void)orig; (void)icon; (void)serial;
+    /* drag-and-drop is not implemented; the request is accepted and
+     * ignored (clients fall back to selection semantics) */
+}
+static void _dev_release(struct wl_client *cli, struct wl_resource *res) {
+    (void)cli;
+    wl_resource_destroy(res);
+}
+static const struct wl_data_device_interface _data_dev_impl = {
+    .start_drag = _dev_start_drag,
+    .set_selection = _dev_set_selection,
+    .release = _dev_release,
+};
+
+static void _dev_res_destroy(struct wl_resource *res) {
+    _data_dev_t *d = wl_resource_get_user_data(res);
+    if (!d) return;
+    wl_list_remove(&d->link);
+    vt_free(d);
+}
+
+static void _ddm_get_data_device(struct wl_client *cli,
+                                 struct wl_resource *res, uint32_t id,
+                                 struct wl_resource *seat) {
+    (void)seat;
+    _wl_state_t *st = _wls;
+    if (!st) return;
+    _data_dev_t *d = vt_malloc0(sizeof(*d));
+    if (!d) { wl_client_post_no_memory(cli); return; }
+    d->cli = cli;
+    struct wl_resource *r = wl_resource_create(
+        cli, &wl_data_device_interface,
+        wl_resource_get_version(res), id);
+    if (!r) { vt_free(d); wl_client_post_no_memory(cli); return; }
+    wl_resource_set_implementation(r, &_data_dev_impl, d,
+                                   _dev_res_destroy);
+    d->res = r;
+    wl_list_insert(st->data_devs.prev, &d->link);
+    /* current selection (if any) goes to newly bound devices */
+    if (st->kbd_focus && st->kbd_focus->res &&
+        wl_resource_get_client(st->kbd_focus->res) == cli)
+        _send_selection(st, r);
+}
+
+static void _ddm_create_data_source(struct wl_client *cli,
+                                    struct wl_resource *res, uint32_t id) {
+    (void)res;
+    _data_src_t *s = vt_malloc0(sizeof(*s));
+    if (!s) { wl_client_post_no_memory(cli); return; }
+    s->cli = cli;
+    vt_vec_init(&s->mimes, sizeof(char *), 4);
+    struct wl_resource *r = wl_resource_create(
+        cli, &wl_data_source_interface, 1, id);
+    if (!r) {
+        vt_vec_fini(&s->mimes);
+        vt_free(s);
+        wl_client_post_no_memory(cli);
+        return;
+    }
+    wl_resource_set_implementation(r, &_data_src_impl, s,
+                                   _src_res_destroy);
+    s->res = r;
+}
+
+static const struct wl_data_device_manager_interface _ddm_impl = {
+    .create_data_source = _ddm_create_data_source,
+    .get_data_device = _ddm_get_data_device,
+};
+
+static void _bind_ddm(struct wl_client *cli, void *data,
+                      uint32_t version, uint32_t id) {
+    (void)data;
+    struct wl_resource *res = wl_resource_create(
+        cli, &wl_data_device_manager_interface,
+        version < 3 ? version : 3, id);
+    if (!res) { wl_client_post_no_memory(cli); return; }
+    wl_resource_set_implementation(res, &_ddm_impl, NULL, NULL);
 }
 
 /* ------------------------------------------------------------ xdg-shell */
@@ -992,6 +1342,15 @@ static void _cursor_default_arrow(_wl_state_t *st) {
 
 static void _cursor_init(_wl_state_t *st) {
     _cursor_default_arrow(st);
+    /* VANTAGE_WL_CURSOR=builtin forces the built-in 16x16 arrow —
+     * used by tests (exact pixel assertions) and as an override when a
+     * theme's cursors misbehave. */
+    const char *force = getenv("VANTAGE_WL_CURSOR");
+    if (force && vt_streq(force, "builtin")) {
+        vt_logi("wayland: cursor: built-in arrow forced "
+                "(VANTAGE_WL_CURSOR=builtin)");
+        return;
+    }
 #if defined(VT_HAVE_XCURSOR)
     const char *theme = getenv("XCURSOR_THEME");
     const char *szs = getenv("XCURSOR_SIZE");
@@ -1041,7 +1400,7 @@ static void _cursor_apply_hw(_wl_state_t *st) {
         return;
     }
     vt_kms_cursor_set(st->kms, st->cursor_img,
-                      st->cur_img_w, st->cur_img_h);
+                      st->cur_img_w, st->cur_img_h, 64);
 }
 
 /* ----------------------------------------------------- input: libinput */
@@ -1174,6 +1533,7 @@ static void _pointer_focus_update(_wl_state_t *st, bool force) {
             }
             if (s->toplevel)
                 _emit_win(st, VT_BACKEND_WL_EVENT_WIN_FOCUS, s->toplevel);
+            _broadcast_selection(st);
         }
     }
 }
@@ -1252,6 +1612,13 @@ static void _pointer_button(_wl_state_t *st, uint32_t button,
 }
 
 static void _pointer_axis(_wl_state_t *st, double value) {
+    /* panel (menus + volume wheel) consumes scroll events first */
+    if (st->panel &&
+        vt_wl_panel_axis(st->panel, st->cursor_x, st->cursor_y,
+                         value > 0 ? 1 : -1)) {
+        st->dirty = true;
+        return;
+    }
     _wl_surf_t *s = st->ptr_focus;
     if (s && s->res) {
         _ptr_res_t *pr;
@@ -1336,11 +1703,28 @@ static void _kbd_key(_wl_state_t *st, uint32_t key, bool pressed) {
         const xkb_keysym_t *syms;
         int ns = xkb_state_key_get_syms(st->xkb_st, key + 8, &syms);
         for (int i = 0; i < ns; i++) {
-            /* Escape closes any open panel menu first */
-            if (syms[i] == XKB_KEY_Escape && st->panel &&
-                vt_wl_panel_key(st->panel, "Escape")) {
-                st->dirty = true;
-                return;
+            /* open panel menus consume keys first: Escape closes,
+             * BackSpace edits the search, printable characters type
+             * into the search bar */
+            if (st->panel) {
+                const char *combo = NULL;
+                char cmb[96] = "";
+                if (syms[i] == XKB_KEY_Escape) combo = "Escape";
+                else if (syms[i] == XKB_KEY_BackSpace) combo = "BackSpace";
+                else if (!_combo_from_xkb(st, syms[i], cmb, sizeof(cmb)))
+                    combo = NULL;
+                /* try combo form first (Escape/BackSpace) */
+                if (combo && vt_wl_panel_key(st->panel, combo, 0)) {
+                    st->dirty = true;
+                    return;
+                }
+                /* printable → search text */
+                uint32_t cp = xkb_keysym_to_utf32(syms[i]);
+                if (!combo && cp > 0 &&
+                    vt_wl_panel_key(st->panel, NULL, cp)) {
+                    st->dirty = true;
+                    return;
+                }
             }
             char combo[96];
             if (_combo_from_xkb(st, syms[i], combo, sizeof(combo)) &&
@@ -1668,12 +2052,49 @@ static void _panel_cb_ws(int ws, void *ud) {
     vt_logi("wayland: workspace -> %d", ws + 1);
 }
 
-static void _panel_cb_logout(void *ud) {
+static void _panel_cb_logout(const char *action, void *ud) {
     _wl_state_t *st = ud;
     if (!st) return;
-    /* route through the WM shortcut table: Ctrl+Alt+Delete is the
-     * registered clean-logout combo (graceful unwind, exit 0) */
-    vt_logi("wayland: panel logout — clean unwind");
+    const char *act = action ? action : "";
+    /* Session-managed run: the session manager owns child supervision
+     * and the shutdown policy — ask IT to end the session. It will
+     * SIGTERM every child (including this compositor, whose unwind
+     * restores the CRTC and returns the VT to text) and then exit,
+     * leaving the user back on their original TTY. Exiting here
+     * WITHOUT telling the session would trigger the supervisor's
+     * restart loop and re-take the screen — the old "trapped
+     * session" bug.
+     * Standalone run (no session manager): local clean unwind. */
+    const char *rd = getenv("XDG_RUNTIME_DIR");
+    if (rd && *rd) {
+        char *path = vt_strprintf("%s/vantage-session.sock", rd);
+        vt_ipc_t *ipc = vt_ipc_new_client(path);
+        vt_free(path);
+        if (ipc) {
+            vt_ipc_msg_t resp = {0};
+            vt_ipc_call(ipc, VT_IPC_MSG_WM_LOGOUT, act, (uint32_t)strlen(act),
+                        &resp, 1500);
+            vt_ipc_msg_free(&resp);
+            vt_ipc_free(ipc);
+            vt_logi("wayland: panel logout (%s) — session manager is "
+                    "ending the session (supervised shutdown, no restart)",
+                    *act ? act : "logout");
+            return;
+        }
+    }
+    if (vt_streq(act, "reboot") || vt_streq(act, "shutdown")) {
+        /* no session manager — schedule the power action to run AFTER
+         * our own clean unwind (detached child in its own session
+         * survives the compositor exit) */
+        char *cmd = vt_strprintf(
+            "sleep 1 && (loginctl %s 2>/dev/null || systemctl %s "
+            "2>/dev/null)", act, act);
+        vt_proc_spawn_detached(cmd);
+        vt_free(cmd);
+        vt_logw("wayland: panel %s without a session manager — the "
+                "action runs right after the compositor exits", act);
+    }
+    vt_logi("wayland: panel logout — no session manager; clean unwind");
     _hotkey_try(st->backend_self, "Ctrl+Alt+Delete");
 }
 
@@ -1692,9 +2113,12 @@ static void _panel_sync_windows(_wl_state_t *st) {
     vt_wl_panel_set_windows(st->panel, wins, n);
 }
 
-/* alpha-blend an ARGB sprite over the XRGB framebuffer */
+/* alpha-blend an ARGB sprite over the XRGB framebuffer.
+ * stride is in uint32 units and may exceed sw (cursor_img is a
+ * 64x64 cell with the image in the top-left corner; client cursor
+ * surfaces follow the client's own row padding). */
 static void _blend_sprite(_wl_state_t *st, const uint32_t *sprite,
-                          int sw, int sh, int hx, int hy) {
+                          int sstride, int sw, int sh, int hx, int hy) {
     int cx = st->cursor_x - hx;
     int cy = st->cursor_y - hy;
     for (int y = 0; y < sh; y++) {
@@ -1703,7 +2127,7 @@ static void _blend_sprite(_wl_state_t *st, const uint32_t *sprite,
         for (int x = 0; x < sw; x++) {
             int dx = cx + x;
             if (dx < 0 || dx >= st->out_w) continue;
-            uint32_t sp = sprite[y * sw + x];
+            uint32_t sp = sprite[y * sstride + x];
             uint32_t a = sp >> 24;
             if (a == 0) continue;
             uint32_t dp = st->fb[dy * st->out_w + dx];
@@ -1727,10 +2151,12 @@ static void _paint(void) {
     if (!st || !st->dirty) return;
     _paint_background(st);
     /* surfaces bottom→top (client windows; cursor surfaces skipped;
-     * windows on other workspaces are hidden) */
+     * windows on other workspaces are hidden). Subsurfaces paint
+     * directly above their parent, at their relative position. */
     _wl_surf_t *s;
     wl_list_for_each(s, &st->surfaces, link) {
         if (!s->mapped || !s->pixels || s->is_cursor) continue;
+        if (s->parent) continue;            /* painted with the parent */
         if (s->toplevel && s->ws != st->ws_cur) continue;
         int x = s->x, y = s->y;
         for (int sy = 0; sy < s->h; sy++) {
@@ -1739,7 +2165,24 @@ static void _paint(void) {
             for (int sx = 0; sx < s->w; sx++) {
                 int dx = x + sx;
                 if (dx < 0 || dx >= st->out_w) continue;
-                st->fb[dy * st->out_w + dx] = s->pixels[sy * s->w + sx];
+                st->fb[dy * st->out_w + dx] =
+                    s->pixels[sy * s->stride + sx];
+            }
+        }
+        /* children above the parent */
+        _wl_surf_t *sub;
+        wl_list_for_each(sub, &s->subs, sub_link) {
+            if (!sub->mapped || !sub->pixels) continue;
+            int cx2 = x + sub->dx, cy2 = y + sub->dy;
+            for (int sy = 0; sy < sub->h; sy++) {
+                int dy = cy2 + sy;
+                if (dy < 0 || dy >= st->out_h) continue;
+                for (int sx = 0; sx < sub->w; sx++) {
+                    int dx = cx2 + sx;
+                    if (dx < 0 || dx >= st->out_w) continue;
+                    st->fb[dy * st->out_w + dx] =
+                        sub->pixels[sy * sub->stride + sx];
+                }
             }
         }
         /* fire frame callbacks */
@@ -1762,11 +2205,14 @@ static void _paint(void) {
      * GPU, including NVIDIA where drmModeSetCursor can silently fail. */
     if (st->cur_client_set && st->cursor_surf && st->cursor_surf->pixels) {
         _blend_sprite(st, st->cursor_surf->pixels,
+                      st->cursor_surf->stride ? st->cursor_surf->stride
+                                              : st->cursor_surf->w,
                       st->cursor_surf->w, st->cursor_surf->h,
                       st->cursor_surf->hotspot_x,
                       st->cursor_surf->hotspot_y);
     } else {
-        _blend_sprite(st, st->cursor_img, st->cur_img_w, st->cur_img_h,
+        _blend_sprite(st, st->cursor_img, 64,
+                      st->cur_img_w, st->cur_img_h,
                       st->cur_img_hx, st->cur_img_hy);
     }
     st->dirty = false;
@@ -1876,6 +2322,7 @@ static int _wl_init(vt_backend_t *self) {
     wl_list_init(&st->surfaces);
     wl_list_init(&st->ptr_reses);
     wl_list_init(&st->kbd_reses);
+    wl_list_init(&st->data_devs);
 
     /* ---- stage 1/15: session (XDG_RUNTIME_DIR) -------------------- */
     _stage_begin(0, "XDG_RUNTIME_DIR preparation");
@@ -2099,6 +2546,15 @@ static int _wl_init(vt_backend_t *self) {
                                     NULL, _bind_output);
     st->xdg_g = wl_global_create(st->display, &xdg_wm_base_interface, 2,
                                  NULL, _bind_xdg_wm_base);
+    st->subcomp_g = wl_global_create(st->display,
+                                     &wl_subcompositor_interface, 1, NULL,
+                                     _bind_subcompositor);
+    st->ddm_g = wl_global_create(st->display,
+                                 &wl_data_device_manager_interface, 3, NULL,
+                                 _bind_ddm);
+    if (!st->subcomp_g || !st->ddm_g)
+        vt_logw("wayland: wl_subcompositor/wl_data_device_manager "
+                "global creation failed");
     if (!st->compositor_g || !st->seat_g || !st->output_g || !st->xdg_g) {
         _stage_fail(12, "failed to create globals");
         goto fail_no_kms;
@@ -2276,11 +2732,47 @@ static int _wl_output_apply(vt_backend_t *self, size_t i,
     o->scale = cfg->scale;
     return 0;
 }
+/* ---- headless test-input hook -----------------------------------
+ * Exercises the REAL input pipeline (the exact handlers libinput
+ * feeds) so integration harnesses can drive the pointer without any
+ * input device. Nothing is faked: motion/press/release/axis run the
+ * same compositor code as hardware events. */
+static int _wl_test_input(vt_backend_t *self, const char *spec) {
+    _wl_state_t *st = (self && self->priv && self->priv == (void *)_wls)
+                      ? _wls : NULL;
+    if (!st || !spec) return -1;
+    int x, y, b, d;
+    if (sscanf(spec, "motion x=%d y=%d", &x, &y) == 2) {
+        _pointer_motion(st, (double)(x - st->cursor_x),
+                        (double)(y - st->cursor_y));
+        return 0;
+    }
+    if (sscanf(spec, "press b=%d", &b) == 1 && b >= 1 && b <= 3) {
+        _pointer_button(st, b == 2 ? 0x111 : b == 3 ? 0x112 : 0x110,
+                        true);
+        return 0;
+    }
+    if (sscanf(spec, "release b=%d", &b) == 1 && b >= 1 && b <= 3) {
+        _pointer_button(st, b == 2 ? 0x111 : b == 3 ? 0x112 : 0x110,
+                        false);
+        return 0;
+    }
+    if (sscanf(spec, "axis d=%d", &d) == 1 && d != 0) {
+        _pointer_axis(st, (double)(d * 15));
+        return 0;
+    }
+    vt_logw("wayland: test-input: unrecognized spec '%s'", spec);
+    return -1;
+}
+
 static bool _wl_supports_compositing(vt_backend_t *self) { (void)self; return true; }
 static bool _wl_can_swap_buffers(vt_backend_t *self) { (void)self; return true; }
 
 vt_backend_t *_vt_backend_wayland_new(void) {
     vt_backend_t *b = vt_malloc0(sizeof(*b));
+    /* Launched applications are children of the compositor; auto-reap
+     * them so long sessions never accumulate zombies. */
+    signal(SIGCHLD, SIG_IGN);
     b->kind = VT_BACKEND_WAYLAND;
     b->init = _wl_init;
     b->fini = _wl_fini;
@@ -2292,6 +2784,7 @@ vt_backend_t *_vt_backend_wayland_new(void) {
     b->supports_compositing = _wl_supports_compositing;
     b->can_swap_buffers = _wl_can_swap_buffers;
     b->close_window = _wl_close_window;
+    b->test_input = _wl_test_input;
     b->set_user_data = _wl_set_user_data;
     b->get_user_data = _wl_get_user_data;
     vt_vec_init(&b->outputs, sizeof(vt_output_t), 2);

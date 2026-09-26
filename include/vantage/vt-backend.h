@@ -106,6 +106,12 @@ typedef struct vt_backend {
      * Returns true when the combo was consumed (do not forward the key
      * to the focused client). */
     bool     (*hotkey)(struct vt_backend *self, const char *combo);
+    /* Optional test hook (Wayland backend): inject pointer events
+     * through the REAL input pipeline for headless integration tests.
+     * spec: "motion x=<n> y=<n>" | "press b=<1..3>" |
+     *       "release b=<1..3>" | "axis d=<-n|+n>".
+     * Returns 0 when the event was delivered. */
+    int      (*test_input)(struct vt_backend *self, const char *spec);
 } vt_backend_t;
 
 /* Native event sink: receives backend-native events (XEvent* on X11,

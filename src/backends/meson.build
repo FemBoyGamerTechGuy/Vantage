@@ -1,7 +1,8 @@
 src_backends = ['vt-backend.c', 'vt-backend-x11.c', 'vt-backend-wayland.c',
                 'vt-seat.c', 'vt-kms.c', 'vt-wl-panel.c']
 
-backend_deps = [vantage_core_dep]
+backend_deps = [vantage_core_dep, vantage_ipc_dep,
+                vantage_integrations_dep, vantage_wallpaper_dep]
 backend_cargs = []
 
 if dep_x11.found()

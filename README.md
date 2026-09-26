@@ -41,18 +41,31 @@ New features, minimal overhead.
   fullscreen window covers the desktop, plus PNG/JPEG still wallpapers
   loaded directly through libpng/libjpeg (no gdk-pixbuf).
 - **A real panel**: dock window with struts, XRender/Xft drawing, live
-  tasklist, workspace switcher (rounded, glowing active button), XDG
-  application launcher menu with the standard categories and a Quit
-  Session entry, calendar popup, ALSA volume slider, network and
-  battery applets, and a username/session menu (Lock, Suspend, Switch
-  User, Log Out, Reboot, Shutdown, Exit) — all on real system
-  mechanisms (logind/elogind, ACPI).
+  tasklist with per-window `_NET_WM_ICON` icons, workspace switcher
+  (rounded, glowing active button that follows the real WM state), a
+  **Programs menu** built from the shared `.desktop` database (search
+  bar, scrolling, icon-theme icons, locale-aware names — Russian and
+  other non-English entries render correctly via per-codepoint font
+  fallback), calendar popup, ALSA volume slider (real mixer values),
+  a functional network indicator, and a username/session menu (Lock,
+  Suspend, Switch User, Log Out, Reboot, Shutdown, Exit) — all on real
+  system mechanisms (logind/elogind, ACPI).
 - **A compositor-drawn panel on native Wayland** (no XWayland, no
-  placeholder blocks): Vantage start button with a categorized
-  .desktop application menu that actually launches apps, xdg window
-  list, workspace buttons, clock + calendar, and the full session
-  menu — rendered with FreeType text directly into the scanout
-  framebuffer.
+  placeholder blocks): Programs button with the SAME shared application
+  database and menu features (search, scrolling, icons, categories),
+  xdg window list, workspace buttons, network + volume (ALSA) controls,
+  clock + calendar, and the full session menu — rendered with FreeType
+  text directly into the scanout framebuffer.
+- **Real Wayland clients work**: xdg-shell toplevels and popups,
+  wl_subcompositor subsurfaces and an in-session clipboard
+  (wl_data_device_manager) — applications launched from the menu
+  inherit the compositor's `WAYLAND_DISPLAY` and actually appear;
+  launched children are reaped, never zombified.
+- **Logout that always returns you to the TTY**: the panel routes
+  session actions through the session manager (SIGTERM + grace, no
+  SIGKILL), and the supervisor never restarts a compositor that exited
+  cleanly — a Wayland logout ends the session instead of re-taking
+  the screen.
 - **Recovery without reboots**: on Wayland the compositor implements
   Ctrl+Alt+F1..F12 VT switching itself (evdev owns the keyboard, so
   the kernel combos never fire) plus Ctrl+Alt+Delete clean logout;
@@ -170,9 +183,10 @@ vantage-remote watch          # stream window events
 
 ## License
 
-Vantage is proprietary, source-available software. See [LICENSE](LICENSE)
-for the full terms (restricted copying, redistribution, modification and
-publication; no sublicensing; trademark protection).
+Vantage is proprietary, source-available software, copyright
+FemBoyGamerTechGuy. See [LICENSE](LICENSE) for the full terms (restricted
+copying, redistribution, modification and publication; no sublicensing;
+trademark protection).
 
 ## Status
 

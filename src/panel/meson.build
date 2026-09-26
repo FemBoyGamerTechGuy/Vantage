@@ -1,6 +1,7 @@
 src_panel = ['vt-panel.c', 'vt-panel-applets.c', 'vt-launcher-applet.c']
 panel_deps = [vantage_core_dep, vantage_renderer_dep, vantage_ipc_dep,
-              vantage_config_dep, vantage_integrations_dep]
+              vantage_config_dep, vantage_integrations_dep,
+              vantage_wallpaper_dep]
 panel_cargs = []
 
 if dep_x11.found() and dep_xft.found() and dep_xrender.found()

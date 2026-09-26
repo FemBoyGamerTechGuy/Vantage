@@ -888,14 +888,16 @@ void vt_kms_handle_events(vt_kms_t *k) {
 
 /* ------------------------------------------------------------ cursor api */
 
-bool vt_kms_cursor_set(vt_kms_t *k, const uint32_t *argb, int w, int h) {
+bool vt_kms_cursor_set(vt_kms_t *k, const uint32_t *argb, int w, int h,
+                       int stride_px) {
 #if defined(VT_HAVE_LIBDRM)
     if (!k || !k->hw_cursor || !k->cur_map || !argb) return false;
     if (w > k->cur_w || h > k->cur_h || w <= 0 || h <= 0) return false;
+    if (stride_px < w) stride_px = w;
     memset(k->cur_map, 0, (size_t)k->cur_size);
     for (int y = 0; y < h; y++)
         memcpy((uint8_t *)k->cur_map + (size_t)y * k->cur_stride,
-               argb + (size_t)y * w, (size_t)w * 4);
+               argb + (size_t)y * stride_px, (size_t)w * 4);
     for (int i = 0; i < k->n_out; i++) {
         if (drmModeSetCursor(k->fd, k->outs[i].crtc_id, k->cur_handle,
                              (uint32_t)k->cur_w, (uint32_t)k->cur_h) < 0) {
@@ -908,7 +910,7 @@ bool vt_kms_cursor_set(vt_kms_t *k, const uint32_t *argb, int w, int h) {
     k->cursor_on = true;
     return true;
 #else
-    (void)k; (void)argb; (void)w; (void)h;
+    (void)k; (void)argb; (void)w; (void)h; (void)stride_px;
     return false;
 #endif
 }

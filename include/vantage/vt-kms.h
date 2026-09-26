@@ -98,7 +98,8 @@ void vt_kms_prime(vt_kms_t *k, const uint32_t *pixels, int w, int h);
 void vt_kms_handle_events(vt_kms_t *k);
 
 /* hardware cursor plane (when available) */
-bool vt_kms_cursor_set(vt_kms_t *k, const uint32_t *argb, int w, int h);
+bool vt_kms_cursor_set(vt_kms_t *k, const uint32_t *argb, int w, int h,
+                       int stride_px);
 void vt_kms_cursor_move(vt_kms_t *k, int x, int y);
 void vt_kms_cursor_hide(vt_kms_t *k);
 

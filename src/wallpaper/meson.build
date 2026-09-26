@@ -1,4 +1,4 @@
-src_wallpaper = ['vt-wallpaper.c', 'vt-image.c']
+src_wallpaper = ['vt-wallpaper.c', 'vt-image.c', 'vt-icons.c']
 
 wallpaper_deps = [vantage_core_dep, vantage_renderer_dep]
 wallpaper_cargs = []

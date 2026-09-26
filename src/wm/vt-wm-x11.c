@@ -423,6 +423,74 @@ static void _frame_geom(const _client_t *c, int *fx, int *fy, int *fw,
 }
 
 #if defined(VT_HAVE_XFT)
+/* ---- per-codepoint title font fallback ---------------------------
+ * Same idea as the panel's: when the title face lacks a glyph (Russian
+ * window titles are the common case), lazily open a fontconfig match
+ * that covers the codepoint and draw that run with it. */
+static int _wm_utf8_cp(const char *s, FcChar32 *out) {
+    const unsigned char *u = (const unsigned char *)s;
+    if ((u[0] & 0x80) == 0) { *out = u[0]; return 1; }
+    if ((u[0] & 0xe0) == 0xc0 && (u[1] & 0xc0) == 0x80) {
+        *out = ((FcChar32)(u[0] & 0x1f) << 6) | (u[1] & 0x3f);
+        return 2;
+    }
+    if ((u[0] & 0xf0) == 0xe0 && (u[1] & 0xc0) == 0x80 &&
+        (u[2] & 0xc0) == 0x80) {
+        *out = ((FcChar32)(u[0] & 0x0f) << 12) |
+               ((FcChar32)(u[1] & 0x3f) << 6) | (u[2] & 0x3f);
+        return 3;
+    }
+    if ((u[0] & 0xf8) == 0xf0 && (u[1] & 0xc0) == 0x80 &&
+        (u[2] & 0xc0) == 0x80 && (u[3] & 0xc0) == 0x80) {
+        *out = ((FcChar32)(u[0] & 0x07) << 18) |
+               ((FcChar32)(u[1] & 0x3f) << 12) |
+               ((FcChar32)(u[2] & 0x3f) << 6) | (u[3] & 0x3f);
+        return 4;
+    }
+    *out = u[0];
+    return 1;
+}
+
+static XftFont *_wm_font_for_cp(vt_wm_x11_t *e, FcChar32 cp) {
+    if (XftCharExists(e->dpy, e->tfont, cp)) return e->tfont;
+    /* small fixed cache of fallback faces */
+    static XftFont *fb[4];
+    static FcChar32 fb_cp[4];
+    static int n_fb;
+    for (int i = 0; i < n_fb; i++)
+        if (fb_cp[i] == cp) return fb[i] ? fb[i] : e->tfont;
+    FcPattern *pat = FcNameParse((const FcChar8 *)"sans:bold");
+    if (!pat) return e->tfont;
+    FcCharSet *cs = FcCharSetCreate();
+    FcCharSetAddChar(cs, cp);
+    FcPatternAddCharSet(pat, FC_CHARSET, cs);
+    FcConfigSubstitute(NULL, pat, FcMatchPattern);
+    FcDefaultSubstitute(pat);
+    FcResult res = FcResultNoMatch;
+    FcPattern *mat = FcFontMatch(NULL, pat, &res);
+    XftFont *f = NULL;
+    if (mat) {
+        f = XftFontOpenPattern(e->dpy, mat);
+        if (f && !XftCharExists(e->dpy, f, cp)) {
+            XftFontClose(e->dpy, f);
+            f = NULL;
+        } else if (!f) {
+            FcPatternDestroy(mat);
+        }
+    }
+    FcPatternDestroy(pat);
+    FcCharSetDestroy(cs);
+    if (n_fb < 4) {
+        fb[n_fb] = f;
+        fb_cp[n_fb] = cp;
+        n_fb++;
+        return f ? f : e->tfont;
+    }
+    /* cache full: do not leak a per-call face */
+    if (f) XftFontClose(e->dpy, f);
+    return e->tfont;
+}
+
 static void _fill(Display *dpy, XRenderPictFormat *fmt, Drawable d, int x,
                   int y, int w, int h, unsigned long argb) {
     Picture pic = XRenderCreatePicture(dpy, d, fmt, 0, NULL);
@@ -541,10 +609,35 @@ static void _frame_paint(vt_wm_x11_t *e, _client_t *c) {
             }
         }
         
-        XftDrawStringUtf8(d, &c8, e->tfont, 8,
-                          _FR_BORDER + (c->fr_title + _FR_BORDER + 8) / 2 -
-                          e->tfont->height / 2 + e->tfont->ascent - 2,
-                          (const FcChar8 *)shown, (int)strlen(shown));
+        /* per-codepoint font fallback so titles in any script render
+         * (a single sans face lacks Cyrillic/CJK on many systems) */
+        {
+            int tx = 8;
+            int ty = _FR_BORDER + (c->fr_title + _FR_BORDER + 8) / 2 -
+                     e->tfont->height / 2 + e->tfont->ascent - 2;
+            const char *pp = shown;
+            while (*pp) {
+                FcChar32 cp;
+                int n = _wm_utf8_cp(pp, &cp);
+                XftFont *rf = _wm_font_for_cp(e, cp);
+                const char *run = pp;
+                int runlen = n;
+                pp += n;
+                while (*pp) {
+                    FcChar32 cp2;
+                    int n2 = _wm_utf8_cp(pp, &cp2);
+                    if (_wm_font_for_cp(e, cp2) != rf) break;
+                    runlen += n2;
+                    pp += n2;
+                }
+                XftDrawStringUtf8(d, &c8, rf, tx, ty,
+                                  (const FcChar8 *)run, runlen);
+                XGlyphInfo gi2;
+                XftTextExtentsUtf8(dpy, rf, (const FcChar8 *)run, runlen,
+                                   &gi2);
+                tx += gi2.xOff;
+            }
+        }
         XftColorFree(dpy, DefaultVisual(dpy, DefaultScreen(dpy)),
                      DefaultColormap(dpy, DefaultScreen(dpy)), &c8);
         XftDrawDestroy(d);
@@ -800,6 +893,10 @@ static void _focus_top_on_desktop(vt_wm_x11_t *e) {
 }
 
 /* ----------------------------------------------------------- workarea */
+static void _apply_configure(vt_wm_x11_t *e, _client_t *c, int x, int y,
+                             int w, int h);
+static void _push_model(vt_wm_x11_t *e, _client_t *c);
+
 static void _update_workarea(vt_wm_x11_t *e) {
     const vt_x11_atoms_t *a = vt_x11_atoms();
     Atom strut = XInternAtom(e->dpy, "_NET_WM_STRUT", False);
@@ -835,8 +932,32 @@ static void _update_workarea(vt_wm_x11_t *e) {
     }
     if (wa.w < 50) wa.w = 50;
     if (wa.h < 50) wa.h = 50;
+    _rect_t old = e->workarea;
     e->workarea = wa;
     _update_desktop_props(e);
+    /* Workarea changed (a panel just docked, or the strut arrived
+     * late): nudge fully-visible windows that now violate the new
+     * workarea back inside it — the classic "window too high, title
+     * bar hidden behind the panel" case at session start. Windows the
+     * user placed are only shifted as far as needed, never resized. */
+    if (old.w == 0 && old.h == 0) return;              /* first pass */
+    int dy = wa.y - old.y;
+    for (size_t i = 0; i < e->clients.size; i++) {
+        _client_t *c = *(_client_t **)vt_vec_at(&e->clients, i);
+        if (!c || c->is_dock || c->is_desktop) continue;
+        if (c->model.maximized || c->model.fullscreen) continue;
+        int ny = c->model.y;
+        if (dy > 0 && c->model.y < wa.y)
+            ny = wa.y;                                  /* below a top panel */
+        else if (dy < 0 && c->model.y >= old.y)
+            ny = c->model.y + dy;                       /* panel removed */
+        if (ny != c->model.y) {
+            c->model.y = ny;
+            _apply_configure(e, c, c->model.x, c->model.y,
+                             c->model.w, c->model.h);
+            _push_model(e, c);
+        }
+    }
 }
 
 static _rect_t _output_for_window(vt_wm_x11_t *e, _client_t *c) {

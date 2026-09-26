@@ -185,27 +185,64 @@ fail — the sprite covers that case). The image comes from Xcursor
 pointer is never invisible. Clients can replace it per-surface via
 `wl_pointer.set_cursor` (rendered as the software sprite).
 
+Cursor images are copied with their REAL row stride (client surfaces
+follow the client's own padding; the built-in/Xcursor image lives in a
+64-px-stride cell). A historic bug read these buffers as tightly packed,
+which sheared the arrow into ~8 diagonal dots — the exact corruption
+seen on real hardware. The headless harness now asserts the exact
+built-in arrow bitmap (73 black + 75 white pixels at the sprite
+position), so that class of bug cannot return silently.
+`VANTAGE_WL_CURSOR=builtin` forces the built-in arrow (tests, and a
+manual override when a theme misbehaves).
+
 ## The compositor panel
 
 The native Wayland session draws a REAL panel with the compositor itself
 (vt-wl-panel.c) — not XWayland, not X11 clients, and not placeholder
 blocks:
 
-* LEFT: Vantage start button → categorized application menu built from
-  XDG `.desktop` entries (Accessories, Development, Education, Games,
-  Graphics, Internet, Multimedia, Office, System, Utilities, Other) with
-  a Quit Session entry; window list of xdg toplevels (click to focus,
-  right-click to close)
-* RIGHT: workspace buttons (with glow on the active one), clock with a
-  calendar popup (previous/next month), username menu with Lock Screen /
-  Suspend / Switch User / Log Out / Reboot / Shutdown / Exit Session
+* LEFT: **Programs** button → categorized application menu built from
+  XDG `.desktop` entries via the SHARED vt-apps database (identical
+  parser, locale handling and category table as the X11 panel — there
+  is no second app list) with a **search bar** (type to filter by name
+  and keywords, BackSpace edits, Escape closes), **scrolling** (wheel
+  over the list, scrollbar indicator), **icon-theme icons** (the user's
+  configured theme via vt-icons) and a Quit Session entry; window list
+  of xdg toplevels (click to focus, right-click to close)
+* RIGHT: workspace buttons (with glow on the active one), network
+  indicator (real `/sys/class/net` state, wired + wireless quality),
+  volume (native ALSA mixer — real values, wheel adjusts, popup slider),
+  clock with a calendar popup (previous/next month), username menu with
+  Lock Screen / Suspend / Switch User / Log Out / Reboot / Shutdown /
+  Exit Session
 
-Text is rasterized with FreeType + fontconfig; a built-in bitmap font is
-the fallback so labels never disappear. Applications actually launch
-(`sh -c` exec from the .desktop `Exec=` line). Session actions use the
-real mechanisms — `loginctl` (logind/elogind) where available, direct
-power ioctls as the fallback — and failures are reported honestly in
-the menu status line.
+Text is rasterized with FreeType + fontconfig **with per-codepoint font
+fallback** (a second face is matched lazily when the primary sans lacks
+a glyph — Cyrillic/CJK app names render correctly); a built-in bitmap
+font is the fallback so labels never disappear.
+
+Applications actually launch: the `Exec=` line is cleaned of field codes
+(`%f %u …`), `Terminal=true` entries are wrapped in a real terminal
+emulator, and children inherit `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR` from
+the compositor (it exported them when it created the socket). Launched
+children are auto-reaped (`SIGCHLD: SIG_IGN`) — no zombies.
+
+Session actions route through the SESSION MANAGER when one is running:
+"Log Out"/"Exit Session"/"Reboot"/"Shutdown" send the session IPC
+message, the supervisor then SIGTERMs every child (the compositor's
+unwind restores the CRTC and returns the VT to text mode) and the
+session exits — **it never restarts the compositor on a clean logout**
+(see "Logout that actually returns to the TTY" below). Lock/Suspend
+spawn `loginctl` detached — the compositor event loop never blocks on
+`system()`. Failures are reported honestly in the menu status line.
+
+Real-client protocol surface: `wl_compositor`, `wl_shm`, `wl_seat`
+(pointer + keyboard, xkb keymaps), `wl_output`, `xdg_wm_base`
+(toplevels with move/resize/maximize/fullscreen, popups),
+**`wl_subcompositor`/`wl_subsurface`** (GTK/Qt overlays paint relative
+to their parent) and **`wl_data_device_manager`** (in-session clipboard:
+selection tracking, per-client offers, `data_offer.receive` pipe
+through to the source).
 
 ## Input requirements (no session manager)
 
@@ -221,6 +258,24 @@ sudo usermod -aG input $USER   # then log out and back in
 Without it the compositor logs a loud diagnostic
 (`wayland: input: NO usable input devices …`) and keyboard/pointer will
 not work — that is a permission problem, not a Vantage bug.
+
+## Logout that actually returns to the TTY
+
+Two independent mechanisms guarantee "Log Out" leaves the Wayland
+session instead of re-taking the screen:
+
+1. The panel routes logout through the session manager's IPC socket
+   (`$XDG_RUNTIME_DIR/vantage-session.sock`): the supervisor enters
+   SHUTDOWN, SIGTERMs every child, and exits. The compositor's own
+   unwind restores the saved CRTC and returns the VT to text mode.
+2. The supervisor treats a CRITICAL component exiting CLEANLY (status
+   0 — exactly what the compositor's logout unwind does) as an
+   intentional logout and ends the session instead of restarting it.
+   Crashes (signal / nonzero status) still restart for self-healing,
+   bounded at 8 attempts.
+
+`vantage-remote logout` takes the same IPC path (session socket first,
+compositor fallback for standalone runs).
 
 ## Escape hatches / recovery
 

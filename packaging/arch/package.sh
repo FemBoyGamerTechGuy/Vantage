@@ -96,6 +96,7 @@ declare -A SONAME_MAP=(
     [libXdamage.so]=libxdamage [libXfixes.so]=libxfixes
     [libXinerama.so]=libxinerama
     [libXcursor.so]=libxcursor [libXext.so]=libxext    [libXft.so]=libxft
+    [libXtst.so]=libxtst
     [libXau.so]=libxau         [libXdmcp.so]=libxdmcp
     # Wayland
     [libwayland-client.so]=wayland [libwayland-server.so]=wayland

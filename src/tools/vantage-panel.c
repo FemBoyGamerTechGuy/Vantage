@@ -46,7 +46,11 @@ int main(int argc, char **argv) {
      * battery/network/tray remain available via the config. */
     vt_panel_add_applet(panel, VT_PANEL_APPLET_LAUNCHER);
     vt_panel_add_applet(panel, VT_PANEL_APPLET_TASKLIST);
+    /* right cluster (reverse-pinned): workspaces | network | volume |
+     * clock | username — workspaces sit next to the clock, the network
+     * indicator is real sysfs state, volume is native ALSA */
     vt_panel_add_applet(panel, VT_PANEL_APPLET_WORKSPACES);
+    vt_panel_add_applet(panel, VT_PANEL_APPLET_NETWORK);
     vt_panel_add_applet(panel, VT_PANEL_APPLET_VOLUME);
     vt_panel_add_applet(panel, VT_PANEL_APPLET_CLOCK);
     vt_panel_add_applet(panel, VT_PANEL_APPLET_USER);

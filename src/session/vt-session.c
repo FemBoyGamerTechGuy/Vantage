@@ -6,6 +6,13 @@
  * Owns startup, autostart, environment setup, shutdown, restart, and
  * power hooks (suspend / hibernate). Hooks are user callbacks called
  * at well-defined stages so the WM, panel, etc. can clean up.
+ *
+ * Supervision policy: a critical component that CRASHES (signal,
+ * nonzero status) is restarted for self-healing; a critical component
+ * that exits CLEANLY (status 0 — the WM logout unwind) is an
+ * intentional logout: the session ends instead of re-taking the
+ * screen. This is what guarantees "Log Out" always returns to the
+ * original TTY and never requires a physical reboot.
  */
 
 #define VT_LOG_DOMAIN "session"
@@ -14,6 +21,9 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/reboot.h>
+#include <linux/reboot.h>
+#include <fcntl.h>
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
@@ -38,6 +48,7 @@ typedef struct {
     pid_t    pgid;         /* process group id (== first spawn pid) */
     bool     critical;
     bool     cmd_missing;
+    bool     intentional_stop;  /* clean exit — never restart */
     int      restarts;
     uint64_t last_start_ms;
     uint64_t restart_delay_ms;
@@ -233,21 +244,50 @@ void vt_session_set_power_handler(vt_session_t *s, vt_session_power_cb_t cb, voi
 }
 
 static int _default_power(vt_session_t *s, vt_session_end_t op) {
-    /* Try /proc/sys/kernel sysrq-style reboot, or via init.
-     * Real implementation uses power integration (see vt-power.c). */
+    /* User-session power path: loginctl works on systemd AND elogind
+     * and needs no root; fall back to systemctl, then the legacy
+     * commands, then direct syscalls. */
     (void)s;
     switch (op) {
     case VT_SESSION_END_LOGOUT:
         /* Session will exit normally — caller handles. */
         return 0;
     case VT_SESSION_END_SHUTDOWN:
-        return system("shutdown -h now");
+        if (system("loginctl poweroff 2>/dev/null") == 0) return 0;
+        if (system("systemctl poweroff 2>/dev/null") == 0) return 0;
+        if (system("shutdown -h now 2>/dev/null") == 0) return 0;
+        sync();
+        return reboot(LINUX_REBOOT_CMD_POWER_OFF);
     case VT_SESSION_END_REBOOT:
-        return system("shutdown -r now");
+        if (system("loginctl reboot 2>/dev/null") == 0) return 0;
+        if (system("systemctl reboot 2>/dev/null") == 0) return 0;
+        if (system("shutdown -r now 2>/dev/null") == 0) return 0;
+        sync();
+        return reboot(LINUX_REBOOT_CMD_RESTART);
     case VT_SESSION_END_SUSPEND:
-        return system("systemctl suspend 2>/dev/null || echo disk > /sys/power/state");
+        if (system("loginctl suspend 2>/dev/null") == 0) return 0;
+        if (system("systemctl suspend 2>/dev/null") == 0) return 0;
+        {
+            int fd = open("/sys/power/state", O_WRONLY);
+            if (fd >= 0) {
+                int r = write(fd, "mem", 3) == 3 ? 0 : -1;
+                close(fd);
+                return r;
+            }
+        }
+        return -1;
     case VT_SESSION_END_HIBERNATE:
-        return system("systemctl hibernate 2>/dev/null || echo disk > /sys/power/state");
+        if (system("loginctl hibernate 2>/dev/null") == 0) return 0;
+        if (system("systemctl hibernate 2>/dev/null") == 0) return 0;
+        {
+            int fd = open("/sys/power/state", O_WRONLY);
+            if (fd >= 0) {
+                int r = write(fd, "disk", 4) == 4 ? 0 : -1;
+                close(fd);
+                return r;
+            }
+        }
+        return -1;
     case VT_SESSION_END_RESTART:
         return 0;
     }
@@ -410,13 +450,29 @@ void vt_session_supervise(vt_session_t *s) {
             if (p->pid == dead) { m = p; break; }
         }
         if (!m) continue; /* autostart child — not managed */
-        if (WIFSIGNALED(status))
+        if (WIFSIGNALED(status)) {
             vt_logw("session: '%s' (pid %d) killed by signal %d",
                     m->name, dead, WTERMSIG(status));
-        else
+        } else {
             vt_logw("session: '%s' (pid %d) exited (status %d)", m->name,
                     dead, WEXITSTATUS(status));
-        if (WEXITSTATUS(status) == 127)
+            /* A CRITICAL component (the WM/compositor) exiting CLEANLY
+             * is an intentional logout — its shutdown path already
+             * restored the VT/CRTC. Restarting it would re-take the
+             * screen and trap the user inside the session; instead the
+             * session itself ends now. Crashes (signal / nonzero
+             * status) still restart for self-healing. */
+            if (m->critical && WEXITSTATUS(status) == 0) {
+                vt_logi("session: critical '%s' exited cleanly — "
+                        "intentional logout, ending the session "
+                        "(no restart)", m->name);
+                m->intentional_stop = true;
+                m->pid = -1;
+                vt_session_end(s, VT_SESSION_END_LOGOUT);
+                return;
+            }
+        }
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 127)
             m->cmd_missing = true;   /* exec failed — do not restart */
         m->pid = -1;
     }
@@ -426,6 +482,7 @@ void vt_session_supervise(vt_session_t *s) {
         _managed_t *m = vt_vec_at(v, i);
         if (m->pid > 0) continue;
         if (m->cmd_missing) continue;   /* command not found — give up */
+        if (m->intentional_stop) continue;  /* asked to stop — honor it */
         if (m->restarts >= 8 && m->critical) {
             vt_loge("session: critical component '%s' failed %d times — "
                     "ending session", m->name, m->restarts);

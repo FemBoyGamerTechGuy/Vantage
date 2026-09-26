@@ -56,6 +56,8 @@ static void _print_usage(FILE *f) {
         "  ws-move <id> <n>        move window to workspace (1-based)\n"
         "  launch <cmd...>         spawn command\n"
         "  logout                  end the session cleanly\n"
+        "  test-input <spec>       headless test hook (motion x=.. y=.. |\n"
+        "                          press b=.. | release b=.. | axis d=..)\n"
         "  reboot|shutdown|        power actions (session manager,\n"
         "  suspend|hibernate         logind-powered when available)\n"
         "  status                  session version/stage/children\n"
@@ -151,10 +153,31 @@ int main(int argc, char **argv) {
         vt_ipc_free(ipc);
         return 0;
     }
-    if (vt_streq(cmd, "launch") && argc >= 3) {
-        /* join remaining args into one command line */
+    if (vt_streq(cmd, "test-input") && argc >= 3) {
+        /* headless test hook — join remaining args as one spec */
         vt_strbuilder_t sb;
         vt_strbuilder_init(&sb, 256);
+        vt_strbuilder_append(&sb, "spec=");
+        for (int i = 2; i < argc; i++) {
+            if (i > 2) vt_strbuilder_append(&sb, " ");
+            vt_strbuilder_append(&sb, argv[i]);
+        }
+        char *payload = vt_strbuilder_finish(&sb, NULL);
+        vt_ipc_msg_t resp = {0};
+        int rc = _do_call(ipc, VT_IPC_MSG_WM_TEST_INPUT, payload, &resp);
+        vt_free(payload);
+        if (rc == 0 && resp.payload && resp.len)
+            printf("%.*s\n", (int)resp.len, (char *)resp.payload);
+        vt_ipc_msg_free(&resp);
+        vt_ipc_free(ipc);
+        return rc;
+    }
+    if (vt_streq(cmd, "launch") && argc >= 3) {
+        /* join remaining args into one command line (the WM handler
+         * parses key=value payloads: cmd=<line>) */
+        vt_strbuilder_t sb;
+        vt_strbuilder_init(&sb, 256);
+        vt_strbuilder_append(&sb, "cmd=");
         for (int i = 2; i < argc; i++) {
             if (i > 2) vt_strbuilder_append(&sb, " ");
             vt_strbuilder_append(&sb, argv[i]);

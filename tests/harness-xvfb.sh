@@ -281,6 +281,53 @@ distinct = len(set(pix[i:i+3] for i in range(0, min(len(pix), w*3*40), 3)))
 print(f"pixels: {w}x{h}, window1={hits1}px, window2={hits2}px, distinct-colors(top40rows)={distinct}")
 sys.exit(0 if (hits1 > 500 and hits2 > 500 and distinct >= 3) else 1)
 PYEOF
+
+echo "== harness-xvfb: Programs menu (shared app database) =="
+# deterministic application database — the panel process reads
+# XDG_DATA_HOME at .desktop scan time
+# click the Programs button (panel top-left, same geometry as the
+# Wayland panel), screenshot, verify the menu: search field + content
+"$(tc vt-x11-testclient)" --seconds 1 --click 63,17 \
+    --screenshot "$WORK/menu.ppm" > "$WORK/menu.log" 2>&1 &
+MPID=$!
+for i in $(seq 1 40); do
+  [ -s "$WORK/menu.ppm" ] && break
+  sleep 0.1
+done
+sleep 0.4
+if [ -s "$WORK/menu.ppm" ]; then
+  python3 - "$WORK/menu.ppm" <<'PYMENU'
+import sys
+p = sys.argv[1]
+with open(p, 'rb') as f:
+    data = f.read()
+vals, pos = [], data.find(b'P6') + 2
+while len(vals) < 3:
+    while data[pos:pos+1].isspace(): pos += 1
+    j = pos
+    while not data[j:j+1].isspace(): j += 1
+    vals.append(int(data[pos:j])); pos = j
+pos += 1
+w, h, _ = vals
+pix = data[pos:pos + w*h*3]
+# the menu popup sits below the 34px panel: search field background
+# 0x2a2e35 is opaque → exactly matchable
+band = pix[(38*w)*3 : (72*w)*3]
+search_bg = band.count(bytes((0x2a, 0x2e, 0x35)))
+menu_area = pix[(38*w)*3 : (250*w)*3]
+white = menu_area.count(bytes((255, 255, 255)))
+text = menu_area.count(bytes((0xec, 0xee, 0xf0)))
+print(f"menu: search-bg={search_bg} white={white} text={text}")
+# search field + rendered text = the REAL Programs menu
+sys.exit(0 if search_bg > 2000 and (white + text) > 40 else 1)
+PYMENU
+  [ $? -eq 0 ] && ok "Programs menu opened (search bar + text rendered)" \
+    || bad "Programs menu did not open/render"
+else
+  bad "no menu screenshot"
+fi
+kill $MPID 2>/dev/null; wait $MPID 2>/dev/null
+
 [ $? -eq 0 ] && ok "screenshot shows managed windows + painted desktop" \
   || bad "screenshot pixel check failed"
 

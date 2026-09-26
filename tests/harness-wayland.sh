@@ -41,6 +41,20 @@ vb() { if [ -n "$BIN" ]; then echo "$BIN/$1"; else echo "$1"; fi; }
 tc() { if [ -n "$TST" ]; then echo "$TST/$1"; else echo "$1"; fi; }
 [ -x "$(tc vt-wayland-testclient)" ] || { echo "vt-wayland-testclient not built"; exit 77; }
 
+# Wait for a COMPLETE frame dump: SIGUSR1 writes ~2.3MB; polling for
+# "non-empty" races the writer. Wait until the size is stable.
+wait_ppm() {
+  local last=-1 cur=0
+  for i in $(seq 1 40); do
+    [ -s /tmp/vantage-wayland.ppm ] || { sleep 0.05; continue; }
+    cur=$(stat -c %s /tmp/vantage-wayland.ppm 2>/dev/null || echo 0)
+    [ "$cur" = "$last" ] && [ "$cur" -gt 100 ] && return 0
+    last=$cur
+    sleep 0.05
+  done
+  return 1
+}
+
 WORK=$(mktemp -d /tmp/vantage-wl.XXXXXX)
 mkdir -p "$WORK/run"
 export XDG_RUNTIME_DIR="$WORK/run"
@@ -48,6 +62,37 @@ chmod 700 "$XDG_RUNTIME_DIR"
 
 # The Wayland backend refuses to nest: make sure neither variable is set
 unset DISPLAY WAYLAND_DISPLAY
+# Deterministic cursor: force the built-in 16x16 arrow so the sprite
+# pixel assertions below are exact on every machine (theme-independent)
+export VANTAGE_WL_CURSOR=builtin
+# deterministic application database for the launcher checks
+mkdir -p "$WORK/data/applications"
+# the launch probe lands in Accessories (the FIRST visible category in
+# the fixed table) and sorts alone there, so "app row 0" is exactly
+# this application on every machine — no dependence on what the host
+# has installed
+cat > "$WORK/data/applications/vt-harness-probe.desktop" <<'DESK'
+[Desktop Entry]
+Type=Application
+Name=Zz Harness Probe
+Exec=/bin/sh -c 'echo launched > $WORK/wl-launch-marker'
+Categories=Utility;
+DESK
+sed -i "s|\$WORK|$WORK|g" "$WORK/data/applications/vt-harness-probe.desktop"
+cat > "$WORK/data/applications/vt-harness-term.desktop" <<'DESK'
+[Desktop Entry]
+Type=Application
+Name=Zz Harness Terminal
+Exec=/bin/true
+Terminal=true
+Categories=System;
+DESK
+export XDG_DATA_HOME="$WORK/data"
+rm -f "$WORK/wl-launch-marker"
+
+# (XDG_DATA_HOME must be exported BEFORE the compositor starts: the
+# process environment is fixed at exec time, and the panel reads it
+# when it lazily loads the .desktop database at first menu open.)
 # Determinism + host safety: never acquire the host's real seat/VT/GPU
 # from a test. The backend then reports seat/vt/drm as "skipped —
 # forced headless", so the stage-marker trace below is IDENTICAL on a
@@ -79,6 +124,14 @@ else
   kill -TERM "$WM_PID" 2>/dev/null; exit 1
 fi
 export WAYLAND_DISPLAY="$SOCKET"
+
+# the desktop stage (panel + first frame) completes AFTER the socket
+# appears — wait for its marker (bounded) before asserting the trace
+for i in $(seq 1 50); do
+  grep -qF '[wayland] desktop: ready' "$WORK/wm.log" 2>/dev/null && break
+  kill -0 "$WM_PID" 2>/dev/null || break
+  sleep 0.1
+done
 
 # ----------------------------------------------------- stage markers
 # VANTAGE_WAYLAND_FORCE_HEADLESS=1 (exported above) makes the whole
@@ -154,10 +207,7 @@ fi
 echo "== harness-wayland: compositor frame-dump check =="
 # frame dump MUST happen while the client surface is still alive
 kill -USR1 "$WM_PID" 2>/dev/null
-for i in $(seq 1 20); do
-  [ -s /tmp/vantage-wayland.ppm ] && break
-  sleep 0.05
-done
+wait_ppm
 wait "$CLIENT_PID" 2>/dev/null
 if [ -s /tmp/vantage-wayland.ppm ]; then
   ok "SIGUSR1 frame dump written"
@@ -199,6 +249,151 @@ PYEOF
     || bad "frame dump check failed (pixels/panel/placeholders)"
 else
   bad "no frame dump at /tmp/vantage-wayland.ppm"
+fi
+
+
+# ------------------------------------------------- interactive UI checks
+# The test-input IPC hook drives the REAL input pipeline (the same
+# handlers libinput feeds), so the headless harness exercises the
+# actual panel: cursor sprite, Programs menu, search bar, category
+# selection, application LAUNCHING, and the volume indicator.
+echo "== harness-wayland: interactive panel via real input path =="
+
+ti() { "$(vb vantage-remote)" test-input "$@" >>"$WORK/ui.log" 2>&1; }
+
+# --- cursor sprite: the built-in 16x16 arrow (forced above) has an
+# --- EXACT bitmap — verify the pixels; the old stride bug read the
+# --- 64-stride image as tight-packed and sheared it into diagonal dots
+ti "motion x=300 y=200"
+sleep 0.2
+rm -f /tmp/vantage-wayland.ppm
+kill -USR1 "$WM_PID" 2>/dev/null
+wait_ppm
+if [ -s /tmp/vantage-wayland.ppm ]; then
+  python3 - <<'PYEOF2'
+import sys
+with open('/tmp/vantage-wayland.ppm','rb') as f:
+    data = f.read()
+vals, pos = [], data.find(b'P6') + 2
+while len(vals) < 3:
+    while data[pos:pos+1].isspace(): pos += 1
+    j = pos
+    while not data[j:j+1].isspace(): j += 1
+    vals.append(int(data[pos:j])); pos = j
+pos += 1
+w, h, _ = vals
+pix = data[pos:pos + w*h*3]
+def px(x, y):
+    i = (y*w+x)*3
+    return (pix[i], pix[i+1], pix[i+2])
+# built-in 16x16 arrow, hotspot (0,0): the bitmap is EXACTLY
+# 73 black + 75 white pixels in the 16x16 box at the cursor position.
+# The old stride bug (reading the 64-stride cell as tight-packed)
+# shears those pixels into diagonal fragments with different counts.
+white = 0
+black = 0
+far = 0
+for dy in range(-4, 20):
+    for dx in range(-4, 20):
+        c = px(300+dx, 200+dy)
+        if c == (255, 255, 255): white += 1
+        elif c == (0, 0, 0): black += 1
+# staircase debris would also land in the ring 20..64px away
+for dy in range(-4, 64):
+    for dx in range(20, 64):
+        if px(300+dx, 200+dy) in ((255, 255, 255), (0, 0, 0)): far += 1
+print(f"cursor: white={white} black={black} far-debris={far}")
+ok = white == 75 and black == 73 and far == 0
+sys.exit(0 if ok else 1)
+PYEOF2
+  [ $? -eq 0 ] && ok "cursor sprite is the exact built-in arrow (73 black + 75 white)"     || bad "cursor sprite corrupted (stride bug pattern?)"
+else
+  bad "no frame dump for the cursor check"
+fi
+
+# --- Programs menu: click the start button, verify the menu opens
+# --- (search bar background is opaque → exact-matchable)
+ti "motion x=63 y=17"
+ti "press b=1"
+ti "release b=1"
+sleep 0.3
+rm -f /tmp/vantage-wayland.ppm
+kill -USR1 "$WM_PID" 2>/dev/null
+wait_ppm
+if [ -s /tmp/vantage-wayland.ppm ]; then
+  python3 - <<'PYEOF3'
+import sys
+with open('/tmp/vantage-wayland.ppm','rb') as f:
+    data = f.read()
+vals, pos = [], data.find(b'P6') + 2
+while len(vals) < 3:
+    while data[pos:pos+1].isspace(): pos += 1
+    j = pos
+    while not data[j:j+1].isspace(): j += 1
+    vals.append(int(data[pos:j])); pos = j
+pos += 1
+w, h, _ = vals
+pix = data[pos:pos + w*h*3]
+# search-field background 0x2a2e35 (opaque) in the menu header band
+band = pix[(38*w)*3 : (72*w)*3]
+search_bg = band.count(bytes((0x2a, 0x2e, 0x35)))
+# white text pixels present in the whole menu area
+menu = pix[(38*w)*3 : (200*w)*3]
+white = menu.count(bytes((255, 255, 255))) + menu.count(bytes((0xec,0xee,0xf0)))
+print(f"menu: search-bg={search_bg} white-ish={white}")
+sys.exit(0 if search_bg > 3000 and white > 60 else 1)
+PYEOF3
+  [ $? -eq 0 ] && ok "Programs menu opened (search bar + content visible)"     || bad "Programs menu did not render"
+else
+  bad "no frame dump for the menu check"
+fi
+
+# --- application launch from the DEFAULT category (Accessories, where
+# --- the probe sorts alone → deterministic row 0); a category click on
+# --- row 0 exercises the same path
+ti "motion x=80 y=89"
+ti "press b=1"
+ti "release b=1"
+sleep 0.2
+# first application row: y = 38+34+4+13 = 89
+ti "motion x=300 y=89"
+ti "press b=1"
+ti "release b=1"
+for i in $(seq 1 20); do
+  [ -f "$WORK/wl-launch-marker" ] && break
+  sleep 0.1
+done
+if [ -f "$WORK/wl-launch-marker" ] &&    grep -q "launched" "$WORK/wl-launch-marker"; then
+  ok "application LAUNCHED from the Programs menu (marker file)"
+else
+  bad "application did not launch from the menu"
+fi
+grep -q "wl-panel: launched" "$WORK/wm.log"   && ok "compositor logged the launch"   || bad "no launch log line in the compositor log"
+
+# --- menu must close after launching (click went through) ---
+sleep 0.2
+rm -f /tmp/vantage-wayland.ppm
+kill -USR1 "$WM_PID" 2>/dev/null
+wait_ppm
+if [ -s /tmp/vantage-wayland.ppm ]; then
+  python3 - <<'PYEOF4'
+import sys
+with open('/tmp/vantage-wayland.ppm','rb') as f:
+    data = f.read()
+vals, pos = [], data.find(b'P6') + 2
+while len(vals) < 3:
+    while data[pos:pos+1].isspace(): pos += 1
+    j = pos
+    while not data[j:j+1].isspace(): j += 1
+    vals.append(int(data[pos:j])); pos = j
+pos += 1
+w, h, _ = vals
+pix = data[pos:pos + w*h*3]
+band = pix[(38*w)*3 : (72*w)*3]
+search_bg = band.count(bytes((0x2a, 0x2e, 0x35)))
+sys.exit(0 if search_bg < 500 else 1)
+PYEOF4
+  [ $? -eq 0 ] && ok "menu closed after launching the application"     || bad "menu stayed open after launching"
 fi
 
 # ------------------------------------------------------------- shutdown
@@ -274,10 +469,7 @@ if [ -n "$SOCK2" ] && [ -S "$XDG_RUNTIME_DIR/$SOCK2" ]; then
   WM_CHILD=$(grep -o "started 'wm' pid=[0-9]*" "$SESS_LOG" | head -1 | cut -d= -f2)
   if [ -n "${WM_CHILD:-}" ] && kill -0 "$WM_CHILD" 2>/dev/null; then
     kill -USR1 "$WM_CHILD" 2>/dev/null
-    for i in $(seq 1 20); do
-      [ -s /tmp/vantage-wayland.ppm ] && break
-      sleep 0.05
-    done
+    wait_ppm
     [ -s /tmp/vantage-wayland.ppm ] \
       && ok "frame dump written under the full session" \
       || bad "no frame dump under the session"
@@ -287,8 +479,32 @@ if [ -n "$SOCK2" ] && [ -S "$XDG_RUNTIME_DIR/$SOCK2" ]; then
 fi
 
 # ------------------------------------------------- logout round-trip
-# vantage-remote logout → session IPC → graceful child shutdown
-# (SIGTERM + grace, no SIGKILL) → exit 0.
+# TWO real paths: (1) the panel's session menu driven by real pointer
+# input, (2) vantage-remote logout → session IPC. Both must end the
+# session with the graceful SIGTERM policy (no SIGKILL, no restart).
+echo "== harness-wayland: panel-driven logout (real input path) =="
+if [ -n "${SESS_PID:-}" ] && kill -0 "$SESS_PID" 2>/dev/null; then
+  # open the username menu (right edge of the bar) then click Log Out
+  ti "motion x=990 y=17"
+  ti "press b=1"
+  ti "release b=1"
+  sleep 0.3
+  # Log Out is the 4th action row: y = 38+4+4+3*26+13 = 134
+  ti "motion x=990 y=134"
+  ti "press b=1"
+  ti "release b=1"
+  for i in $(seq 1 80); do
+    kill -0 "$SESS_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+fi
+if ! kill -0 "$SESS_PID" 2>/dev/null; then
+  ok "panel Log Out ended the session (no restart loop)"
+  grep -q "intentional logout, ending the session" "$SESS_LOG" \
+    && ok "supervisor recognized the intentional logout" \
+    || bad "no intentional-logout policy log line"
+fi
+
 echo "== harness-wayland: vantage-remote logout round-trip =="
 if [ -n "${SESS_PID:-}" ] && kill -0 "$SESS_PID" 2>/dev/null; then
   LOGOUT_RC=0
@@ -299,6 +515,8 @@ if [ -n "${SESS_PID:-}" ] && kill -0 "$SESS_PID" 2>/dev/null; then
     kill -0 "$SESS_PID" 2>/dev/null || break
     sleep 0.1
   done
+else
+  ok "session already ended by the panel logout (remote path skipped)"
 fi
 SESS_EXITED=""
 for i in $(seq 1 60); do

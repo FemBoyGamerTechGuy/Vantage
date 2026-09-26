@@ -403,6 +403,29 @@ static int _h_launch(vt_ipc_t *ipc, const vt_ipc_msg_t *req,
     return 0;
 }
 
+/* Headless test hook: inject a pointer event through the backend's
+ * REAL input pipeline (see vt-backend.h). Only the Wayland backend
+ * implements it; X11 answers "unsupported" because its input comes
+ * from the X server directly. */
+static int _h_test_input(vt_ipc_t *ipc, const vt_ipc_msg_t *req,
+                         vt_ipc_msg_t *resp, void *ud) {
+    (void)ipc;
+    _ctx_t *ctx = ud;
+    const char *spec = _payload_str(req, "spec");
+    if (!spec || !*spec) return -1;
+    vt_wm_t *wm = ctx ? ctx->wm : NULL;
+    if (!wm || !wm->backend || !wm->backend->test_input) {
+        resp->payload = (uint8_t *)vt_strdup("unsupported");
+        resp->len = 11;
+        return 0;
+    }
+    int rc = wm->backend->test_input(wm->backend, spec);
+    char *out = vt_strprintf("%s", rc == 0 ? "ok" : "rejected");
+    resp->payload = (uint8_t *)out;
+    resp->len = (uint32_t)strlen(out) + 1;
+    return 0;
+}
+
 static int _h_ping(vt_ipc_t *ipc, const vt_ipc_msg_t *req,
                    vt_ipc_msg_t *resp, void *ud) {
     (void)ipc; (void)req; (void)ud;
@@ -684,6 +707,7 @@ int main(int argc, char **argv) {
     vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_WS_SWITCH,_h_ws_switch, &ctx);
     vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_WS_MOVE,  _h_ws_move, &ctx);
     vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_LAUNCH,   _h_launch, &ctx);
+    vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_TEST_INPUT, _h_test_input, &ctx);
     vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_LOGOUT,  _h_logout, &ctx);
     vt_logi("wm: ipc server at %s", vt_ipc_get_path(ctx.ipc));
 

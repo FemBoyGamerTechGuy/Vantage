@@ -60,6 +60,16 @@ int  vt_pctx_text(vt_pctx_t *ctx, int x, int y, const char *utf8,
                   bool bold, vt_pcol_t col);
 int  vt_pctx_text_width(vt_pctx_t *ctx, const char *utf8, bool bold);
 int  vt_pctx_text_height(vt_pctx_t *ctx);
+/* draw an ARGB-8888 image (alpha-composited) — used for icons */
+void vt_pctx_draw_argb(vt_pctx_t *ctx, int dx, int dy, int dw, int dh,
+                       const uint32_t *argb, int sw, int sh);
+/* same, onto an arbitrary XRender Picture (popup menu windows) */
+void vt_pctx_draw_argb_pic(Display *dpy, Picture dst, int dx, int dy,
+                           int dw, int dh, const uint32_t *argb,
+                           int sw, int sh);
+/* UTF-8 text with font fallback onto any XftDraw target (menus) */
+int  vt_pctx_menu_text(vt_pctx_t *ctx, XftDraw *dst, int x, int y,
+                       const char *utf8, bool bold, vt_pcol_t col);
 
 /* applet instance context — what each applet gets */
 typedef struct vt_panel vt_panel_t;

@@ -1,184 +1,155 @@
 /* ------------------------------------------------------------ launcher */
-/* The Vantage start button: opens the application menu built from XDG
- * .desktop entries, grouped into the standard categories, plus a
- * Quit Session entry that opens the session actions menu. */
+/* The Vantage Programs button: opens the application menu built from
+ * XDG .desktop entries via the SHARED vt-apps database (the exact same
+ * parser, category table and locale handling the native Wayland panel
+ * uses), grouped into the standard categories, with a search bar,
+ * scrolling, real icon-theme icons, and a Quit Session entry that
+ * opens the session actions menu.
+ *
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
+ * Copyright (c) 2026 FemBoyGamerTechGuy
+ */
 
 #define VT_LOG_DOMAIN "panel-applets"
 #include "vt-panel-internal.h"
 #include <vantage/vt-config.h>
+#include <vantage/vt-apps.h>
+#include <vantage/vt-icons.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
-#include <dirent.h>
 #include <sys/stat.h>
 #include <pwd.h>
+#include <X11/keysym.h>
 #include <vantage/vt-integrations.h>
 
 typedef struct {
-    char *name;
-    char *exec;
-    char *icon;
-    char *category;     /* display category ("Internet", ...) */
-} _desk_entry_t;
-
-/* Category table: .desktop Categories= keyword -> display name. Order
- * defines the menu order; anything unmatched lands in "Other". */
-static const struct { const char *key; const char *label; } _cat_table[] = {
-    { "Utility",     "Utilities"  },
-    { "Development", "Development"},
-    { "Education",   "Education"  },
-    { "Science",     "Education"  },
-    { "Game",        "Games"      },
-    { "Graphics",    "Graphics"   },
-    { "Network",     "Internet"   },
-    { "AudioVideo",  "Multimedia" },
-    { "Audio",       "Multimedia" },
-    { "Video",       "Multimedia" },
-    { "Office",      "Office"     },
-    { "System",      "System"     },
-    { "Settings",    "System"     },
-    { "Core",        "System"     },
-};
-#define _N_CATS ((int)(sizeof(_cat_table) / sizeof(_cat_table[0])))
-
-static const char *const _cat_order[] = {
-    "Accessories2", /* replaced at runtime: see below */
-};
-/* full ordered category list shown in the menu */
-static const char *const _menu_cats[] = {
-    "Accessories", "Development", "Education", "Games", "Graphics",
-    "Internet", "Multimedia", "Office", "System", "Utilities", "Other",
-};
-#define _N_MENU_CATS ((int)(sizeof(_menu_cats) / sizeof(_menu_cats[0])))
-
-static const char *_category_of(const char *desktop_categories) {
-    if (!desktop_categories || !*desktop_categories) return "Other";
-    for (int i = 0; i < _N_CATS; i++)
-        if (strstr(desktop_categories, _cat_table[i].key))
-            return _cat_table[i].label;
-    return "Other";
-}
-
-/* display category for a Utility-only entry: Utilities; with
- * AudioVideo etc. handled above, plain "Utility" goes to Accessories
- * unless it also carries Terminal (then Utilities). */
-static const char *_category_detailed(const char *cats, bool terminal) {
-    if (!cats || !*cats) return "Other";
-    /* Utility+something-else is handled by the table order */
-    for (int i = 0; i < _N_CATS; i++)
-        if (strstr(cats, _cat_table[i].key))
-            return _cat_table[i].label;
-    if (strstr(cats, "Utility")) return terminal ? "Utilities" : "Accessories";
-    return "Other";
-}
-
-typedef struct {
-    vt_vec_t entries;     /* _desk_entry_t */
+    vt_apps_t *apps;         /* shared .desktop database */
     bool loaded;
-    Window menu_win;      /* override-redirect popup */
+
+    Window menu_win;         /* override-redirect popup */
     XftDraw *menu_draw;
-    int  menu_rows;       /* visible app rows */
-    int  menu_sel;        /* hovered app row, -1 none */
-    int  menu_cat;        /* hovered category row, -1 none */
-    int  cur_cat;         /* selected category index */
-    int  scroll;          /* first visible app row */
+    int  menu_rows;          /* visible app rows */
+    int  menu_sel;           /* hovered app row, -1 none */
+    int  cur_cat;            /* selected category TABLE index */
+    int  scroll;             /* first visible app row */
+    char search[64];
+    bool search_focused;
+
+    /* icon cache: name → 18x18 ARGB */
+    vt_vec_t icon_keys;      /* char* */
+    vt_vec_t icon_px;        /* uint32_t* */
+    vt_icon_theme_t *theme;
 } _launcher_t;
+
+/* ---- menu geometry (mirrors the Wayland panel's menu) ---- */
+#define _AM_X        8
+#define _AM_CAT_W    150
+#define _AM_W        560
+#define _AM_ROW      26
+#define _AM_ROWS     12
+#define _AM_SEARCH_H 34
+#define _AM_H        (_AM_SEARCH_H + _AM_ROWS * _AM_ROW + 8)
 
 static void _launcher_menu_paint(vt_applet_env_t *env);
 static void _launcher_menu_handle(vt_panel_t *p, XEvent *ev);
 static void _launcher_menu_close(vt_applet_env_t *env);
 static void _launcher_menu_open(vt_applet_env_t *env);
 
-static char *_strip_field(char *s) {
-    /* cut at %U/%u/%F/%f placeholders */
-    char *p = strstr(s, "%");
-    if (p) *p = 0;
-    /* trim */
-    return vt_strtrim(s);
-}
-
-static int _desk_cmp(const void *a, const void *b);
-
-static void _load_desktop_dir(_launcher_t *l, const char *dir) {
-    DIR *d = opendir(dir);
-    if (!d) return;
-    struct dirent *de;
-    while ((de = readdir(d))) {
-        if (!vt_strendswith(de->d_name, ".desktop")) continue;
-        char *path = vt_strprintf("%s/%s", dir, de->d_name);
-        size_t len = 0;
-        char *content = vt_file_read_all(path, &len);
-        vt_free(path);
-        if (!content) continue;
-        char *name = NULL, *exec = NULL, *icon = NULL, *cats = NULL,
-             *nodisplay = NULL, *onlyin = NULL, *terminal = NULL;
-        char *save = NULL;
-        for (char *line = strtok_r(content, "\n", &save); line;
-             line = strtok_r(NULL, "\n", &save)) {
-            if (name && exec && cats) break;
-            if (vt_strstartswith(line, "Name=") && !name)
-                name = vt_strdup(line + 5);
-            else if (vt_strstartswith(line, "Name[") && !name) {
-                char *eq = strchr(line, '=');
-                if (eq) name = vt_strdup(eq + 1);
+/* ------------------------------------------------------ icon cache */
+static uint32_t *_icon_18(_launcher_t *l, const char *name) {
+    if (!name || !*name) return NULL;
+    for (size_t i = 0; i < l->icon_keys.size; i++)
+        if (vt_streq(*(const char *const *)vt_vec_at(&l->icon_keys, i), name))
+            return *(uint32_t *const *)vt_vec_at(&l->icon_px, i);
+    if (!l->theme) l->theme = vt_icon_theme_load();
+    uint32_t *px = NULL;
+    char path[1024];
+    if (vt_icon_theme_lookup(l->theme, name, 24, path, sizeof(path)) == 0) {
+        uint32_t *full = NULL;
+        int w = 0, h = 0;
+        if (vt_icon_load_argb(path, &full, &w, &h) == 0 && w > 0 && h > 0) {
+            if (w == 18 && h == 18) px = full;
+            else {
+                px = vt_malloc(sizeof(uint32_t) * 18 * 18);
+                for (int y = 0; y < 18; y++) {
+                    int sy = y * h / 18;
+                    if (sy >= h) sy = h - 1;
+                    for (int x = 0; x < 18; x++) {
+                        int sx = x * w / 18;
+                        if (sx >= w) sx = w - 1;
+                        px[y * 18 + x] = full[sy * w + sx];
+                    }
+                }
+                vt_free(full);
             }
-            else if (vt_strstartswith(line, "Exec=") && !exec)
-                exec = vt_strdup(line + 5);
-            else if (vt_strstartswith(line, "Icon=") && !icon)
-                icon = vt_strdup(line + 5);
-            else if (vt_strstartswith(line, "Categories=") && !cats)
-                cats = vt_strdup(line + 11);
-            else if (vt_strstartswith(line, "NoDisplay=true"))
-                nodisplay = vt_strdup("1");
-            else if (vt_strstartswith(line, "Terminal=true"))
-                terminal = vt_strdup("1");
-            else if (vt_strstartswith(line, "OnlyShowIn="))
-                onlyin = vt_strdup(line + 12);
         }
-        vt_free(content);
-        if (nodisplay || !name || !exec) {
-            vt_free(name); vt_free(exec); vt_free(icon); vt_free(cats);
-            vt_free(nodisplay); vt_free(onlyin); vt_free(terminal);
-            continue;
-        }
-        if (onlyin && !strstr(onlyin, "Vantage") && !strstr(onlyin, "GNOME")
-            && !strstr(onlyin, "XFCE")) {
-            vt_free(name); vt_free(exec); vt_free(icon); vt_free(cats);
-            vt_free(onlyin); vt_free(terminal);
-            continue;
-        }
-        _desk_entry_t e = { .name = name, .exec = _strip_field(exec),
-                            .icon = icon,
-                            .category = vt_strdup(_category_detailed(
-                                cats, terminal != NULL)) };
-        vt_free(cats);
-        vt_free(terminal);
-        vt_vec_push(&l->entries, &e);
-        vt_free(nodisplay);
-        vt_free(onlyin);
     }
-    closedir(d);
+    /* negative results are cached too (avoid re-resolving on repaint) */
+    char *key = vt_strdup(name);
+    vt_vec_push(&l->icon_keys, &key);
+    vt_vec_push(&l->icon_px, &px);
+    return px;
 }
 
+/* -------------------------------------------------------- app filtering */
+static bool _app_matches(const vt_app_t *a, int cat_idx,
+                         const char *search) {
+    if (cat_idx < 0) return false;
+    if (a->category != vt_apps_category_label(cat_idx)) return false;
+    if (search && *search) {
+        if (strcasestr(a->name, search)) return true;
+        if (a->keywords && strcasestr(a->keywords, search)) return true;
+        return false;
+    }
+    return true;
+}
+
+static const vt_app_t *_app_row(_launcher_t *l, int cat_idx,
+                                const char *search, size_t row) {
+    size_t r = 0;
+    for (size_t i = 0; i < vt_apps_n(l->apps); i++) {
+        const vt_app_t *a = vt_apps_at(l->apps, i);
+        if (!_app_matches(a, cat_idx, search)) continue;
+        if (r == row) return a;
+        r++;
+    }
+    return NULL;
+}
+
+static size_t _app_count(_launcher_t *l, int cat_idx, const char *search) {
+    size_t r = 0;
+    for (size_t i = 0; i < vt_apps_n(l->apps); i++)
+        if (_app_matches(vt_apps_at(l->apps, i), cat_idx, search)) r++;
+    return r;
+}
+
+/* ------------------------------------------------------------- applet */
 static void _launcher_init(vt_applet_env_t *env) {
     _launcher_t *l = vt_malloc0(sizeof(*l));
-    vt_vec_init(&l->entries, sizeof(_desk_entry_t), 32);
+    vt_vec_init(&l->icon_keys, sizeof(char *), 32);
+    vt_vec_init(&l->icon_px, sizeof(uint32_t *), 32);
     l->menu_sel = -1;
-    l->menu_cat = -1;
-    l->cur_cat = 0;
+    l->cur_cat = -1;
     env->state = l;
 }
 
 static void _launcher_fini(vt_applet_env_t *env) {
     _launcher_t *l = env->state;
     if (!l) return;
-    for (size_t i = 0; i < l->entries.size; i++) {
-        _desk_entry_t *e = vt_vec_at(&l->entries, i);
-        vt_free(e->name); vt_free(e->exec); vt_free(e->icon);
-        vt_free(e->category);
+    for (size_t i = 0; i < l->icon_keys.size; i++) {
+        char **k = vt_vec_at(&l->icon_keys, i);
+        vt_free(*k);
     }
-    vt_vec_fini(&l->entries);
+    for (size_t i = 0; i < l->icon_px.size; i++) {
+        uint32_t **v = vt_vec_at(&l->icon_px, i);
+        vt_free(*v);
+    }
+    vt_vec_fini(&l->icon_keys);
+    vt_vec_fini(&l->icon_px);
+    if (l->theme) vt_icon_theme_free(l->theme);
+    vt_apps_free(l->apps);
     vt_free(l);
 }
 
@@ -186,236 +157,72 @@ static void _launcher_load(vt_applet_env_t *env) {
     _launcher_t *l = env->state;
     if (l->loaded) return;
     l->loaded = true;
-    char *user = vt_strprintf("%s/.local/share/applications", vt_home_dir());
-    _load_desktop_dir(l, "/usr/share/applications");
-    _load_desktop_dir(l, "/usr/local/share/applications");
-    _load_desktop_dir(l, user);
-    vt_free(user);
-    vt_vec_sort(&l->entries, _desk_cmp);
-    vt_logi("launcher: %zu applications", l->entries.size);
-}
-
-static int _desk_cmp(const void *a, const void *b) {
-    const _desk_entry_t *ea = a, *eb = b;
-    return strcasecmp(ea->name, eb->name);
+    l->apps = vt_apps_load();
+    /* default category: first one that has applications */
+    for (int i = 0; i < vt_apps_category_count(); i++) {
+        if (vt_apps_in_category(l->apps, i) > 0) { l->cur_cat = i; break; }
+    }
 }
 
 static int _launcher_measure(vt_applet_env_t *env) {
     _launcher_load(env);
-    return 92;
-}
-
-/* count entries in a display category */
-static int _cat_count(_launcher_t *l, const char *cat) {
-    int n = 0;
-    for (size_t i = 0; i < l->entries.size; i++) {
-        _desk_entry_t *e = vt_vec_at(&l->entries, i);
-        if (vt_streq(e->category, cat)) n++;
-    }
-    return n;
+    return 110;
 }
 
 static void _launcher_render(vt_applet_env_t *env) {
     vt_pctx_t *ctx = env->ctx;
-    int x = env->area.x, w = env->area.w, h = env->area.h;
+    int x = env->area.x, h = env->area.h;
     int y = env->area.y;
-    /* Vantage start button: accent rounded square + V glyph + label */
+    /* Programs button: accent rounded square + grid glyph + label */
     vt_pcol_t accent = { 0x4f, 0x9a, 0xdc, 0xff };
     vt_pcol_t fg = { 0xec, 0xee, 0xf0, 0xff };
     vt_pctx_rounded_rect(ctx, x + 6, y + 3, 22, h - 6, 6, accent);
-    /* the V: two diagonal strokes */
-    for (int i = 0; i < 5; i++) {
-        vt_pctx_rect(ctx, x + 6 + 5 + i, y + 3 + 4 + i, 2, 2, fg);
-        vt_pctx_rect(ctx, x + 6 + 15 - i, y + 3 + 4 + i, 2, 2, fg);
-    }
-    vt_pctx_rect(ctx, x + 6 + 9, y + 3 + 13, 2, 2, fg);
-    vt_pctx_text(ctx, x + 34, y + h / 2 + vt_pctx_text_height(ctx) / 2 - 2,
-                 "Vantage", true, fg);
+    for (int gy = 0; gy < 3; gy++)
+        for (int gx = 0; gx < 3; gx++)
+            vt_pctx_rect(ctx, x + 6 + 5 + gx * 5, y + 3 + 5 + gy * 5, 2, 2,
+                         fg);
+    vt_pctx_text(ctx, x + 36, y + h / 2 + vt_pctx_text_height(ctx) / 2 - 2,
+                 "Programs", true, fg);
 }
 
-/* ---- the application menu (two panes: categories | applications) ---- */
-#define _AM_CAT_W   120
-#define _AM_ROW     26
-#define _AM_W       480
-#define _AM_ROWS    14
-
-static void _launcher_menu_paint(vt_applet_env_t *env) {
+/* --------------------------------------------------- the Programs menu */
+static void _launcher_menu_open(vt_applet_env_t *env) {
     _launcher_t *l = env->state;
     vt_pctx_t *ctx = env->ctx;
-    if (!l->menu_win || !l->menu_draw) return;
-    Display *dpy = ctx->dpy;
-    int w = _AM_W;
-    int h = _AM_ROWS * _AM_ROW + 8;
-    XRenderColor bg = { .red = 0x1a1a, .green = 0x1c1c, .blue = 0x2222,
-                        .alpha = 0xffff };
-    XRenderPictFormat *fmt = XRenderFindVisualFormat(dpy,
-        DefaultVisual(dpy, DefaultScreen(dpy)));
-    Picture pic = XRenderCreatePicture(dpy, l->menu_win, fmt, 0, NULL);
-    XRenderFillRectangle(dpy, PictOpSrc, pic, &bg, 0, 0, (unsigned)w,
-                         (unsigned)h);
-    /* separator between the panes */
-    XRenderColor sep = { .red = 0x3939, .green = 0x3e3e, .blue = 0x4848,
-                         .alpha = 0xffff };
-    XRenderFillRectangle(dpy, PictOpSrc, pic, &sep, _AM_CAT_W, 0, 1,
-                         (unsigned)h);
-
-    /* category pane */
-    for (int i = 0; i < _N_MENU_CATS; i++) {
-        int n = _cat_count(l, _menu_cats[i]);
-        if (n == 0 && i != _N_MENU_CATS - 1) continue;   /* skip empty */
-        int row_y = 4 + i * _AM_ROW;
-        if (row_y + _AM_ROW > h) break;
-        bool active = (i == l->cur_cat);
-        if (active) {
-            XRenderColor hi = { .red = 0x4f4f, .green = 0x9a9a,
-                                .blue = 0xdcdc, .alpha = 0xffff };
-            XRenderFillRectangle(dpy, PictOpOver, pic, &hi, 2,
-                                  (short)row_y, (unsigned)(_AM_CAT_W - 4),
-                                  (unsigned)(_AM_ROW - 2));
-        }
-        XRenderColor tc = active
-            ? (XRenderColor){ .red = 0xffff, .green = 0xffff,
-                              .blue = 0xffff, .alpha = 0xffff }
-            : (XRenderColor){ .red = 0xecec, .green = 0xeeee,
-                              .blue = 0xf0f0, .alpha = 0xffff };
-        XftColor fc;
-        XftColorAllocValue(dpy, DefaultVisual(dpy, DefaultScreen(dpy)),
-                      DefaultColormap(dpy, DefaultScreen(dpy)), &tc, &fc);
-        XftDrawStringUtf8(l->menu_draw, &fc, active ? ctx->font_bold
-                                                    : ctx->font, 10,
-                          row_y + _AM_ROW - 7,
-                          (const FcChar8 *)_menu_cats[i],
-                          (int)strlen(_menu_cats[i]));
-        /* count badge */
-        char badge[16];
-        snprintf(badge, sizeof(badge), "%d", n);
-        XRenderColor dim = { .red = 0x9090, .green = 0x9393, .blue = 0x9999,
-                             .alpha = 0xffff };
-        XftColor fcd;
-        XftColorAllocValue(dpy, DefaultVisual(dpy, DefaultScreen(dpy)),
-                           DefaultColormap(dpy, DefaultScreen(dpy)), &dim,
-                           &fcd);
-        XftDrawStringUtf8(l->menu_draw, &fcd, ctx->font,
-                          _AM_CAT_W - 8 - (int)strlen(badge) * 7,
-                          row_y + _AM_ROW - 7, (const FcChar8 *)badge,
-                          (int)strlen(badge));
-        (void)fcd;
-    }
-
-    /* applications pane */
-    const char *cat = _menu_cats[l->cur_cat];
-    int row = 0;
-    for (size_t i = 0; i < l->entries.size && row < _AM_ROWS; i++) {
-        _desk_entry_t *e = vt_vec_at(&l->entries, i);
-        if (!vt_streq(e->category, cat)) continue;
-        int ry = 4 + row * _AM_ROW;
-        bool sel = (row == l->menu_sel);
-        if (sel) {
-            XRenderColor hi = { .red = 0x3939, .green = 0x3e3e,
-                                .blue = 0x4848, .alpha = 0xffff };
-            XRenderFillRectangle(dpy, PictOpOver, pic, &hi, _AM_CAT_W + 2,
-                                  (short)ry,
-                                  (unsigned)(w - _AM_CAT_W - 4),
-                                  (unsigned)(_AM_ROW - 2));
-        }
-        XRenderColor tc = sel
-            ? (XRenderColor){ .red = 0xffff, .green = 0xffff,
-                              .blue = 0xffff, .alpha = 0xffff }
-            : (XRenderColor){ .red = 0xecec, .green = 0xeeee,
-                              .blue = 0xf0f0, .alpha = 0xffff };
-        XftColor fc;
-        XftColorAllocValue(dpy, DefaultVisual(dpy, DefaultScreen(dpy)),
-                      DefaultColormap(dpy, DefaultScreen(dpy)), &tc, &fc);
-        XftDrawStringUtf8(l->menu_draw, &fc, ctx->font, _AM_CAT_W + 10,
-                          ry + _AM_ROW - 7, (const FcChar8 *)e->name,
-                          (int)strlen(e->name));
-        row++;
-    }
-    if (row == 0) {
-        XRenderColor dim = { .red = 0x9090, .green = 0x9393, .blue = 0x9999,
-                             .alpha = 0xffff };
-        XftColor fc;
-        XftColorAllocValue(dpy, DefaultVisual(dpy, DefaultScreen(dpy)),
-                           DefaultColormap(dpy, DefaultScreen(dpy)), &dim,
-                           &fc);
-        const char *msg = "(no applications)";
-        XftDrawStringUtf8(l->menu_draw, &fc, ctx->font, _AM_CAT_W + 10,
-                          4 + _AM_ROW - 7, (const FcChar8 *)msg,
-                          (int)strlen(msg));
-    }
-    XRenderFreePicture(dpy, pic);
-}
-
-/* the Quit Session row (bottom of the category pane) */
-#define _AM_QUIT_Y(h_) ((h_) - _AM_ROW - 4)
-
-static void _launcher_menu_handle(vt_panel_t *p, XEvent *ev) {
-    vt_applet_env_t env = vt_panel_find_env(p, VT_PANEL_APPLET_LAUNCHER);
-    _launcher_t *l = env.state;
-    if (!l || ev->xany.window != l->menu_win) return;
-    int w = _AM_W, h = _AM_ROWS * _AM_ROW + 8;
-    switch (ev->type) {
-    case Expose:
-        _launcher_menu_paint(&env);
-        break;
-    case MotionNotify: {
-        int x = ev->xmotion.x, y = ev->xmotion.y;
-        if (x < _AM_CAT_W) {
-            int ci = (y - 4) / _AM_ROW;
-            l->menu_cat = (ci >= 0 && ci < _N_MENU_CATS) ? ci : -1;
-            l->menu_sel = -1;
-            if (l->menu_cat >= 0 && _cat_count(l, _menu_cats[l->menu_cat]) > 0)
-                l->cur_cat = l->menu_cat;
-        } else {
-            int ri = (y - 4) / _AM_ROW;
-            l->menu_sel = (ri >= 0 && ri < _AM_ROWS) ? ri : -1;
-            l->menu_cat = -1;
-        }
-        _launcher_menu_paint(&env);
-        break;
-    }
-    case ButtonRelease: {
-        if (ev->xbutton.button == Button1) {
-            int x = ev->xbutton.x, y = ev->xbutton.y;
-            if (y >= _AM_QUIT_Y(h)) {
-                /* Quit Session -> open the session actions menu */
-                _launcher_menu_close(&env);
-                vt_panel_user_menu_open(p);
-                break;
-            }
-            if (x < _AM_CAT_W) {
-                int ci = (y - 4) / _AM_ROW;
-                if (ci >= 0 && ci < _N_MENU_CATS &&
-                    (_cat_count(l, _menu_cats[ci]) > 0 || ci == _N_MENU_CATS - 1)) {
-                    l->cur_cat = ci;
-                    l->scroll = 0;
-                }
-                _launcher_menu_paint(&env);
-                break;
-            }
-            int ri = (y - 4) / _AM_ROW;
-            const char *cat = _menu_cats[l->cur_cat];
-            int row = 0;
-            for (size_t i = 0; i < l->entries.size && row <= ri; i++) {
-                _desk_entry_t *e = vt_vec_at(&l->entries, i);
-                if (!vt_streq(e->category, cat)) continue;
-                if (row == ri) {
-                    vt_logi("launcher: spawn '%s'", e->exec);
-                    vt_panel_spawn(e->exec);
-                    _launcher_menu_close(&env);
-                    break;
-                }
-                row++;
-            }
-        } else {
-            _launcher_menu_close(&env);
-        }
-        break;
-    }
-    default:
-        break;
-    }
-    (void)w;
+    if (l->menu_win) return;
+    _launcher_load(env);
+    l->menu_rows = _AM_ROWS;
+    l->scroll = 0;
+    l->menu_sel = -1;
+    l->search[0] = 0;
+    l->search_focused = true;
+    int x = env->area.x;
+    int y = env->area.y + env->area.h + 4;
+    XSetWindowAttributes wa = { .override_redirect = True,
+                                .background_pixel = 0x22221c1a,
+                                .event_mask = ExposureMask |
+                                              ButtonPressMask |
+                                              ButtonReleaseMask |
+                                              PointerMotionMask |
+                                              Button4Mask | Button5Mask |
+                                              KeyPressMask };
+    l->menu_win = XCreateWindow(ctx->dpy, DefaultRootWindow(ctx->dpy),
+                                x, y, (unsigned)_AM_W, (unsigned)_AM_H, 1,
+                                CopyFromParent, InputOutput, CopyFromParent,
+                                CWOverrideRedirect | CWBackPixel |
+                                CWEventMask, &wa);
+    l->menu_draw = XftDrawCreate(ctx->dpy, l->menu_win,
+                                 DefaultVisual(ctx->dpy,
+                                               DefaultScreen(ctx->dpy)),
+                                 DefaultColormap(ctx->dpy,
+                                                 DefaultScreen(ctx->dpy)));
+    XMapWindow(ctx->dpy, l->menu_win);
+    /* keyboard focus for the search bar (override-redirect windows
+     * are not WM-managed; focus goes directly) */
+    XSetInputFocus(ctx->dpy, l->menu_win, RevertToParent, CurrentTime);
+    vt_panel_set_popup(env->panel, l->menu_win, _launcher_menu_handle);
+    XFlush(ctx->dpy);
+    _launcher_menu_paint(env);
 }
 
 static void _launcher_menu_close(vt_applet_env_t *env) {
@@ -430,40 +237,266 @@ static void _launcher_menu_close(vt_applet_env_t *env) {
     vt_panel_invalidate(env->panel);
 }
 
-static void _launcher_menu_open(vt_applet_env_t *env) {
+static void _launcher_menu_paint(vt_applet_env_t *env) {
     _launcher_t *l = env->state;
     vt_pctx_t *ctx = env->ctx;
-    if (l->menu_win) return;
-    _launcher_load(env);
-    if (l->entries.size == 0) return;
-    l->menu_rows = _AM_ROWS;
-    l->scroll = 0;
-    l->menu_sel = -1;
-    l->menu_cat = -1;
-    int w = _AM_W, h = _AM_ROWS * _AM_ROW + 8;
-    int x = env->area.x;
-    int y = env->area.y + env->area.h + 4;
-    XSetWindowAttributes wa = { .override_redirect = True,
-                                .background_pixel = 0x22221c1a,
-                                .event_mask = ExposureMask |
-                                              ButtonPressMask |
-                                              ButtonReleaseMask |
-                                              PointerMotionMask };
-    l->menu_win = XCreateWindow(ctx->dpy, DefaultRootWindow(ctx->dpy),
-                                x, y, (unsigned)w, (unsigned)h, 1,
-                                CopyFromParent, InputOutput, CopyFromParent,
-                                CWOverrideRedirect | CWBackPixel |
-                                CWEventMask, &wa);
-    l->menu_draw = XftDrawCreate(ctx->dpy, l->menu_win,
-                                 DefaultVisual(ctx->dpy,
-                                               DefaultScreen(ctx->dpy)),
-                                 DefaultColormap(ctx->dpy,
-                                                 DefaultScreen(ctx->dpy)));
-    XMapWindow(ctx->dpy, l->menu_win);
-    vt_panel_set_popup(env->panel, l->menu_win,
-                       _launcher_menu_handle);
-    XFlush(ctx->dpy);
-    _launcher_menu_paint(env);
+    if (!l->menu_win || !l->menu_draw) return;
+    Display *dpy = ctx->dpy;
+    int w = _AM_W, h = _AM_H;
+    XRenderPictFormat *fmt = XRenderFindVisualFormat(dpy,
+        DefaultVisual(dpy, DefaultScreen(dpy)));
+    Picture pic = XRenderCreatePicture(dpy, l->menu_win, fmt, 0, NULL);
+    XRenderColor bg = { .red = 0x1a1a, .green = 0x1c1c, .blue = 0x2222,
+                        .alpha = 0xffff };
+    XRenderFillRectangle(dpy, PictOpSrc, pic, &bg, 0, 0, (unsigned)w,
+                         (unsigned)h);
+
+    /* text helper with the same per-codepoint font fallback the panel
+     * bar uses (Russian/CJK app names render correctly) */
+    #define _MT(txt, xx, yy, colr, bold_)                              \
+        vt_pctx_menu_text(ctx, l->menu_draw, (xx), (yy), (txt),         \
+                          (bold_), (colr))
+
+    /* --- search bar --- */
+    XRenderColor sbg = { .red = 0x2a2a, .green = 0x2e2e, .blue = 0x3535,
+                         .alpha = 0xffff };
+    XRenderFillRectangle(dpy, PictOpSrc, pic, &sbg, 6, 5,
+                          (unsigned)(w - 12), _AM_SEARCH_H - 12);
+    vt_pcol_t dim = { 0x90, 0x93, 0x99, 0xff };
+    _MT("Search:", 14, 26, dim, false);
+    vt_pcol_t fgc = { 0xec, 0xee, 0xf0, 0xff };
+    _MT(l->search, 14 + 52, 26, fgc, false);
+    if (l->search_focused) {
+        XGlyphInfo gi;
+        XftTextExtentsUtf8(dpy, ctx->font, (const FcChar8 *)l->search,
+                           (int)strlen(l->search), &gi);
+        XRenderColor caret = { .red = 0x6f6f, .green = 0xaaaa,
+                               .blue = 0xe8e8, .alpha = 0xffff };
+        XRenderFillRectangle(dpy, PictOpSrc, pic, &caret,
+                             (short)(14 + 52 + gi.xOff + 2), 12, 6, 14);
+    }
+
+    /* separator between the panes */
+    XRenderColor sep = { .red = 0x3939, .green = 0x3e3e, .blue = 0x4848,
+                         .alpha = 0xffff };
+    XRenderFillRectangle(dpy, PictOpSrc, pic, &sep, _AM_CAT_W,
+                         _AM_SEARCH_H, 1, (unsigned)(h - _AM_SEARCH_H));
+
+    /* --- category pane: COMPACT rows (no gaps for empty categories) */
+    int cat_row = 0;
+    int cat_rows_max = (h - _AM_SEARCH_H - _AM_ROW - 8) / _AM_ROW;
+    for (int ci = 0; ci < vt_apps_category_count(); ci++) {
+        if (cat_row >= cat_rows_max) break;
+        int n = vt_apps_in_category(l->apps, ci);
+        if (n == 0 && ci != vt_apps_category_count() - 1) continue;
+        int row_y = _AM_SEARCH_H + 4 + cat_row * _AM_ROW;
+        bool active = (ci == l->cur_cat);
+        if (active) {
+            XRenderColor hi = { .red = 0x4f4f, .green = 0x9a9a,
+                                .blue = 0xdcdc, .alpha = 0xffff };
+            XRenderFillRectangle(dpy, PictOpOver, pic, &hi, 2,
+                                  (short)row_y, (unsigned)(_AM_CAT_W - 4),
+                                  (unsigned)(_AM_ROW - 2));
+        }
+        vt_pcol_t tc = fgc;
+        if (active) tc = (vt_pcol_t){ 0xff, 0xff, 0xff, 0xff };
+        _MT(vt_apps_category_label(ci), 10, row_y + _AM_ROW - 7, tc, active);
+        char badge[16];
+        snprintf(badge, sizeof(badge), "%d", n);
+        vt_pcol_t dcol = dim;
+        _MT(badge, _AM_CAT_W - 8 - (int)strlen(badge) * 7,
+            row_y + _AM_ROW - 7, dcol, false);
+        cat_row++;
+    }
+
+    /* Quit Session pinned at the bottom of the category pane */
+    {
+        int qy = h - _AM_ROW - 4;
+        XRenderColor qb = { .red = 0x2626, .green = 0x2828,
+                            .blue = 0x2e2e, .alpha = 0xffff };
+        XRenderFillRectangle(dpy, PictOpSrc, pic, &qb, 2, (short)qy,
+                             (unsigned)(_AM_CAT_W - 4),
+                             (unsigned)(_AM_ROW - 2));
+        vt_pcol_t warn = { 0xe0, 0x7a, 0x50, 0xff };
+        _MT("Quit Session", 10, qy + _AM_ROW - 7, warn, false);
+    }
+
+    /* --- applications pane (scrollable, with icons) --- */
+    size_t total = _app_count(l, l->cur_cat, l->search);
+    for (int r = 0; r < _AM_ROWS; r++) {
+        const vt_app_t *a = _app_row(l, l->cur_cat, l->search,
+                                     (size_t)(l->scroll + r));
+        if (!a) break;
+        int ry = _AM_SEARCH_H + 4 + r * _AM_ROW;
+        bool sel = (r == l->menu_sel);
+        if (sel) {
+            XRenderColor hi = { .red = 0x3939, .green = 0x3e3e,
+                                .blue = 0x4848, .alpha = 0xffff };
+            XRenderFillRectangle(dpy, PictOpOver, pic, &hi, _AM_CAT_W + 2,
+                                  (short)ry, (unsigned)(w - _AM_CAT_W - 4),
+                                  (unsigned)(_AM_ROW - 2));
+        }
+        uint32_t *icon = _icon_18(l, a->icon);
+        if (icon)
+            vt_pctx_draw_argb_pic(dpy, pic, _AM_CAT_W + 8, ry + 3, 18, 18,
+                                  icon, 18, 18);
+        else {
+            XRenderColor fb = { .red = 0x3939, .green = 0x3e3e,
+                                .blue = 0x4848, .alpha = 0xffff };
+            XRenderFillRectangle(dpy, PictOpOver, pic, &fb, _AM_CAT_W + 8,
+                                  (short)(ry + 3), 18, 18);
+        }
+        vt_pcol_t name_col = fgc;
+        if (sel) name_col = (vt_pcol_t){ 0xff, 0xff, 0xff, 0xff };
+        _MT(a->name, _AM_CAT_W + 34, ry + _AM_ROW - 7, name_col, false);
+    }
+    if (total == 0) {
+        _MT("(no applications)", _AM_CAT_W + 34, _AM_SEARCH_H + _AM_ROW - 7,
+            dim, false);
+    }
+
+    /* --- scrollbar when the list overflows --- */
+    if (total > (size_t)_AM_ROWS) {
+        int track = _AM_ROWS * _AM_ROW - 8;
+        int sb_h = (int)((double)_AM_ROWS / (double)total * track);
+        if (sb_h < 14) sb_h = 14;
+        int sb_y = _AM_SEARCH_H + 4 +
+                   (int)((double)l->scroll / (double)total *
+                         (double)(track - sb_h));
+        XRenderColor trk = { .red = 0x2a2a, .green = 0x2e2e,
+                             .blue = 0x3535, .alpha = 0xffff };
+        XRenderFillRectangle(dpy, PictOpSrc, pic, &trk, w - 8,
+                             (short)(_AM_SEARCH_H + 4), 4,
+                             (unsigned)track);
+        XRenderColor knb = { .red = 0x4f4f, .green = 0x9a9a,
+                             .blue = 0xdcdc, .alpha = 0xffff };
+        XRenderFillRectangle(dpy, PictOpSrc, pic, &knb, w - 8, (short)sb_y,
+                             4, (unsigned)sb_h);
+    }
+
+    XRenderFreePicture(dpy, pic);
+    XFlush(dpy);
+    #undef _MT
+}
+
+/* the Quit Session row (bottom of the category pane) */
+#define _AM_QUIT_Y (_AM_H - _AM_ROW - 4)
+
+static void _search_backspace(_launcher_t *l) {
+    size_t len = strlen(l->search);
+    /* UTF-8 aware: strip one codepoint */
+    while (len > 0 && (l->search[len - 1] & 0xc0) == 0x80) len--;
+    if (len > 0) len--;
+    l->search[len] = 0;
+}
+
+static void _launcher_menu_handle(vt_panel_t *p, XEvent *ev) {
+    vt_applet_env_t env = vt_panel_find_env(p, VT_PANEL_APPLET_LAUNCHER);
+    _launcher_t *l = env.state;
+    if (!l || ev->xany.window != l->menu_win) return;
+    switch (ev->type) {
+    case Expose:
+        _launcher_menu_paint(&env);
+        break;
+    case KeyPress: {
+        KeySym ks;
+        char buf[32];
+        int n = XLookupString(&ev->xkey, buf, sizeof(buf) - 1, &ks, NULL);
+        buf[n > 0 ? n : 0] = 0;
+        if (ks == XK_Escape) {
+            if (l->search[0]) { l->search[0] = 0; l->scroll = 0; }
+            else _launcher_menu_close(&env);
+        } else if (ks == XK_BackSpace) {
+            _search_backspace(l);
+            l->scroll = 0;
+        } else if (n > 0 && (uint8_t)buf[0] >= 32 &&
+                   strlen(l->search) + (size_t)n < sizeof(l->search)) {
+            strcat(l->search, buf);
+            l->scroll = 0;
+        }
+        _launcher_menu_paint(&env);
+        break;
+    }
+    case MotionNotify: {
+        int x = ev->xmotion.x, y = ev->xmotion.y;
+        if (y < _AM_SEARCH_H) { l->menu_sel = -1; break; }
+        if (x < _AM_CAT_W) {
+            l->menu_sel = -1;
+        } else {
+            int ri = (y - _AM_SEARCH_H - 4) / _AM_ROW;
+            l->menu_sel = (ri >= 0 && ri < _AM_ROWS) ? ri : -1;
+        }
+        _launcher_menu_paint(&env);
+        break;
+    }
+    case ButtonPress:
+        /* wheel scrolls the application list */
+        if (ev->xbutton.button == Button4 ||
+            ev->xbutton.button == Button5) {
+            size_t total = _app_count(l, l->cur_cat, l->search);
+            if (total > (size_t)_AM_ROWS) {
+                int d = ev->xbutton.button == Button4 ? -3 : 3;
+                l->scroll += d;
+                if (l->scroll < 0) l->scroll = 0;
+                if ((size_t)l->scroll + _AM_ROWS > total)
+                    l->scroll = (int)total - _AM_ROWS;
+                if (l->scroll < 0) l->scroll = 0;
+            }
+            _launcher_menu_paint(&env);
+            break;
+        }
+        break;
+    case ButtonRelease: {
+        if (ev->xbutton.button != Button1) {
+            _launcher_menu_close(&env);
+            break;
+        }
+        int x = ev->xbutton.x, y = ev->xbutton.y;
+        if (y < _AM_SEARCH_H) {
+            l->search_focused = true;   /* click focuses the search box */
+            _launcher_menu_paint(&env);
+            break;
+        }
+        if (y >= _AM_QUIT_Y && x < _AM_CAT_W) {
+            /* Quit Session -> open the session actions menu */
+            _launcher_menu_close(&env);
+            vt_panel_user_menu_open(p);
+            break;
+        }
+        if (x < _AM_CAT_W) {
+            /* COMPACT category rows: map the clicked row back to the
+             * table index by walking the same visible sequence */
+            int r = (y - _AM_SEARCH_H - 4) / _AM_ROW;
+            int cat_row = 0, picked = -1;
+            for (int ci = 0; ci < vt_apps_category_count(); ci++) {
+                int n = vt_apps_in_category(l->apps, ci);
+                if (n == 0 && ci != vt_apps_category_count() - 1) continue;
+                if (cat_row == r) { picked = ci; break; }
+                cat_row++;
+            }
+            if (picked >= 0) {
+                l->cur_cat = picked;
+                l->scroll = 0;
+            }
+            _launcher_menu_paint(&env);
+            break;
+        }
+        int ri = (y - _AM_SEARCH_H - 4) / _AM_ROW;
+        const vt_app_t *a = _app_row(l, l->cur_cat, l->search,
+                                     (size_t)(l->scroll + ri));
+        if (a) {
+            char *cmd = vt_apps_launch_cmd(a);
+            vt_logi("launcher: spawn '%s' [%s]", cmd,
+                    a->terminal ? "terminal" : "direct");
+            vt_panel_spawn(cmd);
+            vt_free(cmd);
+            _launcher_menu_close(&env);
+        }
+        break;
+    }
+    default:
+        break;
+    }
 }
 
 static void _launcher_on_click(vt_applet_env_t *env, int x, int y,
@@ -482,4 +515,3 @@ const vt_applet_impl_t _applet_launcher = {
     .render = _launcher_render,
     .on_click = _launcher_on_click,
 };
-
