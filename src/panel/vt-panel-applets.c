@@ -1,7 +1,7 @@
 /*
  * vt-panel-applets.c — Built-in panel applets
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * launcher  — menu of XDG .desktop entries, spawns the selected Exec
  * tasklist  — live window buttons via WM IPC (click: focus/minimize)
@@ -16,287 +16,20 @@
 #define VT_LOG_DOMAIN "panel-applets"
 #include "vt-panel-internal.h"
 #include <vantage/vt-config.h>
+#include <vantage/vt-integrations.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <pwd.h>
+#include <unistd.h>
 
 #if defined(VT_HAVE_ALSA)
 #include <alsa/asoundlib.h>
 #endif
 
-/* ------------------------------------------------------------ launcher */
-typedef struct {
-    char *name;
-    char *exec;
-    char *icon;      /* icon name (unused for drawing yet) */
-} _desk_entry_t;
-
-typedef struct {
-    vt_vec_t entries;     /* _desk_entry_t */
-    bool loaded;
-    Window menu_win;      /* override-redirect popup */
-    XftDraw *menu_draw;
-    int  menu_rows;
-    int  menu_sel;
-    int  scroll;
-} _launcher_t;
-
-static void _launcher_menu_paint(vt_applet_env_t *env);
-static void _launcher_menu_handle(vt_panel_t *p, XEvent *ev);
-static void _launcher_menu_close(vt_applet_env_t *env);
-static void _launcher_menu_open(vt_applet_env_t *env);
-
-static char *_strip_field(char *s) {
-    /* cut at %U/%u/%F/%f placeholders */
-    char *p = strstr(s, "%");
-    if (p) *p = 0;
-    /* trim */
-    return vt_strtrim(s);
-}
-
-static int _desk_cmp(const void *a, const void *b);
-
-static void _load_desktop_dir(_launcher_t *l, const char *dir) {
-    DIR *d = opendir(dir);
-    if (!d) return;
-    struct dirent *de;
-    while ((de = readdir(d))) {
-        if (!vt_strendswith(de->d_name, ".desktop")) continue;
-        char *path = vt_strprintf("%s/%s", dir, de->d_name);
-        size_t len = 0;
-        char *content = vt_file_read_all(path, &len);
-        vt_free(path);
-        if (!content) continue;
-        char *name = NULL, *exec = NULL, *icon = NULL, *nodisplay = NULL,
-             *onlyin = NULL;
-        char *save = NULL;
-        for (char *line = strtok_r(content, "\n", &save); line;
-             line = strtok_r(NULL, "\n", &save)) {
-            if (name && exec && icon) break;
-            if (vt_strstartswith(line, "Name=") && !name)
-                name = vt_strdup(line + 5);
-            else if (vt_strstartswith(line, "Name[") && !name) {
-                char *eq = strchr(line, '=');
-                if (eq) name = vt_strdup(eq + 1);
-            }
-            else if (vt_strstartswith(line, "Exec=") && !exec)
-                exec = vt_strdup(line + 5);
-            else if (vt_strstartswith(line, "Icon=") && !icon)
-                icon = vt_strdup(line + 5);
-            else if (vt_strstartswith(line, "NoDisplay=true"))
-                nodisplay = vt_strdup("1");
-            else if (vt_strstartswith(line, "OnlyShowIn="))
-                onlyin = vt_strdup(line + 12);
-        }
-        vt_free(content);
-        if (nodisplay || !name || !exec) {
-            vt_free(name); vt_free(exec); vt_free(icon);
-            vt_free(nodisplay); vt_free(onlyin);
-            continue;
-        }
-        if (onlyin && !strstr(onlyin, "Vantage") && !strstr(onlyin, "GNOME")
-            && !strstr(onlyin, "XFCE")) {
-            vt_free(name); vt_free(exec); vt_free(icon); vt_free(onlyin);
-            continue;
-        }
-        _desk_entry_t e = { .name = name, .exec = _strip_field(exec),
-                            .icon = icon };
-        vt_vec_push(&l->entries, &e);
-        vt_free(nodisplay);
-        vt_free(onlyin);
-    }
-    closedir(d);
-}
-
-static void _launcher_init(vt_applet_env_t *env) {
-    _launcher_t *l = vt_malloc0(sizeof(*l));
-    vt_vec_init(&l->entries, sizeof(_desk_entry_t), 32);
-    env->state = l;
-}
-
-static void _launcher_fini(vt_applet_env_t *env) {
-    _launcher_t *l = env->state;
-    if (!l) return;
-    for (size_t i = 0; i < l->entries.size; i++) {
-        _desk_entry_t *e = vt_vec_at(&l->entries, i);
-        vt_free(e->name); vt_free(e->exec); vt_free(e->icon);
-    }
-    vt_vec_fini(&l->entries);
-    vt_free(l);
-}
-
-static void _launcher_load(vt_applet_env_t *env) {
-    _launcher_t *l = env->state;
-    if (l->loaded) return;
-    l->loaded = true;
-    char *user = vt_strprintf("%s/.local/share/applications", vt_home_dir());
-    _load_desktop_dir(l, "/usr/share/applications");
-    _load_desktop_dir(l, user);
-    vt_free(user);
-    vt_vec_sort(&l->entries, _desk_cmp);
-    vt_logi("launcher: %zu applications", l->entries.size);
-}
-
-static int _desk_cmp(const void *a, const void *b) {
-    const _desk_entry_t *ea = a, *eb = b;
-    return strcasecmp(ea->name, eb->name);
-}
-
-static int _launcher_measure(vt_applet_env_t *env) {
-    _launcher_load(env);
-    return 34;
-}
-
-static void _launcher_render(vt_applet_env_t *env) {
-    vt_pctx_t *ctx = env->ctx;
-    int cx = env->area.x + env->area.w / 2;
-    int cy = env->area.y + env->area.h / 2;
-    /* a simple grid "app launcher" glyph */
-    vt_pcol_t fg = { 0xec, 0xee, 0xf0, 0xff };
-    for (int r = 0; r < 3; r++)
-        for (int c = 0; c < 3; c++)
-            vt_pctx_rect(ctx, cx - 7 + c * 6, cy - 7 + r * 6, 4, 4, fg);
-}
-
-static void _launcher_menu_paint(vt_applet_env_t *env) {
-    _launcher_t *l = env->state;
-    vt_pctx_t *ctx = env->ctx;
-    if (!l->menu_win || !l->menu_draw) return;
-    Display *dpy = ctx->dpy;
-    int w = 260, row_h = 24;
-    int h = l->menu_rows * row_h + 8;
-    XRenderColor bg = { .red = 0x1a1a, .green = 0x1c1c, .blue = 0x2222,
-                        .alpha = 0xffff };
-    XRenderPictFormat *fmt = XRenderFindVisualFormat(dpy,
-        DefaultVisual(dpy, DefaultScreen(dpy)));
-    Picture pic = XRenderCreatePicture(dpy, l->menu_win, fmt, 0, NULL);
-    XRenderFillRectangle(dpy, PictOpSrc, pic, &bg, 0, 0, (unsigned)w,
-                         (unsigned)h);
-    for (int i = 0; i < l->menu_rows; i++) {
-        _desk_entry_t *e = vt_vec_at(&l->entries,
-                                     (size_t)(i + l->scroll));
-        bool sel = (i == l->menu_sel);
-        if (sel) {
-            XRenderColor hi = { .red = 0x4f4f, .green = 0x9a9a,
-                                .blue = 0xdcdc, .alpha = 0xffff };
-            XRenderFillRectangle(dpy, PictOpOver, pic, &hi, 2,
-                                  (short)(4 + i * row_h), (unsigned)(w - 4),
-                                  (unsigned)(row_h - 2));
-        }
-        XRenderColor tc = sel
-            ? (XRenderColor){ .red = 0xffff, .green = 0xffff,
-                              .blue = 0xffff, .alpha = 0xffff }
-            : (XRenderColor){ .red = 0xecec, .green = 0xeeee,
-                              .blue = 0xf0f0, .alpha = 0xffff };
-        XftColor fc;
-        XftColorAllocValue(dpy, DefaultVisual(dpy, DefaultScreen(dpy)),
-                      DefaultColormap(dpy, DefaultScreen(dpy)), &tc, &fc);
-        XftDrawStringUtf8(l->menu_draw, &fc, ctx->font, 10,
-                          4 + i * row_h + row_h - 7,
-                          (const FcChar8 *)e->name, (int)strlen(e->name));
-    }
-    XRenderFreePicture(dpy, pic);
-}
-
-static void _launcher_menu_handle(vt_panel_t *p, XEvent *ev) {
-    vt_applet_env_t env = vt_panel_find_env(p, VT_PANEL_APPLET_LAUNCHER);
-    _launcher_t *l = env.state;
-    if (!l || ev->xany.window != l->menu_win) return;
-    switch (ev->type) {
-    case Expose:
-        _launcher_menu_paint(&env);
-        break;
-    case MotionNotify:
-        l->menu_sel = (ev->xmotion.y - 4) / 24;
-        _launcher_menu_paint(&env);
-        break;
-    case ButtonRelease: {
-        if (ev->xbutton.button == Button1) {
-            int idx = (ev->xbutton.y - 4) / 24 + l->scroll;
-            if (idx >= 0 && (size_t)idx < l->entries.size) {
-                _desk_entry_t *e = vt_vec_at(&l->entries, (size_t)idx);
-                vt_logi("launcher: spawn '%s'", e->exec);
-                vt_panel_spawn(e->exec);
-            }
-            _launcher_menu_close(&env);
-        } else {
-            _launcher_menu_close(&env);
-        }
-        break;
-    }
-    default:
-        break;
-    }
-}
-
-static void _launcher_menu_close(vt_applet_env_t *env) {
-    _launcher_t *l = env->state;
-    vt_pctx_t *ctx = env->ctx;
-    if (!l->menu_win) return;
-    if (l->menu_draw) { XftDrawDestroy(l->menu_draw); l->menu_draw = NULL; }
-    XDestroyWindow(ctx->dpy, l->menu_win);
-    l->menu_win = 0;
-    vt_panel_set_popup(env->panel, 0, NULL);
-    XFlush(ctx->dpy);
-    vt_panel_invalidate(env->panel);
-}
-
-static void _launcher_menu_open(vt_applet_env_t *env) {
-    _launcher_t *l = env->state;
-    vt_pctx_t *ctx = env->ctx;
-    if (l->menu_win) return;
-    _launcher_load(env);
-    if (l->entries.size == 0) return;
-    if (l->entries.size > 16) l->menu_rows = 16;
-    else l->menu_rows = (int)l->entries.size;
-    l->scroll = 0;
-    l->menu_sel = -1;
-    int w = 260, row_h = 24;
-    int h = l->menu_rows * row_h + 8;
-    int x = env->area.x;
-    int y = env->area.y + env->area.h + 4;
-    XSetWindowAttributes wa = { .override_redirect = True,
-                                .background_pixel = 0x22221c1a,
-                                .event_mask = ExposureMask |
-                                              ButtonPressMask |
-                                              ButtonReleaseMask |
-                                              PointerMotionMask };
-    l->menu_win = XCreateWindow(ctx->dpy, DefaultRootWindow(ctx->dpy),
-                                x, y, (unsigned)w, (unsigned)h, 1,
-                                CopyFromParent, InputOutput, CopyFromParent,
-                                CWOverrideRedirect | CWBackPixel |
-                                CWEventMask, &wa);
-    l->menu_draw = XftDrawCreate(ctx->dpy, l->menu_win,
-                                 DefaultVisual(ctx->dpy,
-                                               DefaultScreen(ctx->dpy)),
-                                 DefaultColormap(ctx->dpy,
-                                                 DefaultScreen(ctx->dpy)));
-    XMapWindow(ctx->dpy, l->menu_win);
-    vt_panel_set_popup(env->panel, l->menu_win,
-                       _launcher_menu_handle);
-    XFlush(ctx->dpy);
-}
-
-static void _launcher_on_click(vt_applet_env_t *env, int x, int y,
-                               int button) {
-    (void)x; (void)y; (void)button;
-    _launcher_t *l = env->state;
-    if (l->menu_win) _launcher_menu_close(env);
-    else _launcher_menu_open(env);
-}
-
-const vt_applet_impl_t _applet_launcher = {
-
-    .name = "launcher",
-    .init = _launcher_init,
-    .fini = _launcher_fini,
-    .measure = _launcher_measure,
-    .render = _launcher_render,
-    .on_click = _launcher_on_click,
-};
 
 /* ------------------------------------------------------------ tasklist */
 typedef struct {
@@ -510,15 +243,28 @@ static void _wsp_render(vt_applet_env_t *env) {
     vt_pctx_t *ctx = env->ctx;
     for (int i = 0; i < w->count; i++) {
         int x = env->area.x + i * (WSP_BTN + 4);
-        vt_pcol_t bg = (i == w->current)
-            ? (vt_pcol_t){ 0x4f, 0x9a, 0xdc, 0xff }
-            : (vt_pcol_t){ 0x26, 0x28, 0x2e, 0xff };
-        vt_pctx_rounded_rect(ctx, x, env->area.y, WSP_BTN, env->area.h, 4, bg);
+        int y = env->area.y, h = env->area.h;
+        bool active = (i == w->current);
+        /* glow: brighter fill + accent ring on the active workspace */
+        vt_pcol_t fill = active ? (vt_pcol_t){ 0x6f, 0xaa, 0xe8, 0xff }
+                                : (vt_pcol_t){ 0x26, 0x28, 0x2e, 0xff };
+        vt_pctx_rounded_rect(ctx, x, y, WSP_BTN, h, 7, fill);
+        if (active) {
+            /* accent ring (1px inset outline) */
+            vt_pcol_t ring = { 0xec, 0xee, 0xf0, 0xff };
+            vt_pcol_t glow = { 0x4f, 0x9a, 0xdc, 0x60 };
+            vt_pctx_rect(ctx, x + 2, y + 1, WSP_BTN - 4, 1, glow);
+            vt_pctx_rect(ctx, x + 2, y + h - 2, WSP_BTN - 4, 1, ring);
+            vt_pctx_rect(ctx, x + 1, y + 2, 1, h - 4, ring);
+            vt_pctx_rect(ctx, x + WSP_BTN - 2, y + 2, 1, h - 4, ring);
+        }
         char n[16];
         snprintf(n, sizeof(n), "%d", i + 1);
-        int ty = env->area.y + env->area.h / 2 + vt_pctx_text_height(ctx) / 2 - 2;
-        vt_pctx_text(ctx, x + WSP_BTN / 2 - 3, ty, n, false,
-                     (vt_pcol_t){ 0xec, 0xee, 0xf0, 0xff });
+        vt_pcol_t tc = active ? (vt_pcol_t){ 0xff, 0xff, 0xff, 0xff }
+                              : (vt_pcol_t){ 0x90, 0x93, 0x99, 0xff };
+        int tw = vt_pctx_text_width(ctx, n, active);
+        vt_pctx_text(ctx, x + (WSP_BTN - tw) / 2, y + h / 2 +
+                     vt_pctx_text_height(ctx) / 2 - 2, n, active, tc);
     }
 }
 static void _wsp_on_click(vt_applet_env_t *env, int x, int y, int button) {
@@ -546,6 +292,219 @@ const vt_applet_impl_t _applet_workspaces = {
 };
 
 /* --------------------------------------------------------------- clock */
+typedef struct {
+    Window win;       /* calendar popup */
+    XftDraw *draw;
+    int view_year, view_month;   /* what the calendar shows */
+    int sel;                    /* hovered day, 0 = none */
+} _clock_t;
+
+#define _CAL_W 232
+#define _CAL_H 224
+#define _CAL_CELL 28
+
+static void _clock_cal_paint(vt_applet_env_t *env);
+static void _clock_cal_close(vt_applet_env_t *env);
+static void _clock_cal_handle(vt_panel_t *p, XEvent *ev);
+
+static void _clock_cal_open(vt_applet_env_t *env) {
+    _clock_t *k = env->state;
+    vt_pctx_t *ctx = env->ctx;
+    if (k->win) return;
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    k->view_year = tm.tm_year + 1900;
+    k->view_month = tm.tm_mon;          /* 0-11 */
+    k->sel = 0;
+    int x = env->area.x + env->area.w - _CAL_W;
+    if (x < 4) x = 4;
+    int y = env->area.y + env->area.h + 4;
+    XSetWindowAttributes wa = { .override_redirect = True,
+                                .background_pixel = 0x22221c1a,
+                                .event_mask = ExposureMask |
+                                              ButtonPressMask |
+                                              ButtonReleaseMask |
+                                              PointerMotionMask };
+    k->win = XCreateWindow(ctx->dpy, DefaultRootWindow(ctx->dpy),
+                           x, y, (unsigned)_CAL_W, (unsigned)_CAL_H, 1,
+                           CopyFromParent, InputOutput, CopyFromParent,
+                           CWOverrideRedirect | CWBackPixel | CWEventMask,
+                           &wa);
+    k->draw = XftDrawCreate(ctx->dpy, k->win,
+                            DefaultVisual(ctx->dpy, DefaultScreen(ctx->dpy)),
+                            DefaultColormap(ctx->dpy,
+                                            DefaultScreen(ctx->dpy)));
+    XMapWindow(ctx->dpy, k->win);
+    vt_panel_set_popup(env->panel, k->win, _clock_cal_handle);
+    XFlush(ctx->dpy);
+    _clock_cal_paint(env);
+}
+
+static void _clock_cal_close(vt_applet_env_t *env) {
+    _clock_t *k = env->state;
+    vt_pctx_t *ctx = env->ctx;
+    if (!k->win) return;
+    if (k->draw) { XftDrawDestroy(k->draw); k->draw = NULL; }
+    XDestroyWindow(ctx->dpy, k->win);
+    k->win = 0;
+    vt_panel_set_popup(env->panel, 0, NULL);
+    XFlush(ctx->dpy);
+    vt_panel_invalidate(env->panel);
+}
+
+static void _clock_cal_paint(vt_applet_env_t *env) {
+    _clock_t *k = env->state;
+    vt_pctx_t *ctx = env->ctx;
+    if (!k->win || !k->draw) return;
+    Display *dpy = ctx->dpy;
+    XRenderPictFormat *fmt = XRenderFindVisualFormat(
+        dpy, DefaultVisual(dpy, DefaultScreen(dpy)));
+    Picture pic = XRenderCreatePicture(dpy, k->win, fmt, 0, NULL);
+    XRenderColor bg = { .red = 0x1a1a, .green = 0x1c1c, .blue = 0x2222,
+                        .alpha = 0xffff };
+    XRenderFillRectangle(dpy, PictOpSrc, pic, &bg, 0, 0, (unsigned)_CAL_W,
+                          (unsigned)_CAL_H);
+
+    /* header: ‹ month year › */
+    static const char *const mon[] = { "January", "February", "March",
+        "April", "May", "June", "July", "August", "September", "October",
+        "November", "December" };
+    char head[64];
+    snprintf(head, sizeof(head), "%s %d", mon[k->view_month], k->view_year);
+    XRenderColor white = { .red = 0xecec, .green = 0xeeee, .blue = 0xf0f0,
+                           .alpha = 0xffff };
+    XftColor fc;
+    XftColorAllocValue(dpy, DefaultVisual(dpy, DefaultScreen(dpy)),
+                       DefaultColormap(dpy, DefaultScreen(dpy)), &white, &fc);
+    XftDrawStringUtf8(k->draw, &fc, ctx->font_bold, 44, 24,
+                      (const FcChar8 *)head, (int)strlen(head));
+    /* month arrows */
+    XftDrawStringUtf8(k->draw, &fc, ctx->font_bold, 12, 24,
+                      (const FcChar8 *)"\xe2\x80\xb9", 3);
+    XftDrawStringUtf8(k->draw, &fc, ctx->font_bold, _CAL_W - 20, 24,
+                      (const FcChar8 *)"\xe2\x80\xba", 3);
+
+    /* weekday header (Monday-first, locale-independent) */
+    static const char *const wd[] = { "Mo", "Tu", "We", "Th", "Fr", "Sa",
+                                      "Su" };
+    XRenderColor dim = { .red = 0x9090, .green = 0x9393, .blue = 0x9999,
+                         .alpha = 0xffff };
+    XftColor fd;
+    XftColorAllocValue(dpy, DefaultVisual(dpy, DefaultScreen(dpy)),
+                       DefaultColormap(dpy, DefaultScreen(dpy)), &dim, &fd);
+    for (int i = 0; i < 7; i++)
+        XftDrawStringUtf8(k->draw, &fd, ctx->font, 8 + i * _CAL_CELL + 6, 48,
+                          (const FcChar8 *)wd[i], (int)strlen(wd[i]));
+
+    /* day grid */
+    struct tm first = { .tm_year = k->view_year - 1900,
+                        .tm_mon = k->view_month, .tm_mday = 1 };
+    mktime(&first);
+    int lead = (first.tm_wday + 6) % 7;          /* Monday-first offset */
+    int days = 31;
+    while (days > 28) {
+        struct tm probe = { .tm_year = k->view_year - 1900,
+                            .tm_mon = k->view_month, .tm_mday = days };
+        if (mktime(&probe) == -1 || probe.tm_mon != k->view_month) days--;
+        else break;
+    }
+    time_t now = time(NULL);
+    struct tm tmn;
+    localtime_r(&now, &tmn);
+    for (int d = 0; d < days; d++) {
+        int col = (lead + d) % 7;
+        int row = (lead + d) / 7;
+        int cx = 8 + col * _CAL_CELL;
+        int cy = 56 + row * _CAL_CELL;
+        if (cy + _CAL_CELL > _CAL_H - 4) break;
+        char ds[8];
+        snprintf(ds, sizeof(ds), "%d", d + 1);
+        bool today = (k->view_year == tmn.tm_year + 1900 &&
+                      k->view_month == tmn.tm_mon && d + 1 == tmn.tm_mday);
+        bool hovered = (k->sel == d + 1);
+        if (today) {
+            XRenderColor acc = { .red = 0x4f4f, .green = 0x9a9a,
+                                 .blue = 0xdcdc, .alpha = 0xffff };
+            XRenderFillRectangle(dpy, PictOpOver, pic, &acc, (short)cx,
+                                 (short)cy, (unsigned)(_CAL_CELL - 4),
+                                 (unsigned)(_CAL_CELL - 4));
+        } else if (hovered) {
+            XRenderColor hov = { .red = 0x3939, .green = 0x3e3e,
+                                 .blue = 0x4848, .alpha = 0xffff };
+            XRenderFillRectangle(dpy, PictOpOver, pic, &hov, (short)cx,
+                                 (short)cy, (unsigned)(_CAL_CELL - 4),
+                                 (unsigned)(_CAL_CELL - 4));
+        }
+        XRenderColor tc = today
+            ? (XRenderColor){ .red = 0xffff, .green = 0xffff,
+                              .blue = 0xffff, .alpha = 0xffff }
+            : white;
+        XftColor fday;
+        XftColorAllocValue(dpy, DefaultVisual(dpy, DefaultScreen(dpy)),
+                           DefaultColormap(dpy, DefaultScreen(dpy)), &tc,
+                           &fday);
+        XftDrawStringUtf8(k->draw, today ? &fday : &fc,
+                          today ? ctx->font_bold : ctx->font,
+                          cx + _CAL_CELL / 2 - 3, cy + _CAL_CELL - 9,
+                          (const FcChar8 *)ds, (int)strlen(ds));
+    }
+    XRenderFreePicture(dpy, pic);
+}
+
+static void _clock_cal_handle(vt_panel_t *p, XEvent *ev) {
+    vt_applet_env_t env = vt_panel_find_env(p, VT_PANEL_APPLET_CLOCK);
+    _clock_t *k = env.state;
+    if (!k || ev->xany.window != k->win) return;
+    switch (ev->type) {
+    case Expose:
+        _clock_cal_paint(&env);
+        break;
+    case MotionNotify: {
+        int x = ev->xmotion.x, y = ev->xmotion.y;
+        if (y >= 56 && y < _CAL_H - 4) {
+            int col = (x - 8) / _CAL_CELL, row = (y - 56) / _CAL_CELL;
+            struct tm first = { .tm_year = k->view_year - 1900,
+                                .tm_mon = k->view_month, .tm_mday = 1 };
+            mktime(&first);
+            int lead = (first.tm_wday + 6) % 7;
+            int d = row * 7 + col - lead + 1;
+            k->sel = (d >= 1 && d <= 31) ? d : 0;
+        } else {
+            k->sel = 0;
+        }
+        _clock_cal_paint(&env);
+        break;
+    }
+    case ButtonRelease: {
+        int x = ev->xbutton.x, y = ev->xbutton.y;
+        if (ev->xbutton.button != Button1) {
+            _clock_cal_close(&env);
+            break;
+        }
+        if (y < 36) {
+            if (x < 32) {                 /* previous month */
+                if (--k->view_month < 0) { k->view_month = 11;
+                                           k->view_year--; }
+            } else if (x > _CAL_W - 32) { /* next month */
+                if (++k->view_month > 11) { k->view_month = 0;
+                                            k->view_year++; }
+            } else {
+                _clock_cal_close(&env);
+                break;
+            }
+            k->sel = 0;
+            _clock_cal_paint(&env);
+        } else {
+            _clock_cal_close(&env);
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
 static void _clock_render(vt_applet_env_t *env) {
     vt_pctx_t *ctx = env->ctx;
     char buf[64];
@@ -569,8 +528,25 @@ static int _clock_measure(vt_applet_env_t *env) {
     strftime(buf, sizeof(buf), "%a %d %b  %H:%M", &tm);
     return vt_pctx_text_width(env->ctx, buf, false) + 10;
 }
+static void _clock_init(vt_applet_env_t *env) {
+    env->state = vt_malloc0(sizeof(_clock_t));
+}
+static void _clock_fini(vt_applet_env_t *env) {
+    _clock_t *k = env->state;
+    if (k && k->win) _clock_cal_close(env);
+    vt_free(env->state);
+}
+static void _clock_on_click(vt_applet_env_t *env, int x, int y, int button) {
+    (void)x; (void)y;
+    _clock_t *k = env->state;
+    if (button != 1) return;
+    if (k->win) _clock_cal_close(env);
+    else _clock_cal_open(env);
+}
 const vt_applet_impl_t _applet_clock = {
-    .name = "clock", .render = _clock_render, .measure = _clock_measure,
+    .name = "clock", .init = _clock_init, .fini = _clock_fini,
+    .render = _clock_render, .measure = _clock_measure,
+    .on_click = _clock_on_click,
 };
 
 /* -------------------------------------------------------------- volume */
@@ -578,6 +554,9 @@ typedef struct {
     int level;      /* 0..100 */
     bool muted;
     bool ok;
+    Window win;     /* slider popup */
+    XftDraw *draw;
+    bool dragging;
 } _vol_t;
 
 #if defined(VT_HAVE_ALSA)
@@ -608,6 +587,33 @@ static bool _vol_read(_vol_t *v) {
     v->ok = true;
     return true;
 }
+static bool _vol_set(int level, bool mute) {
+    if (level < 0) level = 0;
+    if (level > 100) level = 100;
+    snd_mixer_t *h = NULL;
+    if (snd_mixer_open(&h, 0) < 0) return false;
+    if (snd_mixer_attach(h, "default") < 0 ||
+        snd_mixer_selem_register(h, NULL, NULL) < 0 ||
+        snd_mixer_load(h) < 0) {
+        snd_mixer_close(h);
+        return false;
+    }
+    snd_mixer_selem_id_t *sid = NULL;
+    snd_mixer_selem_id_alloca(&sid);
+    snd_mixer_selem_id_set_index(sid, 0);
+    snd_mixer_selem_id_set_name(sid, "Master");
+    snd_mixer_elem_t *el = snd_mixer_find_selem(h, sid);
+    if (el) {
+        long mn = 0, mx = 0;
+        snd_mixer_selem_get_playback_volume_range(el, &mn, &mx);
+        long lv = mn + (mx - mn) * level / 100;
+        snd_mixer_selem_set_playback_volume_all(el, lv);
+        if (snd_mixer_selem_has_playback_switch(el))
+            snd_mixer_selem_set_playback_switch_all(el, mute ? 0 : 1);
+    }
+    snd_mixer_close(h);
+    return el != NULL;
+}
 static void _vol_toggle(void) {
     snd_mixer_t *h = NULL;
     if (snd_mixer_open(&h, 0) < 0) return;
@@ -630,24 +636,190 @@ static void _vol_toggle(void) {
 }
 #else
 static bool _vol_read(_vol_t *v) { (void)v; return false; }
+static bool _vol_set(int level, bool mute) { (void)level; (void)mute; return false; }
 static void _vol_toggle(void) {}
 #endif
+
+#define _VOL_W 36
+#define _VOL_H 150
+
+static void _vol_popup_paint(vt_applet_env_t *env);
+static void _vol_popup_close(vt_applet_env_t *env);
+static void _vol_popup_handle(vt_panel_t *p, XEvent *ev);
+
+static void _vol_popup_open(vt_applet_env_t *env) {
+    _vol_t *v = env->state;
+    vt_pctx_t *ctx = env->ctx;
+    if (v->win) return;
+    v->dragging = false;
+    int x = env->area.x;
+    int y = env->area.y + env->area.h + 4;
+    XSetWindowAttributes wa = { .override_redirect = True,
+                                .background_pixel = 0x22221c1a,
+                                .event_mask = ExposureMask |
+                                              ButtonPressMask |
+                                              ButtonReleaseMask |
+                                              PointerMotionMask };
+    v->win = XCreateWindow(ctx->dpy, DefaultRootWindow(ctx->dpy),
+                           x, y, (unsigned)_VOL_W, (unsigned)_VOL_H, 1,
+                           CopyFromParent, InputOutput, CopyFromParent,
+                           CWOverrideRedirect | CWBackPixel | CWEventMask,
+                           &wa);
+    v->draw = XftDrawCreate(ctx->dpy, v->win,
+                            DefaultVisual(ctx->dpy, DefaultScreen(ctx->dpy)),
+                            DefaultColormap(ctx->dpy, DefaultScreen(ctx->dpy)));
+    XMapWindow(ctx->dpy, v->win);
+    vt_panel_set_popup(env->panel, v->win, _vol_popup_handle);
+    XFlush(ctx->dpy);
+    _vol_popup_paint(env);
+}
+
+static void _vol_popup_close(vt_applet_env_t *env) {
+    _vol_t *v = env->state;
+    vt_pctx_t *ctx = env->ctx;
+    if (!v->win) return;
+    if (v->draw) { XftDrawDestroy(v->draw); v->draw = NULL; }
+    XDestroyWindow(ctx->dpy, v->win);
+    v->win = 0;
+    vt_panel_set_popup(env->panel, 0, NULL);
+    XFlush(ctx->dpy);
+    vt_panel_invalidate(env->panel);
+}
+
+static void _vol_popup_paint(vt_applet_env_t *env) {
+    _vol_t *v = env->state;
+    vt_pctx_t *ctx = env->ctx;
+    if (!v->win || !v->draw) return;
+    Display *dpy = ctx->dpy;
+    XRenderPictFormat *fmt = XRenderFindVisualFormat(
+        dpy, DefaultVisual(dpy, DefaultScreen(dpy)));
+    Picture pic = XRenderCreatePicture(dpy, v->win, fmt, 0, NULL);
+    XRenderColor bg = { .red = 0x1a1a, .green = 0x1c1c, .blue = 0x2222,
+                        .alpha = 0xffff };
+    XRenderFillRectangle(dpy, PictOpSrc, pic, &bg, 0, 0, (unsigned)_VOL_W,
+                          (unsigned)_VOL_H);
+    /* vertical slider track: 6px wide, 12px margins */
+    int track_x = (_VOL_W - 8) / 2;
+    int track_y = 14, track_h = _VOL_H - 58;
+    XRenderColor track = { .red = 0x3939, .green = 0x3e3e, .blue = 0x4848,
+                           .alpha = 0xffff };
+    XRenderFillRectangle(dpy, PictOpSrc, pic, &track, (short)track_x,
+                         (short)track_y, 8u, (unsigned)track_h);
+    /* filled part (from the bottom up) */
+    int fill_h = track_h * v->level / 100;
+    XRenderColor fillc = v->muted
+        ? (XRenderColor){ .red = 0x9090, .green = 0x9393, .blue = 0x9999,
+                          .alpha = 0xffff }
+        : (XRenderColor){ .red = 0x4f4f, .green = 0x9a9a, .blue = 0xdcdc,
+                          .alpha = 0xffff };
+    XRenderFillRectangle(dpy, PictOpSrc, pic, &fillc, (short)track_x,
+                         (short)(track_y + track_h - fill_h), 8u,
+                         (unsigned)fill_h);
+    /* percentage label */
+    char pc[8];
+    snprintf(pc, sizeof(pc), "%d%%", v->level);
+    XRenderColor tc = { .red = 0xecec, .green = 0xeeee, .blue = 0xf0f0,
+                        .alpha = 0xffff };
+    XftColor fcv;
+    XftColorAllocValue(dpy, DefaultVisual(dpy, DefaultScreen(dpy)),
+                       DefaultColormap(dpy, DefaultScreen(dpy)), &tc, &fcv);
+    int tw = 0;
+    {
+        XGlyphInfo gi;
+        XftTextExtentsUtf8(dpy, ctx->font, (const FcChar8 *)pc,
+                           (int)strlen(pc), &gi);
+        tw = gi.xOff;
+    }
+    XftDrawStringUtf8(v->draw, &fcv, ctx->font, (_VOL_W - tw) / 2,
+                      _VOL_H - 30, (const FcChar8 *)pc, (int)strlen(pc));
+    /* mute button at the bottom */
+    XRenderColor mbtn = v->muted
+        ? (XRenderColor){ .red = 0xa8a8, .green = 0x5454, .blue = 0x3030,
+                          .alpha = 0xffff }
+        : (XRenderColor){ .red = 0x3939, .green = 0x3e3e, .blue = 0x4848,
+                          .alpha = 0xffff };
+    XRenderFillRectangle(dpy, PictOpSrc, pic, &mbtn, 6,
+                         (short)(_VOL_H - 24), (unsigned)(_VOL_W - 12), 18);
+    const char *mlabel = v->muted ? "unmute" : "mute";
+    XGlyphInfo gm;
+    XftTextExtentsUtf8(dpy, ctx->font, (const FcChar8 *)mlabel,
+                       (int)strlen(mlabel), &gm);
+    XftDrawStringUtf8(v->draw, &fcv, ctx->font, (_VOL_W - gm.xOff) / 2,
+                      _VOL_H - 11, (const FcChar8 *)mlabel,
+                      (int)strlen(mlabel));
+    XRenderFreePicture(dpy, pic);
+}
+
+static void _vol_popup_handle(vt_panel_t *p, XEvent *ev) {
+    vt_applet_env_t env = vt_panel_find_env(p, VT_PANEL_APPLET_VOLUME);
+    _vol_t *v = env.state;
+    if (!v || ev->xany.window != v->win) return;
+    int track_y = 14, track_h = _VOL_H - 58;
+    switch (ev->type) {
+    case Expose:
+        _vol_popup_paint(&env);
+        break;
+    case MotionNotify:
+    case ButtonPress: {
+        int y = ev->type == MotionNotify ? ev->xmotion.y : ev->xbutton.y;
+        if (ev->type == ButtonPress || v->dragging) {
+            int lvl = (track_y + track_h - y) * 100 / track_h;
+            if (lvl < 0) lvl = 0;
+            if (lvl > 100) lvl = 100;
+            v->level = lvl;
+            v->muted = false;
+            _vol_set(v->level, v->muted);
+        }
+        if (ev->type == ButtonPress) v->dragging = true;
+        _vol_popup_paint(&env);
+        vt_panel_invalidate(p);
+        break;
+    }
+    case ButtonRelease: {
+        int y = ev->xbutton.y;
+        v->dragging = false;
+        if (y > _VOL_H - 24) {           /* mute button */
+            v->muted = !v->muted;
+            _vol_set(v->level, v->muted);
+        }
+        _vol_popup_paint(&env);
+        vt_panel_invalidate(p);
+        break;
+    }
+    default:
+        break;
+    }
+}
 
 static void _vol_render(vt_applet_env_t *env) {
     _vol_t *v = env->state;
     vt_pctx_t *ctx = env->ctx;
     if (!v->ok) return;
+    /* speaker glyph + percentage */
+    int x = env->area.x, y = env->area.y, h = env->area.h;
+    vt_pcol_t fg = { 0xec, 0xee, 0xf0, 0xff };
+    if (v->muted) fg.a = 0x90;
+    vt_pctx_rect(ctx, x + 4, y + h / 2 - 3, 4, 6, fg);       /* driver  */
+    vt_pctx_rect(ctx, x + 8, y + h / 2 - 6, 3, 12, fg);      /* cone    */
+    if (!v->muted) {
+        vt_pctx_rect(ctx, x + 13, y + h / 2 - 4, 1, 2, fg);  /* wave 1 */
+        vt_pctx_rect(ctx, x + 15, y + h / 2 - 6, 1, 4, fg);
+        vt_pctx_rect(ctx, x + 13, y + h / 2 + 2, 1, 2, fg);
+        vt_pctx_rect(ctx, x + 15, y + h / 2 + 2, 1, 4, fg);
+    } else {
+        vt_pctx_rect(ctx, x + 14, y + h / 2 - 5, 1, 2, fg);  /* X */
+        vt_pctx_rect(ctx, x + 16, y + h / 2 - 3, 1, 2, fg);
+        vt_pctx_rect(ctx, x + 16, y + h / 2 + 1, 1, 2, fg);
+        vt_pctx_rect(ctx, x + 18, y + h / 2 - 1, 1, 2, fg);
+    }
     char buf[24];
-    if (v->muted) snprintf(buf, sizeof(buf), "vol %d%% [muted]", v->level);
-    else snprintf(buf, sizeof(buf), "vol %d%%", v->level);
-    int tw = vt_pctx_text_width(ctx, buf, false);
-    int ty = env->area.y + env->area.h / 2 + vt_pctx_text_height(ctx) / 2 - 2;
-    vt_pctx_text(ctx, env->area.x + env->area.w - tw, ty, buf, false,
-                 (vt_pcol_t){ 0xec, 0xee, 0xf0, 0xff });
+    snprintf(buf, sizeof(buf), "%d%%", v->level);
+    int ty = y + h / 2 + vt_pctx_text_height(ctx) / 2 - 2;
+    vt_pctx_text(ctx, x + 24, ty, buf, false, fg);
 }
 static int _vol_measure(vt_applet_env_t *env) {
     _vol_t *v = env->state;
-    return v->ok ? 78 : 0;
+    return v->ok ? 56 : 0;
 }
 static void _vol_tick(vt_applet_env_t *env, uint64_t now) {
     (void)now;
@@ -655,17 +827,40 @@ static void _vol_tick(vt_applet_env_t *env, uint64_t now) {
     _vol_read(v);
 }
 static void _vol_click(vt_applet_env_t *env, int x, int y, int button) {
-    (void)env; (void)x; (void)y;
-    if (button == 1) _vol_toggle();
+    (void)x; (void)y;
+    _vol_t *v = env->state;
+    if (button == 1) {
+        if (v->win) _vol_popup_close(env);
+        else _vol_popup_open(env);
+    } else if (button == 2) {
+        _vol_toggle();
+        _vol_read(v);
+    }
+}
+static void _vol_wheel(vt_applet_env_t *env, int dir) {
+    _vol_t *v = env->state;
+    int lvl = v->level + dir * 5;
+    if (lvl < 0) lvl = 0;
+    if (lvl > 100) lvl = 100;
+    v->level = lvl;
+    v->muted = false;
+    _vol_set(v->level, v->muted);
+    vt_panel_invalidate(env->panel);
 }
 static void _vol_init(vt_applet_env_t *env) {
     _vol_t *v = vt_malloc0(sizeof(*v));
     env->state = v;
     _vol_read(v);
 }
+static void _vol_fini(vt_applet_env_t *env) {
+    _vol_t *v = env->state;
+    if (v && v->win) _vol_popup_close(env);
+    vt_free(v);
+}
 const vt_applet_impl_t _applet_volume = {
-    .name = "volume", .init = _vol_init, .render = _vol_render,
-    .measure = _vol_measure, .on_tick = _vol_tick, .on_click = _vol_click,
+    .name = "volume", .init = _vol_init, .fini = _vol_fini,
+    .render = _vol_render, .measure = _vol_measure, .on_tick = _vol_tick,
+    .on_click = _vol_click, .on_wheel = _vol_wheel,
 };
 
 /* ------------------------------------------------------------- network */
@@ -868,4 +1063,311 @@ static void _tray_render(vt_applet_env_t *env) {
 const vt_applet_impl_t _applet_tray = {
     .name = "tray", .init = _tray_init, .fini = _tray_fini,
     .measure = _tray_measure, .render = _tray_render,
+};
+
+/* ----------------------------------------------------------------- user */
+/* Username + session menu: the last element on the panel. Actions use the
+ * real system mechanisms — vt-integrations power hooks (logind/elogind
+ * via systemctl/loginctl, then direct ioctls) and the session-manager
+ * IPC socket for logout. Nothing is faked; failures are logged. */
+typedef struct {
+    char name[48];
+    Window win;      /* session menu popup */
+    XftDraw *draw;
+    int sel;         /* hovered row */
+    char *status;    /* one-line action feedback */
+} _user_t;
+
+enum {
+    _UA_LOCK = 0, _UA_SUSPEND, _UA_SWITCH, _UA_LOGOUT, _UA_REBOOT,
+    _UA_SHUTDOWN, _UA_EXIT, _UA_COUNT
+};
+static const char *const _user_actions[_UA_COUNT] = {
+    "Lock Screen", "Suspend", "Switch User", "Log Out", "Reboot",
+    "Shutdown", "Exit Session",
+};
+
+#define _UM_W 190
+#define _UM_ROW 26
+
+static void _user_menu_paint(vt_applet_env_t *env);
+static void _user_menu_close(vt_applet_env_t *env);
+
+static void _user_init(vt_applet_env_t *env) {
+    _user_t *u = vt_malloc0(sizeof(*u));
+    const char *n = getenv("USER");
+    if ((!n || !*n)) {
+        struct passwd *pw = getpwuid(getuid());
+        n = pw ? pw->pw_name : "user";
+    }
+    snprintf(u->name, sizeof(u->name), "%s", n);
+    u->sel = -1;
+    env->state = u;
+}
+static void _user_fini(vt_applet_env_t *env) {
+    _user_t *u = env->state;
+    if (u) {
+        if (u->win) _user_menu_close(env);
+        vt_free(u->status);
+        vt_free(u);
+    }
+}
+static int _user_measure(vt_applet_env_t *env) {
+    _user_t *u = env->state;
+    return vt_pctx_text_width(env->ctx, u->name, false) + 34;
+}
+static void _user_render(vt_applet_env_t *env) {
+    _user_t *u = env->state;
+    vt_pctx_t *ctx = env->ctx;
+    int x = env->area.x, y = env->area.y, h = env->area.h;
+    /* avatar disc + name + menu caret */
+    vt_pcol_t accent = { 0x4f, 0x9a, 0xdc, 0xff };
+    vt_pctx_rounded_rect(ctx, x + 6, y + 4, h - 8, h - 8, (h - 8) / 2, accent);
+    vt_pcol_t fg = { 0xff, 0xff, 0xff, 0xff };
+    /* head + shoulders glyph */
+    vt_pctx_rect(ctx, x + 6 + (h - 8) / 2 - 2, y + 9, 4, 4, fg);
+    vt_pctx_rect(ctx, x + 6 + (h - 8) / 2 - 4, y + 15, 8, 3, fg);
+    vt_pctx_text(ctx, x + h + 2,
+                 y + h / 2 + vt_pctx_text_height(ctx) / 2 - 2, u->name,
+                 false, (vt_pcol_t){ 0xec, 0xee, 0xf0, 0xff });
+    /* caret */
+    for (int i = 0; i < 3; i++)
+        vt_pctx_rect(ctx, x + env->area.w - 16 + i * 4, y + h / 2 - 1 + i, 2,
+                     2, (vt_pcol_t){ 0x90, 0x93, 0x99, 0xff });
+}
+
+/* run a real session action; returns an honest status line */
+static char *_user_do_action(int act) {
+    vt_power_t *pwr = vt_power_new();
+    vt_power_init(pwr);
+    char *status = NULL;
+    switch (act) {
+    case _UA_LOCK:
+        /* real: logind/elogind LockSession (loginctl) */
+        if (system("loginctl lock-session 2>/dev/null") == 0)
+            status = vt_strdup("lock requested (loginctl)");
+        else
+            status = vt_strdup("lock unavailable: no logind/elogind "
+                               "session (start one, or install elogind)");
+        break;
+    case _UA_SUSPEND:
+        if (vt_power_suspend(pwr) == 0)
+            status = vt_strdup("suspend requested");
+        else
+            status = vt_strdup("suspend failed (see journal)");
+        break;
+    case _UA_SWITCH: {
+        /* real: activate another login session if one exists */
+        FILE *fp = popen("loginctl list-sessions --no-legend 2>/dev/null",
+                         "r");
+        char line[256];
+        char other[64] = "";
+        bool own = false;
+        const char *sid = getenv("XDG_SESSION_ID");
+        if (fp) {
+            while (fgets(line, sizeof(line), fp)) {
+                char cand[64] = "";
+                sscanf(line, "%63s", cand);
+                if (!cand[0]) continue;
+                if (sid && strcmp(cand, sid) == 0) { own = true; continue; }
+                snprintf(other, sizeof(other), "%s", cand);
+                break;
+            }
+            pclose(fp);
+        }
+        if (own && other[0]) {
+            char cmd[128];
+            snprintf(cmd, sizeof(cmd), "loginctl activate-session %s",
+                     other);
+            if (system(cmd) == 0)
+                status = vt_strprintf("switching to session %s", other);
+            else
+                status = vt_strdup("activate-session failed");
+        } else {
+            status = vt_strdup("no other session to switch to "
+                               "(log in on another VT first)");
+        }
+        break;
+    }
+    case _UA_LOGOUT:
+        vt_panel_send_session(VT_IPC_MSG_WM_LOGOUT, "");
+        status = vt_strdup("logout requested");
+        break;
+    case _UA_REBOOT:
+        if (vt_power_reboot(pwr) == 0)
+            status = vt_strdup("reboot requested");
+        else
+            status = vt_strdup("reboot not permitted (are you allowed?)");
+        break;
+    case _UA_SHUTDOWN:
+        if (vt_power_shutdown(pwr) == 0)
+            status = vt_strdup("shutdown requested");
+        else
+            status = vt_strdup("shutdown not permitted (are you allowed?)");
+        break;
+    case _UA_EXIT:
+        vt_panel_send_session(VT_IPC_MSG_WM_LOGOUT, "exit");
+        status = vt_strdup("exiting the session");
+        break;
+    default:
+        break;
+    }
+    vt_power_free(pwr);
+    return status;
+}
+
+static void _user_menu_paint(vt_applet_env_t *env) {
+    _user_t *u = env->state;
+    vt_pctx_t *ctx = env->ctx;
+    if (!u->win || !u->draw) return;
+    Display *dpy = ctx->dpy;
+    int w = _UM_W;
+    int h = _UA_COUNT * _UM_ROW + 8 + (u->status ? _UM_ROW : 0);
+    XRenderPictFormat *fmt = XRenderFindVisualFormat(dpy,
+        DefaultVisual(dpy, DefaultScreen(dpy)));
+    Picture pic = XRenderCreatePicture(dpy, u->win, fmt, 0, NULL);
+    XRenderColor bg = { .red = 0x1a1a, .green = 0x1c1c, .blue = 0x2222,
+                        .alpha = 0xffff };
+    XRenderFillRectangle(dpy, PictOpSrc, pic, &bg, 0, 0, (unsigned)w,
+                         (unsigned)h);
+    for (int i = 0; i < _UA_COUNT; i++) {
+        int ry = 4 + i * _UM_ROW;
+        bool sel = (i == u->sel);
+        if (sel) {
+            XRenderColor hi = { .red = 0x4f4f, .green = 0x9a9a,
+                                .blue = 0xdcdc, .alpha = 0xffff };
+            XRenderFillRectangle(dpy, PictOpOver, pic, &hi, 2, (short)ry,
+                                 (unsigned)(w - 4), (unsigned)(_UM_ROW - 2));
+        }
+        XRenderColor tc = sel
+            ? (XRenderColor){ .red = 0xffff, .green = 0xffff,
+                              .blue = 0xffff, .alpha = 0xffff }
+            : (XRenderColor){ .red = 0xecec, .green = 0xeeee,
+                              .blue = 0xf0f0, .alpha = 0xffff };
+        XftColor fc;
+        XftColorAllocValue(dpy, DefaultVisual(dpy, DefaultScreen(dpy)),
+                           DefaultColormap(dpy, DefaultScreen(dpy)), &tc,
+                           &fc);
+        /* destructive actions render in warning tone */
+        if (i >= _UA_REBOOT && !sel) {
+            XRenderColor warn = { .red = 0xe0e0, .green = 0x7a7a,
+                                  .blue = 0x5050, .alpha = 0xffff };
+            XftColorAllocValue(dpy, DefaultVisual(dpy, DefaultScreen(dpy)),
+                               DefaultColormap(dpy, DefaultScreen(dpy)),
+                               &warn, &fc);
+        }
+        XftDrawStringUtf8(u->draw, &fc, ctx->font, 10, ry + _UM_ROW - 7,
+                          (const FcChar8 *)_user_actions[i],
+                          (int)strlen(_user_actions[i]));
+    }
+    if (u->status) {
+        XRenderColor dim = { .red = 0x9090, .green = 0x9393, .blue = 0x9999,
+                             .alpha = 0xffff };
+        XftColor fd;
+        XftColorAllocValue(dpy, DefaultVisual(dpy, DefaultScreen(dpy)),
+                           DefaultColormap(dpy, DefaultScreen(dpy)), &dim,
+                           &fd);
+        XftDrawStringUtf8(u->draw, &fd, ctx->font, 10,
+                          4 + _UA_COUNT * _UM_ROW + _UM_ROW - 7,
+                          (const FcChar8 *)u->status,
+                          (int)strlen(u->status));
+    }
+    XRenderFreePicture(dpy, pic);
+}
+
+static void _user_menu_handle(vt_panel_t *p, XEvent *ev) {
+    vt_applet_env_t env = vt_panel_find_env(p, VT_PANEL_APPLET_USER);
+    _user_t *u = env.state;
+    if (!u || ev->xany.window != u->win) return;
+    switch (ev->type) {
+    case Expose:
+        _user_menu_paint(&env);
+        break;
+    case MotionNotify:
+        u->sel = (ev->xmotion.y - 4) / _UM_ROW;
+        if (u->sel >= _UA_COUNT) u->sel = -1;
+        _user_menu_paint(&env);
+        break;
+    case ButtonRelease: {
+        if (ev->xbutton.button == Button1) {
+            int idx = (ev->xbutton.y - 4) / _UM_ROW;
+            if (idx >= 0 && idx < _UA_COUNT) {
+                vt_free(u->status);
+                u->status = _user_do_action(idx);
+                vt_logi("user-menu: %s — %s", _user_actions[idx], u->status);
+                _user_menu_paint(&env);
+                /* logout/exit close the menu: the session is ending */
+                if (idx == _UA_LOGOUT || idx == _UA_EXIT) {
+                    _user_menu_close(&env);
+                }
+                break;
+            }
+        }
+        _user_menu_close(&env);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+static void _user_menu_close(vt_applet_env_t *env) {
+    _user_t *u = env->state;
+    vt_pctx_t *ctx = env->ctx;
+    if (!u->win) return;
+    if (u->draw) { XftDrawDestroy(u->draw); u->draw = NULL; }
+    XDestroyWindow(ctx->dpy, u->win);
+    u->win = 0;
+    vt_panel_set_popup(env->panel, 0, NULL);
+    XFlush(ctx->dpy);
+    vt_panel_invalidate(env->panel);
+}
+
+void vt_panel_user_menu_open(struct vt_panel *p) {
+    vt_applet_env_t env = vt_panel_find_env(p, VT_PANEL_APPLET_USER);
+    _user_t *u = env.state;
+    vt_pctx_t *ctx = env.ctx;
+    if (!u || u->win) return;
+    int w = _UM_W;
+    int h = _UA_COUNT * _UM_ROW + 8;
+    int x = env.area.x + env.area.w - w;
+    if (x < 4) x = 4;
+    int y = env.area.y + env.area.h + 4;
+    XSetWindowAttributes wa = { .override_redirect = True,
+                                .background_pixel = 0x22221c1a,
+                                .event_mask = ExposureMask |
+                                              ButtonPressMask |
+                                              ButtonReleaseMask |
+                                              PointerMotionMask };
+    u->win = XCreateWindow(ctx->dpy, DefaultRootWindow(ctx->dpy),
+                           x, y, (unsigned)w, (unsigned)h, 1, CopyFromParent,
+                           InputOutput, CopyFromParent,
+                           CWOverrideRedirect | CWBackPixel | CWEventMask,
+                           &wa);
+    u->draw = XftDrawCreate(ctx->dpy, u->win,
+                            DefaultVisual(ctx->dpy, DefaultScreen(ctx->dpy)),
+                            DefaultColormap(ctx->dpy, DefaultScreen(ctx->dpy)));
+    u->sel = -1;
+    XMapWindow(ctx->dpy, u->win);
+    vt_panel_set_popup(p, u->win, _user_menu_handle);
+    XFlush(ctx->dpy);
+    _user_menu_paint(&env);
+}
+
+static void _user_on_click(vt_applet_env_t *env, int x, int y, int button) {
+    (void)x; (void)y;
+    _user_t *u = env->state;
+    if (button != 1) return;
+    if (u->win) _user_menu_close(env);
+    else {
+        vt_free(u->status);
+        u->status = NULL;
+        vt_panel_user_menu_open(env->panel);
+    }
+}
+
+const vt_applet_impl_t _applet_user = {
+    .name = "user", .init = _user_init, .fini = _user_fini,
+    .measure = _user_measure, .render = _user_render,
+    .on_click = _user_on_click,
 };

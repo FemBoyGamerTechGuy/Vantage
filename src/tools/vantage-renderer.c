@@ -1,7 +1,7 @@
 /*
  * vantage-renderer.c — Renderer probe / debug tool
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Reports what renderer Vantage will pick on the current system.
  */

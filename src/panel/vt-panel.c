@@ -1,7 +1,7 @@
 /*
  * vt-panel.c — Vantage panel (X11 dock window)
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * A real X11 dock: _NET_WM_WINDOW_TYPE_DOCK window spanning the primary
  * output, with _NET_WM_STRUT_PARTIAL so the WM reserves screen space.
@@ -223,6 +223,30 @@ void vt_panel_send_wm(vt_panel_t *p, uint32_t msg, const char *payload) {
     vt_ipc_msg_free(&resp);
 }
 
+void vt_panel_send_session(uint32_t msg, const char *payload) {
+    /* The session manager serves the same protocol on its own socket in
+     * XDG_RUNTIME_DIR; logout and friends are served there. */
+    const char *rd = getenv("XDG_RUNTIME_DIR");
+    if (!rd || !*rd) {
+        vt_logw("panel: XDG_RUNTIME_DIR unset — cannot reach the session "
+                "manager");
+        return;
+    }
+    char *path = vt_strprintf("%s/vantage-session.sock", rd);
+    vt_ipc_t *ipc = vt_ipc_new_client(path);
+    vt_free(path);
+    if (!ipc) {
+        vt_logw("panel: cannot connect to vantage-session.sock — is the "
+                "session manager running?");
+        return;
+    }
+    vt_ipc_msg_t resp = {0};
+    vt_ipc_call(ipc, msg, payload ? payload : "",
+                payload ? (uint32_t)strlen(payload) : 0, &resp, 1500);
+    vt_ipc_msg_free(&resp);
+    vt_ipc_free(ipc);
+}
+
 /* ------------------------------------------------------------ applets */
 int vt_panel_add_applet(vt_panel_t *p, vt_panel_applet_kind_t kind) {
     if (!p || !p->priv) return -1;
@@ -238,6 +262,7 @@ int vt_panel_add_applet(vt_panel_t *p, vt_panel_applet_kind_t kind) {
     case VT_PANEL_APPLET_VOLUME:     impl = &_applet_volume; break;
     case VT_PANEL_APPLET_NETWORK:    impl = &_applet_network; break;
     case VT_PANEL_APPLET_BATTERY:    impl = &_applet_battery; break;
+    case VT_PANEL_APPLET_USER:       impl = &_applet_user; break;
     default: return -1;
     }
     _applet_t a = { .kind = kind, .impl = impl, .state = NULL,
@@ -280,15 +305,19 @@ static void _layout(vt_panel_t *p) {
         a->area = (vt_rect_t){ .x = x, .y = 2, .w = w, .h = h - 4 };
         x += w + 8;
     }
-    /* right-aligned applets: clock/battery/network/volume/tray get pinned
-     * to the right edge in reverse registration order */
+    /* right-aligned applets: user/clock/volume/workspaces/battery/
+     * network/tray get pinned to the right edge in reverse registration
+     * order — the intended reading order (left→right) ends up:
+     *   [workspaces] [volume] [clock] [username]  (plus battery/net/tray) */
     int xr = ctx->w - 6;
     for (size_t i = pv->slots.size; i > 0; i--) {
         _applet_t *a = vt_vec_at(&pv->slots, i - 1);
         bool right = a->kind == VT_PANEL_APPLET_CLOCK ||
+                     a->kind == VT_PANEL_APPLET_USER ||
                      a->kind == VT_PANEL_APPLET_BATTERY ||
                      a->kind == VT_PANEL_APPLET_NETWORK ||
                      a->kind == VT_PANEL_APPLET_VOLUME ||
+                     a->kind == VT_PANEL_APPLET_WORKSPACES ||
                      a->kind == VT_PANEL_APPLET_TRAY;
         if (!right) continue;
         a->area.x = xr - a->area.w;
@@ -589,6 +618,22 @@ static void _dispatch_x(vt_panel_t *p) {
         case ButtonPress: {
             XButtonEvent *be = &ev.xbutton;
             int ax = be->x, ay = be->y;
+            /* wheel events arrive as buttons 4/5 */
+            if (be->button == 4 || be->button == 5) {
+                for (size_t i = 0; i < pv->slots.size; i++) {
+                    _applet_t *a = vt_vec_at(&pv->slots, i);
+                    if (ax >= a->area.x && ax < a->area.x + a->area.w &&
+                        ay >= a->area.y && ay < a->area.y + a->area.h) {
+                        if (a->impl && a->impl->on_wheel)
+                            a->impl->on_wheel(&(vt_applet_env_t){
+                                .panel = p, .ctx = ctx, .area = a->area,
+                                .state = a->state },
+                                be->button == 4 ? 1 : -1);
+                        break;
+                    }
+                }
+                break;
+            }
             for (size_t i = 0; i < pv->slots.size; i++) {
                 _applet_t *a = vt_vec_at(&pv->slots, i);
                 if (ax >= a->area.x && ax < a->area.x + a->area.w &&

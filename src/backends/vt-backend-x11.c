@@ -1,7 +1,7 @@
 /*
  * vt-backend-x11.c — X11 display backend
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * One Xlib Display connection per process, owned by this backend. The
  * backend is a client of whatever X server is already running

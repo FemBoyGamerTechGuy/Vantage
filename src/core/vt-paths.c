@@ -1,7 +1,7 @@
 /*
  * vt-paths.c — Runtime resource + binary discovery
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Vantage must run both straight from the source/build tree
  * (`./vantage-session`, `./builddir/src/tools/vantage-wm`) and from an

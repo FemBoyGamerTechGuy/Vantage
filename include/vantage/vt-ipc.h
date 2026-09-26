@@ -1,7 +1,7 @@
 /*
  * vt-ipc.h — Vantage internal IPC
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Provides a lightweight Unix-domain-socket RPC protocol so that
  * Vantage components can talk to each other without depending on D-Bus.

@@ -2,7 +2,7 @@ Name:       vantage
 Version:    0.2.0
 Release:    1%{?dist}
 Summary:    Lightweight raw-C Linux desktop environment
-License:    GPL-2.0-or-later
+License:    LicenseRef-Vantage-Proprietary
 URL:        https://github.com/FemBoyGamerTechGuy/Vantage
 Source0:    %{url}/archive/v%{version}.tar.gz
 

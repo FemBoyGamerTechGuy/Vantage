@@ -1,7 +1,7 @@
 /*
  * vt-backend-wayland.c — Native Wayland compositor backend
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * A real Wayland compositor built directly on libwayland-server:
  *
@@ -67,6 +67,8 @@
 #include <xkbcommon/xkbcommon.h>
 #endif
 
+#include "vt-wl-panel.h"
+
 /* ------------------------------------------------------------ logging */
 
 /* The 15 startup stages, in order. */
@@ -121,6 +123,7 @@ typedef struct _wl_surf {
     int32_t  w, h;
     int32_t  dx, dy;                  /* attach offset */
     int      x, y;                    /* composited position */
+    int      ws;                      /* workspace (all if sticky-ish) */
     bool     mapped;
     bool     has_pending_xdg;         /* xdg toplevel exists */
     struct _xdg_toplevel *toplevel;
@@ -185,6 +188,11 @@ typedef struct {
     int clients;
     uint64_t frame_count;
     bool headless;                    /* honest marker: no KMS */
+
+    /* compositor-side panel + workspace state */
+    vt_wl_panel_t *panel;
+    int ws_count, ws_cur;
+    time_t panel_clock_sync;
 
     /* real session path */
     vt_seat_t *seat;
@@ -1049,9 +1057,18 @@ static int _li_open_restricted(const char *path, int flags, void *ud) {
             fcntl(fd, F_SETFL, fl | (flags & O_NONBLOCK));
             return fd;
         }
+        vt_logw("wayland: input: cannot open %s through the seat — "
+                "EACCES usually means no session manager holds the "
+                "device permissions", path);
         return -1;
     }
-    return open(path, flags | O_CLOEXEC);
+    int fd = open(path, flags | O_CLOEXEC);
+    if (fd < 0)
+        vt_logw("wayland: input: open(%s) failed: %s — without a "
+                "session manager the user needs the 'input' group "
+                "(usermod -aG input $USER, re-login), or install "
+                "elogind/seatd", path, strerror(errno));
+    return fd;
 }
 
 static void _li_close_restricted(int fd, void *ud) {
@@ -1092,9 +1109,11 @@ static void _li_add_device(_wl_state_t *st,
 static _wl_surf_t *_surface_at(_wl_state_t *st, int x, int y) {
     _wl_surf_t *found = NULL;
     _wl_surf_t *s;
+    if (st->panel && vt_wl_panel_contains(st->panel, x, y)) return NULL;
     /* surfaces list is bottom→top: iterate reversed */
     wl_list_for_each_reverse(s, &st->surfaces, link) {
         if (!s->mapped || s->is_cursor) continue;
+        if (s->toplevel && s->ws != st->ws_cur) continue;
         if (x >= s->x && x < s->x + s->w &&
             y >= s->y && y < s->y + s->h) {
             found = s;
@@ -1209,6 +1228,16 @@ static void _pointer_button(_wl_state_t *st, uint32_t button,
     if (button == 0x110 && !pressed)
         st->op_active = false;     /* BTN_LEFT release ends interactive op */
     if (st->op_active && pressed) return;
+    /* panel (bar + menus) swallows pointer events before any client */
+    if (st->panel &&
+        vt_wl_panel_pointer(st->panel, st->cursor_x, st->cursor_y,
+                            pressed ? 1 : 2,
+                            button == 0x110 ? 1 :
+                            button == 0x111 ? 2 :
+                            button == 0x112 ? 3 : 0)) {
+        st->dirty = true;
+        return;
+    }
     _wl_surf_t *s = st->ptr_focus;
     if (s && s->res) {
         _ptr_res_t *pr;
@@ -1282,6 +1311,21 @@ static void _kbd_modifiers_send(_wl_state_t *st) {
 }
 #endif /* VT_HAVE_XKBCOMMON */
 
+/* Ctrl+Alt+F1..F12 switches VTs — the compositor owns the keyboard via
+ * evdev, so the kernel's own console switch combination never fires; we
+ * must perform the switch ourselves or a wedged session means a reboot. */
+static void _vt_hotkey(_wl_state_t *st, xkb_keysym_t sym) {
+    if (sym >= XKB_KEY_F1 && sym <= XKB_KEY_F12) {
+        int vt = (int)(sym - XKB_KEY_F1) + 1;
+        vt_logi("wayland: VT-switch hotkey Ctrl+Alt+F%d — switching "
+                "(release/acquire will drop/retake DRM master)", vt);
+        if (vt_seat_vt_switch_to(st->seat, vt) != 0)
+            vt_logw("wayland: VT switch to %d failed — keyboard input "
+                    "may be the only way out (Ctrl+Alt+F1..F12, or "
+                    "Ctrl+Alt+Delete to log out)", vt);
+    }
+}
+
 static void _kbd_key(_wl_state_t *st, uint32_t key, bool pressed) {
 #if defined(VT_HAVE_XKBCOMMON)
     if (!st->xkb_st) return;
@@ -1292,11 +1336,24 @@ static void _kbd_key(_wl_state_t *st, uint32_t key, bool pressed) {
         const xkb_keysym_t *syms;
         int ns = xkb_state_key_get_syms(st->xkb_st, key + 8, &syms);
         for (int i = 0; i < ns; i++) {
+            /* Escape closes any open panel menu first */
+            if (syms[i] == XKB_KEY_Escape && st->panel &&
+                vt_wl_panel_key(st->panel, "Escape")) {
+                st->dirty = true;
+                return;
+            }
             char combo[96];
             if (_combo_from_xkb(st, syms[i], combo, sizeof(combo)) &&
                 _hotkey_try(st->backend_self, combo)) {
                 vt_logi("wayland: hotkey consumed: %s", combo);
                 return;    /* do not forward to the client */
+            }
+            /* VT switching: Ctrl+Alt+F1..F12 */
+            uint32_t mods = xkb_state_serialize_mods(
+                st->xkb_st, XKB_STATE_MODS_DEPRESSED);
+            if ((mods & 0x4) && (mods & 0x8) && st->seat) {
+                _vt_hotkey(st, syms[i]);
+                return;
             }
         }
     }
@@ -1323,9 +1380,25 @@ static void _li_process(_wl_state_t *st) {
         case LIBINPUT_EVENT_DEVICE_ADDED:
             _li_add_device(st, libinput_event_get_device(ev));
             break;
-        case LIBINPUT_EVENT_DEVICE_REMOVED:
+        case LIBINPUT_EVENT_DEVICE_REMOVED: {
+            /* remove from the model — a removed device usually means the
+             * open failed (EACCES: no session manager, no input group) */
+            struct libinput_device *dev = libinput_event_get_device(ev);
+            const char *sys = dev ? libinput_device_get_sysname(dev) : NULL;
+            if (sys) {
+                for (size_t i = 0; i < st->backend_self->inputs.size; i++) {
+                    vt_input_dev_t *d = vt_vec_at(&st->backend_self->inputs, i);
+                    if (d->syspath && vt_streq(d->syspath, sys)) {
+                        vt_free(d->name);
+                        vt_free(d->syspath);
+                        vt_vec_remove(&st->backend_self->inputs, i);
+                        break;
+                    }
+                }
+            }
             vt_logd("wayland: input device removed");
             break;
+        }
         case LIBINPUT_EVENT_POINTER_MOTION: {
             struct libinput_event_pointer *pe =
                 libinput_event_get_pointer_event(ev);
@@ -1408,6 +1481,24 @@ static bool _input_init(_wl_state_t *st) {
                                       _li_fd_cb, st);
     libinput_dispatch(st->li);
     _li_process(st);   /* initial device-added events */
+    /* honest accounting: did we actually GET usable devices? The
+     * DEVICE_ADDED event fires before the device is opened — count what
+     * ended up openable instead of lying about it. */
+    int kb = 0, ptr = 0;
+    for (size_t i = 0; i < st->backend_self->inputs.size; i++) {
+        vt_input_dev_t *d = vt_vec_at(&st->backend_self->inputs, i);
+        if (d->type == 0) kb++;
+        else if (d->type == 1) ptr++;
+    }
+    if (kb == 0 && ptr == 0) {
+        vt_loge("wayland: input: NO usable input devices — keyboard and "
+                "pointer will not work. Remedies: (1) run through a "
+                "session manager (elogind/seatd), or (2) add the user "
+                "to the 'input' group: usermod -aG input $USER and "
+                "re-login. Ctrl+Alt+F1..F12 VT switching and "
+                "Ctrl+Alt+Delete logout are handled by the compositor "
+                "once input works.");
+    }
     return true;
 }
 
@@ -1526,21 +1617,79 @@ static int _drm_fd_cb(int fd, uint32_t mask, void *data) {
 /* ------------------------------------------------------------ painting */
 
 static void _paint_background(_wl_state_t *st) {
-    const int panel_h = 30;
+    /* plain desktop background — the real panel is drawn by
+     * vt-wl-panel.c on top of everything (not placeholder blocks) */
     for (int y = 0; y < st->out_h; y++) {
-        uint32_t row = (y < panel_h) ? 0xff23262b : 0xff1a1a1a;
+        uint32_t row = 0xff1a1a1a;
         for (int x = 0; x < st->out_w; x++)
             st->fb[y * st->out_w + x] = row;
     }
-    /* a few launcher-ish squares on the panel */
-    static const uint32_t pal[] = { 0xffe05a5a, 0xff5a9ae0, 0xff7ac860,
-                                    0xffe0b05a };
-    for (size_t i = 0; i < sizeof(pal) / sizeof(pal[0]); i++) {
-        int x0 = 10 + (int)i * 34, y0 = 7;
-        for (int y = y0; y < y0 + 16 && y < panel_h; y++)
-            for (int x = x0; x < x0 + 16 && x < st->out_w; x++)
-                st->fb[y * st->out_w + x] = pal[i];
+}
+
+/* ---- panel glue: compositor → panel callbacks ---- */
+static void _panel_cb_focus(uint64_t id, void *ud) {
+    _wl_state_t *st = ud;
+    if (!st) return;
+    _wl_surf_t *s;
+    wl_list_for_each(s, &st->surfaces, link) {
+        if (s->toplevel && s->toplevel->id == id) {
+            st->kbd_focus = s;
+            st->focused_toplevel = s->toplevel;
+            _pointer_focus_update(st, true);
+            _emit_win(st, VT_BACKEND_WL_EVENT_WIN_FOCUS, s->toplevel);
+            st->dirty = true;
+            return;
+        }
     }
+}
+
+static void _panel_cb_close(uint64_t id, void *ud) {
+    vt_backend_t *self = ((_wl_state_t *)ud)->backend_self;
+    if (self && self->close_window) self->close_window(self, id);
+}
+
+static void _panel_emit_ws(_wl_state_t *st) {
+    vt_backend_wl_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.kind = VT_BACKEND_WL_EVENT_WORKSPACE;
+    ev.window_id = (uint64_t)(unsigned)st->ws_cur;
+    ev.title = NULL;
+    ev.app_id = NULL;
+    vt_backend_emit_event(st->backend_self, &ev);
+}
+
+static void _panel_cb_ws(int ws, void *ud) {
+    _wl_state_t *st = ud;
+    if (!st || ws < 0 || ws >= st->ws_count || ws == st->ws_cur) return;
+    st->ws_cur = ws;
+    vt_wl_panel_set_workspaces(st->panel, st->ws_count, st->ws_cur);
+    _panel_emit_ws(st);
+    st->dirty = true;
+    vt_logi("wayland: workspace -> %d", ws + 1);
+}
+
+static void _panel_cb_logout(void *ud) {
+    _wl_state_t *st = ud;
+    if (!st) return;
+    /* route through the WM shortcut table: Ctrl+Alt+Delete is the
+     * registered clean-logout combo (graceful unwind, exit 0) */
+    vt_logi("wayland: panel logout — clean unwind");
+    _hotkey_try(st->backend_self, "Ctrl+Alt+Delete");
+}
+
+static void _panel_sync_windows(_wl_state_t *st) {
+    vt_wl_panel_win_t wins[16];
+    size_t n = 0;
+    _wl_surf_t *s;
+    wl_list_for_each_reverse(s, &st->surfaces, link) {
+        if (!s->mapped || s->is_cursor || !s->toplevel) continue;
+        if (s->ws != st->ws_cur) continue;
+        wins[n].id = s->toplevel->id;
+        wins[n].title = s->toplevel->title ? s->toplevel->title : "";
+        wins[n].focused = (st->kbd_focus == s);
+        if (++n >= 16) break;
+    }
+    vt_wl_panel_set_windows(st->panel, wins, n);
 }
 
 /* alpha-blend an ARGB sprite over the XRGB framebuffer */
@@ -1577,10 +1726,12 @@ static void _paint(void) {
     _wl_state_t *st = _wls;
     if (!st || !st->dirty) return;
     _paint_background(st);
-    /* surfaces bottom→top (client windows; cursor surfaces skipped) */
+    /* surfaces bottom→top (client windows; cursor surfaces skipped;
+     * windows on other workspaces are hidden) */
     _wl_surf_t *s;
     wl_list_for_each(s, &st->surfaces, link) {
         if (!s->mapped || !s->pixels || s->is_cursor) continue;
+        if (s->toplevel && s->ws != st->ws_cur) continue;
         int x = s->x, y = s->y;
         for (int sy = 0; sy < s->h; sy++) {
             int dy = y + sy;
@@ -1600,21 +1751,23 @@ static void _paint(void) {
             vt_free(n);
         }
     }
-    /* software cursor sprite when there is no hardware plane (or the
-     * client set its own cursor surface) */
-    bool sw_cursor = true;
-    if (st->kms && vt_kms_hw_cursor(st->kms) && !st->cur_client_set)
-        sw_cursor = false;
-    if (sw_cursor) {
-        if (st->cur_client_set && st->cursor_surf && st->cursor_surf->pixels) {
-            _blend_sprite(st, st->cursor_surf->pixels,
-                          st->cursor_surf->w, st->cursor_surf->h,
-                          st->cursor_surf->hotspot_x,
-                          st->cursor_surf->hotspot_y);
-        } else {
-            _blend_sprite(st, st->cursor_img, st->cur_img_w, st->cur_img_h,
-                          st->cur_img_hx, st->cur_img_hy);
-        }
+    /* the REAL compositor panel: bar + open menus, on top of clients */
+    if (st->panel) {
+        _panel_sync_windows(st);
+        vt_wl_panel_paint(st->panel, st->fb, st->out_w, st->out_h);
+    }
+    /* Software cursor sprite — ALWAYS drawn. The hardware cursor plane
+     * is a bonus (used when the driver actually supports it); making the
+     * sprite the source of truth guarantees a visible cursor on every
+     * GPU, including NVIDIA where drmModeSetCursor can silently fail. */
+    if (st->cur_client_set && st->cursor_surf && st->cursor_surf->pixels) {
+        _blend_sprite(st, st->cursor_surf->pixels,
+                      st->cursor_surf->w, st->cursor_surf->h,
+                      st->cursor_surf->hotspot_x,
+                      st->cursor_surf->hotspot_y);
+    } else {
+        _blend_sprite(st, st->cursor_img, st->cur_img_w, st->cur_img_h,
+                      st->cur_img_hx, st->cur_img_hy);
     }
     st->dirty = false;
     st->frame_count++;
@@ -2023,15 +2176,30 @@ static int _wl_init(vt_backend_t *self) {
     _wls = st;
     st->dirty = true;
 
+    /* ---- the REAL compositor panel (no placeholder blocks) -------- */
+    st->ws_count = 4;
+    st->ws_cur = 0;
+    st->panel = vt_wl_panel_create(st->out_w, 32);
+    vt_wl_panel_set_workspaces(st->panel, st->ws_count, st->ws_cur);
+    {
+        vt_wl_panel_cbs_t cbs = {
+            .focus_window = _panel_cb_focus,
+            .close_window = _panel_cb_close,
+            .switch_ws = _panel_cb_ws,
+            .logout = _panel_cb_logout,
+        };
+        vt_wl_panel_set_callbacks(st->panel, &cbs, st);
+    }
+
     /* ---- stage 15/15: desktop (first frame) -------------------------- */
     _stage_begin(14, "first frame");
     _paint();
     _present();
-    _stage_ok(14, "desktop painted %dx%d (%s), cursor %s",
+    _stage_ok(14, "desktop painted %dx%d (%s), cursor software sprite, "
+              "compositor panel (Vantage menu, window list, workspaces, "
+              "clock, session menu)",
               st->out_w, st->out_h,
-              st->kms ? vt_kms_out_name(st->kms, 0) : "headless",
-              st->kms ? (vt_kms_hw_cursor(st->kms) ? "on the hardware "
-                        "plane" : "software sprite") : "software sprite");
+              st->kms ? vt_kms_out_name(st->kms, 0) : "headless");
     vt_logi("[wayland] desktop: ready");
     return 0;
 
@@ -2049,6 +2217,10 @@ static void _wl_fini(vt_backend_t *self) {
     if (self->priv != _wls || !_wls) return;
     _wl_state_t *st = _wls;
     vt_logi("wayland: shutting down the compositor");
+    if (st->panel) {
+        vt_wl_panel_destroy(st->panel);
+        st->panel = NULL;
+    }
     _input_fini(st);
     _xkb_fini(st);
     if (st->drm_src) { wl_event_source_remove(st->drm_src); st->drm_src = NULL; }

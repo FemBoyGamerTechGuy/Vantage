@@ -1,7 +1,7 @@
 /*
  * vt-integ-audio.c — Optional audio integration (PipeWire > Pulse > ALSA)
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Audio is NOT a hard dependency. Vantage probes each backend at runtime
  * and uses the first one available. If none are available, all calls

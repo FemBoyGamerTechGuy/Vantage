@@ -1,7 +1,7 @@
 #!/bin/bash
 # harness-cli.sh — Vantage CLI & distribution-model integration harness
 #
-# SPDX-License-Identifier: GPL-2.0-or-later
+# SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
 #
 # Verifies the session-manager command line and that Vantage runs both
 # from the build tree and from an installed staging prefix:

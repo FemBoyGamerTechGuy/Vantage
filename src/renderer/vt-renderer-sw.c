@@ -1,7 +1,7 @@
 /*
  * vt-renderer-sw.c — Software rasterizer fallback
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Always built. Provides a simple CPU-side renderer with a single
  * in-memory framebuffer. Used when no GPU acceleration is available

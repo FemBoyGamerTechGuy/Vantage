@@ -1,7 +1,7 @@
 /*
  * vt-desktop.c — Vantage desktop surface (X11)
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * A _NET_WM_WINDOW_TYPE_DESKTOP child of the root, rendered bottom-most
  * and present on every workspace. Draws the wallpaper (color, gradient,

@@ -51,11 +51,39 @@ falls back to starting an X server.
 ```ini
 [desktop]
 backend=x11      ; or: wayland, auto (default)
+
+[wm]
+focus=click      ; click (default) | sloppy (follows pointer)
 ```
 
 Legacy spellings `backend=xorg` and `backend=xlibre` are accepted as
 aliases of `x11`. Command-line flags and `$VANTAGE_BACKEND` override
 the configuration file.
+
+## Window decorations (SSD)
+
+Vantage draws real server-side decorations: every normal window is
+reparented into a WM-owned frame with a 26px title bar and a 2px accent
+border — visible on Kitty, Mirage and every other client regardless of
+their toolkit:
+
+* title (UTF-8 via Xft, truncated with an ellipsis when long)
+* close / maximize / minimize buttons (right end of the title bar)
+* double-click the title bar toggles maximize
+* drag the title bar to move; drag any border/corner to resize
+* active window: accent border + bright title; inactive: dimmed
+* fullscreen removes the chrome and restores it afterwards
+* `_NET_FRAME_EXTENTS` reports the real insets so EWMH-aware toolbars
+  and panels size correctly
+
+Docks (`_NET_WM_WINDOW_TYPE_DOCK`) and desktop windows stay undecorated.
+
+## Focus policy
+
+The default is **click-to-focus**: hovering a window NEVER steals
+keyboard focus — focus moves only on a click anywhere in the window
+(client area, title bar or frame border). Users who prefer
+focus-follows-mouse can set `[wm] focus=sloppy`.
 
 ## Dependencies
 

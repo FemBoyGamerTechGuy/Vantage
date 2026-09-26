@@ -1,7 +1,7 @@
 /*
  * vt-settings.h — Vantage settings
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * A modular settings system. Each settings module owns a small part of
  * the configuration and provides a small programmatic API. A separate

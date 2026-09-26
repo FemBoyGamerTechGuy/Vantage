@@ -35,6 +35,10 @@ if dep_x11.found()
     x11_testclient_deps += [dep_xfixes]
     x11_testclient_cargs += ['-DVT_HAVE_XFIXES']
   endif
+  if dep_xtst.found()
+    x11_testclient_deps += [dep_xtst]
+    x11_testclient_cargs += ['-DVT_HAVE_XTST']
+  endif
   x11_testclient = executable('vt-x11-testclient',
     sources : 'vt-x11-testclient.c',
     dependencies : x11_testclient_deps,
@@ -99,8 +103,22 @@ if harness_wayland.found() and wl_client_ok and \
     is_parallel : false)
 endif
 
+# REAL Wayland session self-test (tier 2): no forced headless, KMS
+# required. Skips (exit 77) on machines without /dev/dri or when not run
+# from a console — it NEVER fakes a pass. Run from a TTY on the target
+# hardware:   ./build test   (or tests/harness-wayland-real.sh directly)
+harness_wl_real = find_program('harness-wayland-real.sh', required : false)
+if harness_wl_real.found() and wl_client_ok and \
+   dep_wayland_server.found() and get_option('tests').enabled()
+  test('harness-wayland-real', harness_wl_real,
+    args : [meson.project_build_root()],
+    timeout : 120,
+    suite : 'integration',
+    is_parallel : false)
+endif
+
 # Install the harnesses next to the docs so users can run them anywhere
-install_data('harness-xvfb.sh', 'harness-wayland.sh', 'harness-cli.sh',
+install_data('harness-xvfb.sh', 'harness-wayland.sh', 'harness-wayland-real.sh', 'harness-cli.sh',
   install_dir : join_paths(vt_datadir, 'tests'))
 
 # ------------------------------------------------------------------

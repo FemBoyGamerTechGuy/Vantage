@@ -1,7 +1,7 @@
 /*
  * vt-session.c — Session lifecycle manager
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Owns startup, autostart, environment setup, shutdown, restart, and
  * power hooks (suspend / hibernate). Hooks are user callbacks called

@@ -1,7 +1,7 @@
 /*
  * vt-theme.c — Vantage theme engine
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Loads a JSON theme description, applies it to the live compositor,
  * and generates GTK CSS + Qt6 QSS files so user GTK/Qt6 apps pick up

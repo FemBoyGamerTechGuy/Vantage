@@ -1,7 +1,7 @@
 /*
  * vt-settings-modules.c — Per-module settings ops
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Each module is intentionally tiny. They read/write known config keys
  * and call into the appropriate subsystem's apply() to push changes

@@ -1,7 +1,7 @@
 /*
  * vt-integrations.h — Optional integrations
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * These are all OPTIONAL. Vantage never requires any of them. Each module
  * probes the system at runtime and gracefully degrades when unavailable.

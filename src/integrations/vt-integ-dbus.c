@@ -1,7 +1,7 @@
 /*
  * vt-integ-dbus.c — Optional D-Bus integration
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * D-Bus is NOT required for Vantage to run. This module exposes a thin
  * wrapper around libdbus (if linked) so optional integrations (portal,

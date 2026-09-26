@@ -1,7 +1,7 @@
 /*
  * vt-panel.h — Vantage panel
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * A lightweight panel that hosts plugins. Plugins are tiny C modules
  * (built-in or runtime-loadable via dlopen). The panel exposes a stable

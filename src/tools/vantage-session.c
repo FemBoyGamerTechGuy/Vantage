@@ -1,7 +1,7 @@
 /*
  * vantage-session.c — Vantage session manager binary
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Session entry point. Backend selection:
  *
@@ -356,8 +356,10 @@ int main(int argc, char **argv) {
             }
         }
     } else {
-        vt_logi("session: panel and desktop currently require the X11 "
-                "backend; the Wayland session runs the compositor and WM");
+        vt_logi("session: the Wayland session draws its panel inside the "
+                "compositor (Vantage menu, window list, workspaces, clock, "
+                "session controls); the X11 panel/desktop clients are not "
+                "needed there");
     }
 
     /* 4. XDG autostart (system + user) */

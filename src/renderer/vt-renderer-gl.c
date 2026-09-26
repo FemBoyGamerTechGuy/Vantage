@@ -1,7 +1,7 @@
 /*
  * vt-renderer-gl.c — OpenGL/EGL hardware renderer
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Compiled only when both EGL and OpenGL (or GLESv2) are available.
  * Provides:

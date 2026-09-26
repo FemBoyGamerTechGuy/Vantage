@@ -1,7 +1,7 @@
 /*
  * vt-ipc.c — Vantage internal IPC over Unix domain sockets
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Wire format (little-endian):
  *   [u32 magic=0x56544352][u32 msg_id][u32 type][u32 len][len bytes payload]

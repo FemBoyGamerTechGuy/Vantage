@@ -1,7 +1,7 @@
 /*
  * vt-session.h — Vantage session manager
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Owns the DE lifecycle: startup, autostart, environment setup, logout,
  * restart, suspend hooks, watchdog.

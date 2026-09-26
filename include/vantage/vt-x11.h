@@ -1,7 +1,7 @@
 /*
  * vt-x11.h — Shared X11 glue used by backend, WM, compositor and UI
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Internal header (not installed). All X11-flavored components share one
  * Display connection owned by the backend. Any conforming X11 server

@@ -1,7 +1,7 @@
 /*
  * vt-core.c — Vantage core library implementation
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Provides logging, memory, strings, integer parsing, paths, time, RNG.
  * Uses only libc/libpthread. No external deps.

@@ -1,7 +1,7 @@
 /*
  * vt-seat.h — Session / seat management for the native Wayland backend
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Acquires the seat, VT and (indirectly) DRM-master rights that a real
  * compositor session needs:
@@ -81,6 +81,9 @@ int  vt_seat_drm_drop_master(vt_seat_t *s, int drm_fd);
 
 /* Switch to our VT and wait (bounded) until it is active. */
 int  vt_seat_vt_activate(vt_seat_t *s, int timeout_ms);
+/* Switch to an arbitrary VT (Ctrl+Alt+F1..F12 in the compositor) — the
+ * evdev-owned keyboard means the kernel hotkeys never fire otherwise. */
+int  vt_seat_vt_switch_to(vt_seat_t *s, int vt);
 
 /* KD_GRAPHICS / KD_TEXT on our VT. Only call KD_GRAPHICS after the first
  * scanout buffer is on the CRTC — switching early leaves a black screen

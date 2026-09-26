@@ -1,7 +1,7 @@
 /*
  * vt-input.h — Vantage input subsystem
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Unified input device enumeration (keyboard, pointer, touch) and event
  * dispatching. Uses libxkbcommon for keyboard layout handling, independent

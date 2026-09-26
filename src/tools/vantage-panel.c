@@ -1,7 +1,7 @@
 /*
  * vantage-panel.c — Standalone panel binary
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Reads the panel section of the Vantage config (position, height,
  * applet list), creates the panel and runs the event loop. Normally
@@ -41,15 +41,15 @@ int main(int argc, char **argv) {
     else if (vt_strcaseeq(pos, "right")) panel->pos = VT_PANEL_POS_RIGHT;
     panel->height = (int)vt_config_get_int(cfg, "panel", "height", 32);
 
-    /* default applet set; order = left to right, then right-aligned */
+    /* default applet set — LEFT: start button + task list;
+     * RIGHT (pinned, reverse order): workspaces, volume, clock, username.
+     * battery/network/tray remain available via the config. */
     vt_panel_add_applet(panel, VT_PANEL_APPLET_LAUNCHER);
-    vt_panel_add_applet(panel, VT_PANEL_APPLET_WORKSPACES);
     vt_panel_add_applet(panel, VT_PANEL_APPLET_TASKLIST);
-    vt_panel_add_applet(panel, VT_PANEL_APPLET_TRAY);
+    vt_panel_add_applet(panel, VT_PANEL_APPLET_WORKSPACES);
     vt_panel_add_applet(panel, VT_PANEL_APPLET_VOLUME);
-    vt_panel_add_applet(panel, VT_PANEL_APPLET_NETWORK);
-    vt_panel_add_applet(panel, VT_PANEL_APPLET_BATTERY);
     vt_panel_add_applet(panel, VT_PANEL_APPLET_CLOCK);
+    vt_panel_add_applet(panel, VT_PANEL_APPLET_USER);
 
     if (vt_panel_start(panel) != VT_OK) {
         vt_loge("panel: failed to start");

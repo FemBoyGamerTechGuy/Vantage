@@ -1,7 +1,7 @@
 /*
  * vt-renderer.h — Vantage renderer abstraction
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Provides a backend-agnostic rendering API used by the compositor,
  * wallpaper engine, and panel. Available renderers:

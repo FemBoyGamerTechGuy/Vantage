@@ -1,7 +1,7 @@
 /*
  * vantage-remote.c — CLI control client for the running Vantage session
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Talks to the vantage-wm IPC server (window commands) and the
  * vantage-session IPC server (status). Also usable from scripts and as the

@@ -5,7 +5,7 @@ pkgrel=1
 pkgdesc="Lightweight raw-C desktop environment — Wayland compositor + X11 backend, cross-toolkit Qt6/GTK theming, live video wallpapers"
 arch=('x86_64' 'aarch64')
 url="https://github.com/FemBoyGamerTechGuy/Vantage"
-license=('GPL-2.0-or-later')
+license=('LicenseRef-Vantage-Proprietary')
 depends=(
   'glibc'
   # native Wayland compositor session (seat/VT/DRM/input)
@@ -13,8 +13,8 @@ depends=(
   # X11 backend
   'libx11' 'libxcb' 'libxcomposite' 'libxdamage' 'libxext' 'libxft'
   'libxi' 'libxrandr' 'libxrender' 'libxcursor'
-  # shared runtime bits
-  'json-c' 'systemd-libs'
+  # shared runtime bits (freetype2/fontconfig: WM titles + panel text)
+  'json-c' 'systemd-libs' 'freetype2' 'fontconfig'
 )
 makedepends=(
   'meson' 'ninja' 'gcc' 'pkg-config' 'wayland-protocols'

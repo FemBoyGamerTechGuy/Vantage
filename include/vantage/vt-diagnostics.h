@@ -1,7 +1,7 @@
 /*
  * vt-diagnostics.h — Vantage diagnostics
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Produces a single human-readable snapshot of what Vantage sees on the
  * current machine: backend, renderer, GPU, driver, OpenGL version, EGL

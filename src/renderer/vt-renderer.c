@@ -1,7 +1,7 @@
 /*
  * vt-renderer.c — Vantage renderer abstraction
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Provides a backend-agnostic renderer. Probes available backends at
  * runtime (opengl, vulkan, software) and selects the best one. Renderers

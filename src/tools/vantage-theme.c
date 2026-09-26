@@ -1,7 +1,7 @@
 /*
  * vantage-theme.c — Theme CLI
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Lists installed themes, applies a theme, or generates one from an
  * accent color.

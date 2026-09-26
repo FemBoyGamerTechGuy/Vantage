@@ -1,7 +1,7 @@
 /*
  * vt-compositor.h — Vantage compositor
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Owns frame scheduling, damage tracking, and surface compositing.
  * Designed for performance: no work when idle, damage-tracked repaints,

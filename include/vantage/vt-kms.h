@@ -1,7 +1,7 @@
 /*
  * vt-kms.h — DRM/KMS scanout path for the native Wayland compositor
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Everything needed to put real pixels on a real screen:
  *   - /dev/dri/card* discovery with per-card driver logging

@@ -1,7 +1,7 @@
 #!/bin/bash
 # harness-xvfb.sh — Vantage full-session integration harness (Xorg path)
 #
-# SPDX-License-Identifier: GPL-2.0-or-later
+# SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
 #
 # Boots the REAL session stack on a fresh Xvfb display, exercising the
 # X11 backend selection exactly as a user would:
@@ -225,6 +225,27 @@ if [ -n "$WID" ]; then
 else
   bad "no window id found for IPC ops"
 fi
+
+echo "== harness-xvfb: window decorations (SSD frames) =="
+FRAME_LOG="$WORK/frame.log"
+"$(tc vt-x11-testclient)" --frame-probe > "$FRAME_LOG" 2>&1
+FRC=$?
+if [ $FRC -eq 0 ] && grep -q "framed=yes" "$FRAME_LOG"; then
+  ok "client window reparented into a WM frame"
+  grep -q "frame-extents=" "$FRAME_LOG" && ok "_NET_FRAME_EXTENTS reported: $(grep -o 'frame-extents=[0-9,]*' "$FRAME_LOG")"
+else
+  bad "no server-side decorations: $(cat "$FRAME_LOG")"
+fi
+
+echo "== harness-xvfb: focus policy (click-to-focus, no hover steal) =="
+FOCUS_LOG="$WORK/focus.log"
+"$(tc vt-x11-testclient)" --focus-probe > "$FOCUS_LOG" 2>&1
+FRC=$?
+grep -q "hover-steals=no" "$FOCUS_LOG" && ok "hover does NOT steal keyboard focus" \
+  || bad "hover steals focus: $(cat "$FOCUS_LOG")"
+grep -q "click-focus=yes" "$FOCUS_LOG" && ok "click focuses the window" \
+  || bad "click did not focus: $(cat "$FOCUS_LOG")"
+[ $FRC -eq 0 ] && ok "focus probe exit status 0" || bad "focus probe rc=$FRC"
 
 echo "== harness-xvfb: pixel verification =="
 # screenshot while the second test window is still alive

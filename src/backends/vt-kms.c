@@ -2,7 +2,7 @@
  * vt-kms.c — DRM/KMS scanout: connectors, CRTCs, GBM/dumb buffers,
  *            async page flips, hardware cursor, EGL renderer probe
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Composition is CPU-side into mapped scanout buffers — deliberately:
  * it is the same path the headless tests exercise, so what the tests

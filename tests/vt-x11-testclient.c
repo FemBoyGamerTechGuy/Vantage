@@ -1,7 +1,7 @@
 /*
  * vt-x11-testclient.c — X11 test client for Vantage smoke tests
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Maps a few windows with known geometry/colors/titles, runs for a while,
  * optionally dumps a screenshot of the root window to a PPM file:
@@ -18,6 +18,20 @@
  *     XFixesGetCursorImage at the pointer position; counts opaque
  *     pixels. Prints cursor-pos=X,Y cursor-size=WxH cursor-opaque=N and
  *     exits 0 only when N > 0 (an invisible/empty cursor fails).
+ *
+ *   vt-x11-testclient --frame-probe
+ *     Verifies server-side decorations: maps a window, waits for the WM
+ *     to manage it, then reports _NET_FRAME_EXTENTS and the reparenting
+ *     parent. Prints frame-extents=l,r,t,b frame-parent=0x.. and exits 0
+ *     only when the client was reparented into a frame with non-zero
+ *     top extent (a real title bar).
+ *
+ *   vt-x11-testclient --focus-probe
+ *     Verifies the focus policy: focuses window A, HOVERS window B
+ *     (pointer warp, no click) and asserts the active window is still A
+ *     (hover must not steal keyboard focus), then CLICKS window B via
+ *     XTest and asserts focus moved. Prints hover-steals=no click-focus=yes
+ *     on success.
  */
 
 #include <X11/Xlib.h>
@@ -25,6 +39,9 @@
 #include <X11/Xatom.h>
 #if defined(VT_HAVE_XFIXES)
 #include <X11/extensions/Xfixes.h>
+#endif
+#if defined(VT_HAVE_XTST)
+#include <X11/extensions/XTest.h>
 #endif
 #include <stdbool.h>
 #include <stdio.h>
@@ -95,12 +112,16 @@ int main(int argc, char **argv) {
     const char *title = "Vantage Test";
     bool ewmh_only = false;
     bool cursor_only = false;
+    bool frame_only = false;
+    bool focus_only = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--seconds") && i + 1 < argc) seconds = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--screenshot") && i + 1 < argc) shot = argv[++i];
         else if (!strcmp(argv[i], "--title") && i + 1 < argc) title = argv[++i];
         else if (!strcmp(argv[i], "--ewmh-probe")) ewmh_only = true;
         else if (!strcmp(argv[i], "--cursor-probe")) cursor_only = true;
+        else if (!strcmp(argv[i], "--frame-probe")) frame_only = true;
+        else if (!strcmp(argv[i], "--focus-probe")) focus_only = true;
     }
     Display *d = XOpenDisplay(NULL);
     if (!d) { fprintf(stderr, "cannot open display\n"); return 1; }
@@ -169,6 +190,122 @@ int main(int argc, char **argv) {
         free(name);
         XCloseDisplay(d);
         return rc;
+    }
+
+    if (frame_only) {
+        int s = DefaultScreen(d);
+        Window root = RootWindow(d, s);
+        Window w = make_window(d, "Frame Probe", 120, 120, 300, 200,
+                               0x3a5f9a);
+        XMapWindow(d, w);
+        XFlush(d);
+        /* wait for the WM to manage it */
+        Window parent = None;
+        for (int t = 0; t < 50; t++) {
+            Window r, *kids = NULL;
+            unsigned int nk = 0;
+            if (XQueryTree(d, w, &r, &parent, &kids, &nk)) {
+                if (kids) XFree(kids);
+                if (parent != root && parent != None) break;
+            }
+            msleep(50);
+        }
+        Atom fe = XInternAtom(d, "_NET_FRAME_EXTENTS", False);
+        Atom actual;
+        int fmt;
+        unsigned long n, bytes;
+        unsigned char *data = NULL;
+        long l = 0, r_ = 0, t = 0, b = 0;
+        if (XGetWindowProperty(d, w, fe, 0, 4, False, XA_CARDINAL, &actual,
+                               &fmt, &n, &bytes, &data) == Success && data
+                               && n >= 4) {
+            long *v = (long *)(void *)data;
+            l = v[0]; r_ = v[1]; t = v[2]; b = v[3];
+            XFree(data);
+        }
+        printf("frame-parent=0x%lx frame-extents=%ld,%ld,%ld,%ld\n",
+               (unsigned long)parent, l, r_, t, b);
+        fflush(stdout);
+        bool ok = parent != root && parent != None && t > 0;
+        printf(ok ? "framed=yes\n" : "framed=no\n");
+        fflush(stdout);
+        XDestroyWindow(d, w);
+        XCloseDisplay(d);
+        return ok ? 0 : 1;
+    }
+
+    if (focus_only) {
+        int s = DefaultScreen(d);
+        Window root = RootWindow(d, s);
+        Window a = make_window(d, "Focus A", 100, 100, 350, 250, 0x3a5f9a);
+        Window b = make_window(d, "Focus B", 500, 260, 300, 220, 0x9a3a5f);
+        XMapWindow(d, a);
+        XMapWindow(d, b);
+        XFlush(d);
+        msleep(600);      /* let the WM manage both */
+
+        /* focus A explicitly (EWMH _NET_ACTIVE_WINDOW root form: the
+         * target window travels in data.l[2]) */
+        Atom net_active = XInternAtom(d, "_NET_ACTIVE_WINDOW", False);
+        XEvent msg = { .type = ClientMessage };
+        msg.xclient.window = root;
+        msg.xclient.message_type = net_active;
+        msg.xclient.format = 32;
+        msg.xclient.data.l[0] = 1;              /* source: application */
+        msg.xclient.data.l[1] = CurrentTime;
+        msg.xclient.data.l[2] = (long)a;        /* window to activate   */
+        XSendEvent(d, root, False, SubstructureRedirectMask | SubstructureNotifyMask,
+                   &msg);
+        XFlush(d);
+        msleep(400);
+
+        Window active_of(void) {
+            Atom actual;
+            int fmt;
+            unsigned long n, bytes;
+            unsigned char *data = NULL;
+            Window active = None;
+            if (XGetWindowProperty(d, root, net_active, 0, 1, False,
+                                   AnyPropertyType, &actual, &fmt, &n,
+                                   &bytes,
+                                   &data) == Success && data && n >= 1) {
+                active = *(Window *)(void *)data;
+                XFree(data);
+            }
+            return active;
+        }
+
+        Window act_a = active_of();
+
+        /* HOVER window B: warp the pointer there WITHOUT clicking */
+        XWarpPointer(d, None, b, 0, 0, 0, 0, 40, 40);
+        XFlush(d);
+        msleep(500);
+        Window act_hover = active_of();
+        bool hover_ok = (act_hover == act_a);
+        printf("active-a=0x%lx active-hover=0x%lx hover-steals=%s\n",
+               (unsigned long)act_a, (unsigned long)act_hover,
+               hover_ok ? "no" : "YES");
+
+        /* CLICK window B via XTest */
+        bool click_ok = false;
+#if defined(VT_HAVE_XTST)
+        int evb, errb, vmaj, vmin;
+        if (XTestQueryExtension(d, &evb, &errb, &vmaj, &vmin)) {
+            XTestFakeButtonEvent(d, 1, True, CurrentTime);
+            XTestFakeButtonEvent(d, 1, False, CurrentTime);
+            XFlush(d);
+            msleep(400);
+            Window act_click = active_of();
+            click_ok = (act_click == b);
+        }
+#endif
+        printf("click-focus=%s\n", click_ok ? "yes" : "no");
+        fflush(stdout);
+        XDestroyWindow(d, a);
+        XDestroyWindow(d, b);
+        XCloseDisplay(d);
+        return (hover_ok && click_ok) ? 0 : 1;
     }
 
     Window w1 = make_window(d, title, 100, 100, 400, 300, 0x3a5f9a);

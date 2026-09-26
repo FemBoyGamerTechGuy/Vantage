@@ -1,5 +1,5 @@
 src_backends = ['vt-backend.c', 'vt-backend-x11.c', 'vt-backend-wayland.c',
-                'vt-seat.c', 'vt-kms.c']
+                'vt-seat.c', 'vt-kms.c', 'vt-wl-panel.c']
 
 backend_deps = [vantage_core_dep]
 backend_cargs = []
@@ -77,6 +77,11 @@ if dep_xcursor.found()
 endif
 if dep_xkbcommon.found()
   backend_cargs += ['-DVT_HAVE_XKBCOMMON']
+endif
+# compositor-side panel text (real glyphs, not placeholder blocks)
+if dep_freetype.found() and dep_fontconfig.found()
+  backend_deps += [dep_freetype, dep_fontconfig]
+  backend_cargs += ['-DVT_HAVE_FREETYPE']
 endif
 
 lib_vantage_backends = static_library('vantage-backends',

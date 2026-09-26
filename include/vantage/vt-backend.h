@@ -1,7 +1,7 @@
 /*
  * vt-backend.h — Display backend abstraction
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Vantage has two display backends:
  *   - Wayland (native compositor on libwayland-server)
@@ -70,6 +70,7 @@ typedef enum {
     VT_BACKEND_WL_EVENT_WIN_STATE,
     VT_BACKEND_WL_EVENT_WIN_FOCUS,
     VT_BACKEND_WL_EVENT_WIN_GEOMETRY,
+    VT_BACKEND_WL_EVENT_WORKSPACE,   /* count/cur carried in the event */
 } vt_backend_wl_event_kind_t;
 
 typedef struct {

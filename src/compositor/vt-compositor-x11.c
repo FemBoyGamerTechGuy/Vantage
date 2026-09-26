@@ -1,7 +1,7 @@
 /*
  * vt-compositor-x11.c — X11 composite manager engine
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Uses XComposite (manual redirection), XDamage and XRender:
  *   - all root children are redirected; the compositor is the only thing

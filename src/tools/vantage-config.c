@@ -1,7 +1,7 @@
 /*
  * vantage-config.c — Configuration CLI
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  */
 
 #define VT_LOG_DOMAIN "config"

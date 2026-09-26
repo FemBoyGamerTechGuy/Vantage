@@ -1,7 +1,7 @@
 /*
  * vantage-desktop.c — Standalone desktop binary
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Owns the wallpaper surface, desktop icons and the root context menu.
  * Started by vantage-session; also works standalone on any EWMH WM.

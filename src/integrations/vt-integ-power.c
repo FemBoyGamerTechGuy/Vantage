@@ -1,7 +1,7 @@
 /*
  * vt-integ-power.c — Power/suspend/shutdown/reboot hooks
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Probes: logind (systemd) > elogind > UPower > direct /sys/power/state
  * + reboot(2)/shutdown(2). Works on systems without systemd/elogind.

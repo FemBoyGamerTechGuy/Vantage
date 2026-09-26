@@ -1,7 +1,7 @@
 /*
  * vt-wm.c — Vantage window manager (backend-agnostic core)
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Window placement, focus, stacking, workspaces, keyboard shortcuts.
  * The public model operations are routed to the active backend engine

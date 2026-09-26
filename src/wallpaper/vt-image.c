@@ -1,7 +1,7 @@
 /*
  * vt-image.c — Image loading for wallpapers (libpng + libjpeg direct)
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Loads PNG and JPEG files straight into RGBA buffers without pulling in
  * gdk-pixbuf/GLib. This keeps the wallpaper engine dependency-light; if

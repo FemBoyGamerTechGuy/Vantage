@@ -1,32 +1,161 @@
-                    GNU GENERAL PUBLIC LICENSE
-                       Version 2, June 1991
+VANTAGE DESKTOP ENVIRONMENT — PROPRIETARY SOURCE-AVAILABLE LICENSE
+Version 1.0
 
- Copyright (C) 1989, 1991 Free Software Foundation, Inc.
- 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
+Copyright (c) 2026 The Vantage Project. All rights reserved.
+Copyright holder of record: <COPYRIGHT HOLDER NAME> ("the Licensor").
+This file sets out the terms under which the Vantage Desktop Environment
+software, including its full source code, is made available. If you do
+not agree to all of these terms, you may not use, copy, modify, or
+redistribute the software.
 
- Everyone is permitted to copy and distribute verbatim copies
- of this license document, but changing it is not allowed.
+1. DEFINITIONS
 
-                            Preamble
+  "Software" means the Vantage Desktop Environment, including all source
+  code, build scripts, documentation, artwork, themes, configuration
+  files, and any derivatives or modifications thereof, in whole or in
+  part.
 
-  The licenses for most software are designed to take away your
-freedom to share and change it.  By contrast, the GNU General Public
-License is intended to guarantee your freedom to share and change free
-software--to make sure the software is free for all its users.
+  "Licensed Copy" means a copy of the Software obtained from the Licensor
+  or an authorized distribution channel, together with this License text.
 
-(This is a brief summary of the GNU GPL v2 — the full text is
-available at https://www.gnu.org/licenses/gpl-2.0.html)
+2. GRANT OF USE
 
-Vantage is licensed under the GNU General Public License v2 or, at
-your option, any later version. You may redistribute and/or modify
-Vantage under the terms of the GPL.
+  Subject to the terms of this License, the Licensor grants the person or
+  entity that obtains a Licensed Copy ("You") a limited, non-exclusive,
+  non-transferable, revocable permission to:
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
+    a) install and run the Software, in unmodified form, on computers
+       that You own or control, for personal or internal business use; and
 
-For the full text of the license, see:
-https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt
+    b) compile the unmodified source code solely to run it as described
+       in (a).
 
-SPDX-License-Identifier: GPL-2.0-or-later
+  No other rights are granted. Anything not expressly granted here is
+  reserved by the Licensor.
+
+3. RESTRICTIONS ON REDISTRIBUTION AND COPYING
+
+  You may NOT:
+
+    a) redistribute, sublicense, sell, rent, lease, lend, publish,
+       broadcast, or otherwise make the Software, or any part of it,
+       available to third parties, whether in source, binary, or any
+       other form;
+
+    b) publish, upload, mirror, or host the source code, or any modified
+       version of it, in any public or private repository, code-hosting
+       service, file-sharing service, or distribution channel;
+
+    c) remove, alter, obscure, or circumvent any copyright, trademark,
+       attribution, or licensing notice contained in the Software; or
+
+    d) use the Software to provide a commercial service to third parties
+       (including but not limited to hosting, support, or consulting
+       built on redistributed copies) without separate written permission
+       from the Licensor.
+
+  Making one backup copy of a Licensed Copy for archival or
+  disaster-recovery purposes, kept under Your exclusive control, is
+  permitted.
+
+4. RESTRICTIONS ON MODIFICATION
+
+  You may modify the Software only for Your own personal or internal use
+  on machines You own or control. Modified copies remain subject to this
+  License. You may NOT distribute modified copies, in source or binary
+  form, to any third party, and You may NOT publish modified source code
+  in any forum or repository. Contributions submitted to the Licensor
+  become the property of the Licensor (see Section 7).
+
+5. NO SUBLICENSING
+
+  This License is granted to You directly and may not be sublicensed,
+  assigned, or transferred without the prior written consent of the
+  Licensor. Any attempted sublicense, assignment, or transfer is void.
+
+6. BRAND AND TRADEMARK
+
+  "Vantage", the Vantage name and logo, and related marks are trademarks
+  of the Licensor. You may not:
+
+    a) use the marks to name, brand, or promote any product, service,
+       repository, or distribution other than the official Software
+       releases distributed by the Licensor;
+
+    b) create, distribute, or publicly display modified versions of the
+       Software under the Vantage name or marks; or
+
+    c) register or attempt to register any mark, domain name, or
+       identifier that is confusingly similar to the marks.
+
+7. CONTRIBUTIONS AND FEEDBACK
+
+  By submitting source code, patches, issue reports, or other
+  suggestions to the Licensor, You grant the Licensor a perpetual,
+  irrevocable, worldwide, royalty-free right to use, modify, sublicense
+  under any terms the Licensor chooses, and incorporate such
+  contributions into the Software and any other Licensor products,
+  without restriction or compensation.
+
+8. TERMINATION
+
+  This License and all rights granted under it terminate automatically
+  and without notice if You breach any of its terms. Upon termination
+  You must immediately cease all use of the Software and destroy all
+  copies (source, binary, modified, and backup) in Your possession or
+  control. Sections 9, 10, and 11 survive termination.
+
+9. NO WARRANTY
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+  OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+  MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, ACCURACY, AND
+  NON-INFRINGEMENT. THE ENTIRE RISK OF THE USE OR INABILITY TO USE THE
+  SOFTWARE REMAINS WITH YOU.
+
+10. NO LIABILITY
+
+  TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE LICENSOR SHALL
+  NOT BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+  EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING BUT NOT LIMITED TO
+  PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA,
+  PROFITS, OR BUSINESS INTERRUPTION) ARISING IN ANY WAY OUT OF THE USE
+  OF OR INABILITY TO USE THE SOFTWARE, EVEN IF ADVISED OF THE
+  POSSIBILITY OF SUCH DAMAGES.
+
+11. APPLICABLE LAW AND INTERPRETATION
+
+  This License shall be governed by and construed in accordance with the
+  laws of the jurisdiction of the Licensor's principal place of business
+  (to be recorded in the copyright holder line above), without regard to
+  conflict-of-law rules. Where mandatory local law grants You rights that
+  conflict with a term of this License (for example, statutory consumer
+  guarantees or statutory private-use exceptions), those rights are not
+  limited by this License; the remaining terms continue to apply to the
+  fullest extent permitted. If any term is held unenforceable, the
+  remaining terms remain in effect. The Uniform Computer Information
+  Transactions Act and the United Nations Convention on Contracts for
+  the International Sale of Goods do not apply to this License.
+
+12. FUTURE VERSIONS AND CHANGES
+
+  The Licensor may amend or replace this License in future releases of
+  the Software. The terms that apply to You are those distributed with
+  the particular Licensed Copy You obtained; copies obtained under later
+  terms are governed by those later terms.
+
+---------------------------------------------------------------------------
+NOTE ON LEGAL EFFECT
+
+This is a restrictive, source-available proprietary license. It is
+intended to reserve the Licensor's rights over copying, publication,
+modification, and redistribution, and to protect the Vantage branding.
+The Licensor makes no representation or guarantee about the legal
+enforceability of any particular clause in any particular jurisdiction;
+the disclaimer in Sections 9-11 applies to this document as well.
+
+The copyright holder line above intentionally uses a placeholder
+(<COPYRIGHT HOLDER NAME>) and must be completed by the rights owner
+before distribution.
+
+SPDX-License-Identifier: LicenseRef-Vantage-Proprietary

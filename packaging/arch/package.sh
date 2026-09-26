@@ -1,7 +1,7 @@
 #!/bin/bash
 # package.sh — Vantage's native Arch Linux packager
 #
-# SPDX-License-Identifier: GPL-2.0-or-later
+# SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
 #
 # Invoked by `./build packages arch` (never run by hand with makepkg):
 #
@@ -116,6 +116,7 @@ declare -A SONAME_MAP=(
     [libavfilter.so]=ffmpeg  [libavdevice.so]=ffmpeg  [libpostproc.so]=ffmpeg
     # data / image / GLib
     [libjson-c.so]=json-c  [libpng16.so]=libpng     [libpng.so]=libpng
+    [libfreetype.so]=freetype2 [libfontconfig.so]=fontconfig
     [libjpeg.so]=libjpeg-turbo [libturbojpeg.so]=libjpeg-turbo
     [libgdk_pixbuf-2.0.so]=gdk-pixbuf2
     [libgobject-2.0.so]=glib2 [libglib-2.0.so]=glib2 [libgio-2.0.so]=glib2
@@ -224,7 +225,7 @@ make_pkginfo() {  # $1=pkgname $2=pkgdesc $3=destdir [$4=conflict-with]; depends
         echo "packager = Vantage Build System <vantage@localhost>"
         echo "size = $size"
         echo "arch = $ARCH"
-        echo "license = GPL-2.0-or-later"
+        echo "license = LicenseRef-Vantage-Proprietary"
         while read -r dep; do
             [ -n "$dep" ] || continue
             valid_dep "$dep" || die "invalid dependency '$dep' would corrupt "\

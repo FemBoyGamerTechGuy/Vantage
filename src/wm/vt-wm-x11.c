@@ -1,21 +1,24 @@
 /*
  * vt-wm-x11.c — X11 window manager engine (EWMH/ICCCM)
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * The full window-management engine for the Xorg/XLibre backends:
  *   - client lifecycle (manage / withdraw / destroy)
  *   - EWMH root properties and client state atoms
- *   - focus (click + sloppy), stacking layers, raise/restack
+ *   - focus (click-to-focus by default, sloppy optional)
+ *   - stacking layers, raise/restack
  *   - workspaces, sticky windows, taskbar-visible client list
  *   - maximize / fullscreen / minimize with proper state transitions
  *   - edge-snap tiling on interactive move
  *   - keyboard hotkeys via XGrabKey, alt-drag move/resize via XGrabButton
  *   - workarea computation honoring panel struts
+ *   - server-side decorations: a reparenting frame with title bar,
+ *     close/maximize/minimize buttons, borders and edge resize grips
  *
- * Vantage draws no server-side decorations by default; the compositor
- * provides shadows, and CSD/toolkit chrome covers the rest. _NET_FRAME_
- * EXTENTS is announced as 0,0,0,0.
+ * The frame is a plain InputOutput window the WM owns; the client is
+ * reparented into it at a fixed inset. _NET_FRAME_EXTENTS reports the
+ * real inset so EWMH-aware panels/taskbars size correctly.
  */
 
 #define VT_LOG_DOMAIN "wm-x11"
@@ -34,15 +37,24 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <signal.h>
+#include <time.h>
 
 #if defined(VT_HAVE_XCURSOR)
 #include <X11/Xcursor/Xcursor.h>
+#endif
+
+#if defined(VT_HAVE_XFT)
+#include <X11/extensions/Xrender.h>
+#include <X11/Xft/Xft.h>
 #endif
 
 /* ------------------------------------------------------------- client */
 typedef struct _client {
     vt_window_t      model;        /* embedded public model; id == Window */
     Window           win;
+    Window           frame;        /* decoration frame (None if unframed) */
+    bool             framed;
+    int              fr_title;     /* live title-bar height (0 fullscreen) */
     Window           transient_for;
     bool             has_size_hints;
     long             min_w, min_h, max_w, max_h, base_w, base_h, inc_w, inc_h;
@@ -52,6 +64,7 @@ typedef struct _client {
     bool             is_desktop;
     bool             expect_unmap;
     unsigned long    opacity;
+    Time             last_title_click;   /* double-click maximize */
 } _client_t;
 
 typedef struct {
@@ -69,11 +82,14 @@ typedef struct vt_wm_x11 {
     int              n_desktops;
     int              cur_desktop;
     int              sink_id;
-    bool             sloppy_focus;
+    bool             sloppy_focus;    /* default: click-to-focus */
     bool             snap_enabled;
     Cursor           cur_move, cur_resize;
     Cursor           cur_default;      /* themed root cursor */
     bool             cur_default_set;
+#if defined(VT_HAVE_XFT)
+    XftFont         *tfont;           /* frame title font */
+#endif
     /* interactive move/resize */
     bool             in_op;
     int              op_mode;         /* 0=move 1=resize */
@@ -359,9 +375,351 @@ static void _set_state_atoms(vt_wm_x11_t *e, _client_t *c) {
                          PropModeReplace, (const unsigned char *)list, n);
 }
 
+static void _set_frame_extents(vt_wm_x11_t *e, _client_t *c);
+static void _frame_paint(vt_wm_x11_t *e, _client_t *c);
+static void _send_configure(vt_wm_x11_t *e, _client_t *c);
+static void _close(vt_wm_x11_t *e, _client_t *c);
+static void _maximize(vt_wm_x11_t *e, _client_t *c, bool on);
+static void _minimize(vt_wm_x11_t *e, _client_t *c, bool on);
+static void _focus(vt_wm_x11_t *e, _client_t *c);
+static void _raise(vt_wm_x11_t *e, _client_t *c);
+static void _op_start(vt_wm_x11_t *e, _client_t *c, int mode, int edge,
+                      int px, int py);
+
+/* ------------------------------------------------------ decorations */
+#define _FR_BORDER 2
+#define _FR_TITLE  26
+#define _FR_BTN_W  26
+#define _FR_BTN_GAP 2
+
 static void _set_frame_extents(vt_wm_x11_t *e, _client_t *c) {
-    unsigned long fe[4] = { 0, 0, 0, 0 };
+    unsigned long fe[4];
+    if (c->framed) {
+        fe[0] = (unsigned long)_FR_BORDER;                 /* left   */
+        fe[1] = (unsigned long)_FR_BORDER;                 /* right  */
+        fe[2] = (unsigned long)(c->fr_title + _FR_BORDER);  /* top    */
+        fe[3] = (unsigned long)_FR_BORDER;                 /* bottom */
+    } else {
+        memset(fe, 0, sizeof(fe));
+    }
     _set_cardinal_list(c->win, vt_x11_atoms()->net_frame_extents, fe, 4);
+}
+
+static bool _framed(const _client_t *c) {
+    return c && c->framed && c->frame != None;
+}
+
+static Window _fr_win(const _client_t *c) {
+    return _framed(c) ? c->frame : c->win;
+}
+
+/* frame geometry derived from the (client-space) model geometry */
+static void _frame_geom(const _client_t *c, int *fx, int *fy, int *fw,
+                        int *fh) {
+    *fx = c->model.x - _FR_BORDER;
+    *fy = c->model.y - (c->fr_title + _FR_BORDER);
+    *fw = c->model.w + 2 * _FR_BORDER;
+    *fh = c->model.h + c->fr_title + 2 * _FR_BORDER;
+}
+
+#if defined(VT_HAVE_XFT)
+static void _fill(Display *dpy, XRenderPictFormat *fmt, Drawable d, int x,
+                  int y, int w, int h, unsigned long argb) {
+    Picture pic = XRenderCreatePicture(dpy, d, fmt, 0, NULL);
+    XRenderColor c = {
+        .red   = (unsigned short)(((argb >> 16) & 0xff) * 0x101),
+        .green = (unsigned short)(((argb >> 8)  & 0xff) * 0x101),
+        .blue  = (unsigned short)(((argb)       & 0xff) * 0x101),
+        .alpha = (unsigned short)(((argb >> 24) & 0xff) * 0x101),
+    };
+    XRenderFillRectangle(dpy, PictOpSrc, pic, &c, (short)x, (short)y,
+                          (unsigned)w, (unsigned)h);
+    XRenderFreePicture(dpy, pic);
+}
+#endif
+
+/* Paint the frame: border, title bar, title text, window buttons.
+ * Colors follow the Vantage dark palette; the active window gets the
+ * accent border and bright text, inactive ones dim down. */
+static void _frame_paint(vt_wm_x11_t *e, _client_t *c) {
+    if (!_framed(c)) return;
+    Display *dpy = e->dpy;
+    Window fw = c->frame;
+    int fx, fy, fw_, fh_;
+    _frame_geom(c, &fx, &fy, &fw_, &fh_);
+    if (c->fr_title <= 0) {
+        /* fullscreen: solid edge, no chrome */
+#if defined(VT_HAVE_XFT)
+        XRenderPictFormat *fmt = XRenderFindVisualFormat(dpy,
+            DefaultVisual(dpy, DefaultScreen(dpy)));
+        _fill(dpy, fmt, fw, 0, 0, fw_, fh_, 0xff000000);
+#endif
+        return;
+    }
+
+#if defined(VT_HAVE_XFT)
+    XRenderPictFormat *fmt = XRenderFindVisualFormat(
+        dpy, DefaultVisual(dpy, DefaultScreen(dpy)));
+    bool active = c->model.focused;
+    unsigned long border = active ? 0xff4f9adc : 0xff26282e;
+    unsigned long bar    = active ? 0xff2b2f36 : 0xff1a1c22;
+    unsigned long fg     = active ? 0xffeceef0 : 0xff909399;
+
+    int tw = fw_, th = c->fr_title + _FR_BORDER;
+    _fill(dpy, fmt, fw, 0, 0, tw, th, bar);                       /* title bar  */
+    _fill(dpy, fmt, fw, 0, th, _FR_BORDER, fh_ - th, border);     /* left edge  */
+    _fill(dpy, fmt, fw, tw - _FR_BORDER, th, _FR_BORDER, fh_ - th, border);
+    _fill(dpy, fmt, fw, 0, fh_ - _FR_BORDER, tw, _FR_BORDER, border);
+    _fill(dpy, fmt, fw, _FR_BORDER, th, tw - 2 * _FR_BORDER, fh_ - th - _FR_BORDER,
+          0xff000000);   /* behind the client (occluded, keeps X happy) */
+
+    /* buttons: [min][max][close] at the right end of the title bar */
+    int by = _FR_BORDER;
+    int btn_y = by + (c->fr_title - 8) / 2;     /* glyph vertical center */
+    int bx = tw - _FR_BORDER - _FR_BTN_W;
+    struct { char kind; unsigned long col; } btns[3] = {
+        { 'x', 0xffe05a5a },   /* close    */
+        { 'm', 0xff4f9adc },   /* maximize */
+        { 'n', 0xff7ac860 },   /* minimize */
+    };
+    for (int i = 0; i < 3; i++) {
+        int x0 = bx - i * (_FR_BTN_W + _FR_BTN_GAP);
+        /* subtle button well */
+        _fill(dpy, fmt, fw, x0 + 3, by + 3, _FR_BTN_W - 6, c->fr_title - 6,
+              (bar & 0xffffff00u) | 0x33);
+        unsigned long g = btns[i].col;
+        switch (btns[i].kind) {
+        case 'x':                     /* × */
+            _fill(dpy, fmt, fw, x0 + 10, btn_y,     2, 2, g);
+            _fill(dpy, fmt, fw, x0 + 14, btn_y,     2, 2, g);
+            _fill(dpy, fmt, fw, x0 + 12, btn_y + 2, 2, 2, g);
+            _fill(dpy, fmt, fw, x0 + 10, btn_y + 4, 2, 2, g);
+            _fill(dpy, fmt, fw, x0 + 14, btn_y + 4, 2, 2, g);
+            break;
+        case 'm':                     /* ▢ */
+            _fill(dpy, fmt, fw, x0 + 10, btn_y, 6, 6, g);
+            _fill(dpy, fmt, fw, x0 + 11, btn_y + 1, 4, 4, bar | 0xff000000u);
+            break;
+        case 'n':                     /* – */
+        default:
+            _fill(dpy, fmt, fw, x0 + 10, btn_y + 3, 6, 2, g);
+            break;
+        }
+    }
+
+    /* title text */
+    const char *title = c->model.title ? c->model.title : "";
+    if (*title && e->tfont) {
+        XftDraw *d = XftDrawCreate(dpy, fw,
+                                   DefaultVisual(dpy, DefaultScreen(dpy)),
+                                   DefaultColormap(dpy, DefaultScreen(dpy)));
+        XftColor c8;
+        XRenderColor rc = {
+            .red   = (unsigned short)(((fg >> 16) & 0xff) * 0x101),
+            .green = (unsigned short)(((fg >> 8)  & 0xff) * 0x101),
+            .blue  = (unsigned short)(((fg)       & 0xff) * 0x101),
+            .alpha = 0xffff,
+        };
+        XftColorAllocValue(dpy, DefaultVisual(dpy, DefaultScreen(dpy)),
+                           DefaultColormap(dpy, DefaultScreen(dpy)), &rc, &c8);
+        int max_w = bx - 3 * (_FR_BTN_W + _FR_BTN_GAP) - 10 - 8;
+        XGlyphInfo gi;
+        XftTextExtentsUtf8(dpy, e->tfont, (const FcChar8 *)title,
+                           (int)strlen(title), &gi);
+        char shown[128];
+        snprintf(shown, sizeof(shown), "%s", title);
+        if (gi.xOff > max_w && max_w > 16) {
+            for (;;) {
+                size_t l = strlen(shown);
+                if (l < 2 || gi.xOff <= max_w) break;
+                shown[l - 1] = 0;
+                snprintf(shown + strlen(shown),
+                         sizeof(shown) - strlen(shown), "%s",
+                         "\xe2\x80\xa6");   /* ellipsis */
+                XftTextExtentsUtf8(dpy, e->tfont, (const FcChar8 *)shown,
+                                   (int)strlen(shown), &gi);
+            }
+        }
+        
+        XftDrawStringUtf8(d, &c8, e->tfont, 8,
+                          _FR_BORDER + (c->fr_title + _FR_BORDER + 8) / 2 -
+                          e->tfont->height / 2 + e->tfont->ascent - 2,
+                          (const FcChar8 *)shown, (int)strlen(shown));
+        XftColorFree(dpy, DefaultVisual(dpy, DefaultScreen(dpy)),
+                     DefaultColormap(dpy, DefaultScreen(dpy)), &c8);
+        XftDrawDestroy(d);
+    }
+#else
+    (void)e;
+#endif /* VT_HAVE_XFT */
+}
+
+/* Which decoration hotspot is at frame-local (x,y)? */
+typedef enum {
+    _FR_HIT_NONE = 0, _FR_HIT_TITLE, _FR_HIT_CLOSE, _FR_HIT_MAX,
+    _FR_HIT_MIN, _FR_HIT_EDGE_L, _FR_HIT_EDGE_R, _FR_HIT_EDGE_T,
+    _FR_HIT_EDGE_B, _FR_HIT_CORNER_TL, _FR_HIT_CORNER_TR,
+    _FR_HIT_CORNER_BL, _FR_HIT_CORNER_BR,
+} _fr_hit_t;
+
+static _fr_hit_t _frame_hit(_client_t *c, int x, int y, int fw_, int fh_) {
+    if (!_framed(c)) return _FR_HIT_NONE;
+    if (c->fr_title <= 0) {         /* fullscreen: edges only */
+        int m = _FR_BORDER + 4;
+        bool l = x < m, r = x > fw_ - m, t = y < m, b = y > fh_ - m;
+        if (l && t) return _FR_HIT_CORNER_TL;
+        if (r && t) return _FR_HIT_CORNER_TR;
+        if (l && b) return _FR_HIT_CORNER_BL;
+        if (r && b) return _FR_HIT_CORNER_BR;
+        if (l) return _FR_HIT_EDGE_L;
+        if (r) return _FR_HIT_EDGE_R;
+        if (t) return _FR_HIT_EDGE_T;
+        if (b) return _FR_HIT_EDGE_B;
+        return _FR_HIT_NONE;
+    }
+    int th = c->fr_title + _FR_BORDER;
+    if (y <= th) {
+        /* title row (top border included) */
+        int bx = fw_ - _FR_BORDER - _FR_BTN_W;
+        if (x >= bx) return _FR_HIT_CLOSE;
+        if (x >= bx - (_FR_BTN_W + _FR_BTN_GAP)) return _FR_HIT_MAX;
+        if (x >= bx - 2 * (_FR_BTN_W + _FR_BTN_GAP)) return _FR_HIT_MIN;
+        return _FR_HIT_TITLE;
+    }
+    if (y >= fh_ - _FR_BORDER - 4) {
+        bool l = x < _FR_BORDER + 8, r = x > fw_ - _FR_BORDER - 8;
+        if (l) return _FR_HIT_CORNER_BL;
+        if (r) return _FR_HIT_CORNER_BR;
+        return _FR_HIT_EDGE_B;
+    }
+    if (x <= _FR_BORDER + 4) {
+        if (y < th + 8) return _FR_HIT_CORNER_TL;
+        return _FR_HIT_EDGE_L;
+    }
+    if (x >= fw_ - _FR_BORDER - 4) {
+        if (y < th + 8) return _FR_HIT_CORNER_TR;
+        return _FR_HIT_EDGE_R;
+    }
+    return _FR_HIT_NONE;
+}
+
+/* Create the frame and reparent the client into it. */
+static void _frame_create(vt_wm_x11_t *e, _client_t *c) {
+    Display *dpy = e->dpy;
+    c->fr_title = _FR_TITLE;
+    int fx, fy, fw_, fh_;
+    _frame_geom(c, &fx, &fy, &fw_, &fh_);
+    XSetWindowAttributes wa = {
+        .override_redirect = False,
+        .background_pixel = BlackPixel(dpy, DefaultScreen(dpy)),
+        .event_mask = ExposureMask | ButtonPressMask | ButtonReleaseMask |
+                      ButtonMotionMask | SubstructureNotifyMask |
+                      EnterWindowMask,
+    };
+    c->frame = XCreateWindow(dpy, e->root, fx, fy, (unsigned)fw_,
+                             (unsigned)fh_, 0, CopyFromParent, InputOutput,
+                             CopyFromParent, CWOverrideRedirect | CWBackPixel |
+                             CWEventMask, &wa);
+    c->framed = true;
+    if (e->cur_default_set) XDefineCursor(dpy, c->frame, e->cur_default);
+
+    /* reparent: guard against the reparent-unmap being read as a withdraw */
+    c->expect_unmap = true;
+    XReparentWindow(dpy, c->win, c->frame, _FR_BORDER,
+                    c->fr_title + _FR_BORDER);
+    XMapWindow(dpy, c->win);
+    /* keep the alt-drag grabs working on the client window itself */
+    unsigned int mods[] = { 0, LockMask, Mod2Mask, Mod5Mask };
+    for (size_t i = 0; i < VT_ARRAY_SIZE(mods); i++) {
+        XGrabButton(dpy, Button1, Mod1Mask | mods[i], c->win, False,
+                    ButtonPressMask | ButtonMotionMask | ButtonReleaseMask,
+                    GrabModeSync, GrabModeSync, None, None);
+        XGrabButton(dpy, Button3, Mod1Mask | mods[i], c->win, False,
+                    ButtonPressMask | ButtonMotionMask | ButtonReleaseMask,
+                    GrabModeSync, GrabModeSync, None, None);
+        XGrabButton(dpy, Button1, mods[i], c->win, False,
+                    ButtonPressMask | ButtonMotionMask | ButtonReleaseMask,
+                    GrabModeSync, GrabModeSync, None, None);
+    }
+}
+
+/* Destroy the frame, restoring the client to the root. */
+static void _frame_destroy(vt_wm_x11_t *e, _client_t *c, bool destroyed) {
+    if (!_framed(c)) return;
+    Display *dpy = e->dpy;
+    if (!destroyed) {
+        XUnmapWindow(dpy, c->frame);
+        c->expect_unmap = true;
+        XReparentWindow(dpy, c->win, e->root, c->model.x, c->model.y);
+        XMapWindow(dpy, c->win);
+    }
+    XDestroyWindow(dpy, c->frame);
+    c->frame = None;
+    c->framed = false;
+}
+
+/* Find the client whose frame is `w` (frame events). */
+static _client_t *_find_frame(vt_wm_x11_t *e, Window w) {
+    for (size_t i = 0; i < e->clients.size; i++) {
+        _client_t *c = *(_client_t **)vt_vec_at(&e->clients, i);
+        if (_framed(c) && c->frame == w) return c;
+    }
+    return NULL;
+}
+
+/* Button press on the decoration frame: buttons, title drag, edges. */
+static void _frame_button(vt_wm_x11_t *e, _client_t *c, XButtonEvent *be) {
+    int fw_, fh_, fx, fy;
+    _frame_geom(c, &fx, &fy, &fw_, &fh_);
+    _fr_hit_t hit = _frame_hit(c, be->x, be->y, fw_, fh_);
+
+    /* any press on the frame focuses the window first */
+    if (!c->model.focused) _focus(e, c);
+
+    if (be->button == Button1) {
+        switch (hit) {
+        case _FR_HIT_CLOSE:
+            _close(e, c);
+            return;
+        case _FR_HIT_MAX:
+            _maximize(e, c, !c->model.maximized);
+            return;
+        case _FR_HIT_MIN:
+            _minimize(e, c, true);
+            return;
+        case _FR_HIT_TITLE: {
+            /* double-click toggles maximize */
+            if (c->last_title_click &&
+                be->time - c->last_title_click < 400) {
+                _maximize(e, c, !c->model.maximized);
+                c->last_title_click = 0;
+                return;
+            }
+            c->last_title_click = be->time;
+            _raise(e, c);
+            _op_start(e, c, 0, 0, be->x_root, be->y_root);
+            return;
+        }
+        case _FR_HIT_EDGE_L:   _op_start(e, c, 1, 4, be->x_root, be->y_root); return;
+        case _FR_HIT_EDGE_R:   _op_start(e, c, 1, 1, be->x_root, be->y_root); return;
+        case _FR_HIT_EDGE_T:   _op_start(e, c, 1, 8, be->x_root, be->y_root); return;
+        case _FR_HIT_EDGE_B:   _op_start(e, c, 1, 2, be->x_root, be->y_root); return;
+        case _FR_HIT_CORNER_TL: _op_start(e, c, 1, 4 | 8, be->x_root, be->y_root); return;
+        case _FR_HIT_CORNER_TR: _op_start(e, c, 1, 1 | 8, be->x_root, be->y_root); return;
+        case _FR_HIT_CORNER_BL: _op_start(e, c, 1, 4 | 2, be->x_root, be->y_root); return;
+        case _FR_HIT_CORNER_BR: _op_start(e, c, 1, 1 | 2, be->x_root, be->y_root); return;
+        default:
+            _raise(e, c);
+            return;
+        }
+    } else if (be->button == Button3) {
+        if (hit == _FR_HIT_TITLE || hit == _FR_HIT_NONE)
+            _op_start(e, c, 1, 1 | 2, be->x_root, be->y_root);
+        else
+            _op_start(e, c, 1, 1 | 2, be->x_root, be->y_root);
+    } else if (be->button == Button2) {
+        _minimize(e, c, true);
+    }
 }
 
 /* -------------------------------------------------------- focus/stack */
@@ -373,7 +731,7 @@ static void _restack(vt_wm_x11_t *e) {
     vt_vec_sort(&e->stacking, _cmp_layer_asc);
     for (size_t i = 0; i < e->stacking.size; i++) {
         _client_t *c = *(_client_t **)vt_vec_at(&e->stacking, i);
-        XRaiseWindow(e->dpy, c->win);
+        XRaiseWindow(e->dpy, _fr_win(c));
     }
     _update_client_list(e);
 }
@@ -384,16 +742,19 @@ static void _raise(vt_wm_x11_t *e, _client_t *c) {
         if (*pp == c) { vt_vec_remove(&e->stacking, i); break; }
     }
     vt_vec_push(&e->stacking, &c);
-    XRaiseWindow(e->dpy, c->win);
+    XRaiseWindow(e->dpy, _fr_win(c));
     _restack(e);
 }
 
 static void _focus(vt_wm_x11_t *e, _client_t *c) {
     const vt_x11_atoms_t *a = vt_x11_atoms();
+    _client_t *prev = NULL;
     for (size_t i = 0; i < e->clients.size; i++) {
         _client_t *p = *(_client_t **)vt_vec_at(&e->clients, i);
+        if (p->model.focused) prev = p;
         p->model.focused = (p == c);
     }
+    if (prev && prev != c) _frame_paint(e, prev);   /* dim the old frame */
     if (c) {
         if (c->input_hint || !c->take_focus)
             XSetInputFocus(e->dpy, c->win, RevertToPointerRoot, CurrentTime);
@@ -406,9 +767,12 @@ static void _focus(vt_wm_x11_t *e, _client_t *c) {
             msg.xclient.data.l[1] = CurrentTime;
             XSendEvent(e->dpy, c->win, False, NoEventMask, &msg);
         }
-        unsigned long w = c->win;
-        _set_cardinal_list(e->root, a->net_active_window, &w, 1);
+        /* EWMH: _NET_ACTIVE_WINDOW is of type WINDOW */
+        Window w = c->win;
+        XChangeProperty(e->dpy, e->root, a->net_active_window, XA_WINDOW, 32,
+                        PropModeReplace, (const unsigned char *)&w, 1);
         _raise(e, c);
+        _frame_paint(e, c);       /* brighten the new frame */
         for (size_t i = 0; i < e->clients.size; i++) {
             _client_t **pp = vt_vec_at(&e->clients, i);
             if (*pp == c) { vt_vec_remove(&e->clients, i); break; }
@@ -509,14 +873,26 @@ static void _apply_configure(vt_wm_x11_t *e, _client_t *c, int x, int y,
     }
     if (w < 1) w = 1;
     if (h < 1) h = 1;
-    XWindowChanges wc = { .x = x, .y = y, .width = w, .height = h,
-                          .border_width = 0, .sibling = None,
-                          .stack_mode = Above };
-    XConfigureWindow(e->dpy, c->win,
-                     CWX | CWY | CWWidth | CWHeight | CWBorderWidth |
-                     CWStackMode, &wc);
     c->model.x = x; c->model.y = y;
     c->model.w = w; c->model.h = h;
+    if (_framed(c)) {
+        int fx, fy, fw_, fh_;
+        _frame_geom(c, &fx, &fy, &fw_, &fh_);
+        XMoveResizeWindow(e->dpy, c->frame, fx, fy, (unsigned)fw_,
+                          (unsigned)fh_);
+        XMoveResizeWindow(e->dpy, c->win, _FR_BORDER,
+                          c->fr_title + _FR_BORDER, (unsigned)w, (unsigned)h);
+        _frame_paint(e, c);
+        /* tell the client its root-relative geometry (ICCCM 4.2.3) */
+        _send_configure(e, c);
+    } else {
+        XWindowChanges wc = { .x = x, .y = y, .width = w, .height = h,
+                              .border_width = 0, .sibling = None,
+                              .stack_mode = Above };
+        XConfigureWindow(e->dpy, c->win,
+                         CWX | CWY | CWWidth | CWHeight | CWBorderWidth |
+                         CWStackMode, &wc);
+    }
 }
 
 static void _manage(vt_wm_x11_t *e, Window w) {
@@ -601,10 +977,16 @@ static void _manage(vt_wm_x11_t *e, Window w) {
     _set_wm_state(e, c, NormalState);
     _set_net_wm_desktop(e, c);
     _set_allowed_actions(e, c);
+
+    /* decorations: docks/desktops stay undecorated */
+    if (!c->is_dock && !c->is_desktop) _frame_create(e, c);
     _set_frame_extents(e, c);
     _set_state_atoms(e, c);
 
-    /* grab alt-drag move/resize on the client, ignoring lock modifiers */
+    /* grab alt-drag move/resize AND plain Button1 (click-to-focus) on
+     * the client, ignoring lock modifiers. The plain grab makes the WM
+     * see every click first; ReplayPointer then delivers it to the
+     * client — the classic click-to-focus mechanism. */
     unsigned int mods[] = { 0, LockMask, Mod2Mask, Mod5Mask, LockMask | Mod2Mask,
                             LockMask | Mod5Mask, Mod2Mask | Mod5Mask,
                             LockMask | Mod2Mask | Mod5Mask };
@@ -613,6 +995,9 @@ static void _manage(vt_wm_x11_t *e, Window w) {
                     ButtonPressMask | ButtonMotionMask | ButtonReleaseMask,
                     GrabModeSync, GrabModeSync, None, None);
         XGrabButton(e->dpy, Button3, Mod1Mask | mods[i], c->win, False,
+                    ButtonPressMask | ButtonMotionMask | ButtonReleaseMask,
+                    GrabModeSync, GrabModeSync, None, None);
+        XGrabButton(e->dpy, Button1, mods[i], c->win, False,
                     ButtonPressMask | ButtonMotionMask | ButtonReleaseMask,
                     GrabModeSync, GrabModeSync, None, None);
     }
@@ -626,6 +1011,10 @@ static void _manage(vt_wm_x11_t *e, Window w) {
     if (c->is_dock || c->is_desktop) _update_workarea(e);
 
     XMapWindow(e->dpy, w);
+    if (_framed(c)) {
+        XMapWindow(e->dpy, c->frame);
+        _frame_paint(e, c);
+    }
 
     if (!c->is_dock && !c->is_desktop &&
         (c->model.sticky || c->model.workspace == e->cur_desktop))
@@ -651,7 +1040,9 @@ static void _unmanage(vt_wm_x11_t *e, Window w, bool destroyed) {
     _remove_model(e, c);
     if (!destroyed) {
         XRemoveFromSaveSet(e->dpy, w);
+        XUngrabButton(e->dpy, AnyButton, AnyModifier, w);
     }
+    _frame_destroy(e, c, destroyed);
     bool was_dock = c->is_dock;
     bool was_focused = c->model.focused;
     _client_free(c);
@@ -686,14 +1077,17 @@ static void _fullscreen(vt_wm_x11_t *e, _client_t *c, bool on) {
         c->model.prev_x = c->model.x; c->model.prev_y = c->model.y;
         c->model.prev_w = c->model.w; c->model.prev_h = c->model.h;
         c->model.fullscreen = true;
+        c->fr_title = 0;          /* chrome off while fullscreen */
         _apply_configure(e, c, out.x, out.y, out.w, out.h);
         _raise(e, c);
     } else {
         c->model.fullscreen = false;
+        c->fr_title = _FR_TITLE;
         _apply_configure(e, c, c->model.prev_x, c->model.prev_y,
                          c->model.prev_w, c->model.prev_h);
     }
     _set_state_atoms(e, c);
+    _set_frame_extents(e, c);
     _emit_win(e, c, VT_WM_EVENT_STATE);
 }
 
@@ -701,13 +1095,13 @@ static void _minimize(vt_wm_x11_t *e, _client_t *c, bool on) {
     if (on == c->model.minimized) return;
     c->model.minimized = on;
     if (on) {
-        c->expect_unmap = true;
-        XUnmapWindow(e->dpy, c->win);
+        XUnmapWindow(e->dpy, _fr_win(c));
         c->model.mapped = false;
         _set_wm_state(e, c, IconicState);
         if (c->model.focused) { c->model.focused = false; _focus_top_on_desktop(e); }
     } else {
-        XMapWindow(e->dpy, c->win);
+        XMapWindow(e->dpy, _fr_win(c));
+        if (_framed(c)) XMapWindow(e->dpy, c->win);
         c->model.mapped = true;
         _set_wm_state(e, c, NormalState);
         _focus(e, c);
@@ -763,12 +1157,12 @@ static void _set_desktop(vt_wm_x11_t *e, int d) {
         _client_t *c = *(_client_t **)vt_vec_at(&e->clients, i);
         if (c->is_dock || c->is_desktop || c->model.sticky) continue;
         if (c->model.workspace == d && !c->model.minimized) {
-            XMapWindow(e->dpy, c->win);
+            XMapWindow(e->dpy, _fr_win(c));
+            if (_framed(c)) XMapWindow(e->dpy, c->win);
             c->model.mapped = true;
             _set_wm_state(e, c, NormalState);
         } else if (c->model.workspace != d && !c->model.minimized) {
-            c->expect_unmap = true;
-            XUnmapWindow(e->dpy, c->win);
+            XUnmapWindow(e->dpy, _fr_win(c));
             c->model.mapped = false;
             _set_wm_state(e, c, IconicState);
         }
@@ -785,7 +1179,8 @@ static void _move_to_desktop(vt_wm_x11_t *e, _client_t *c, int d) {
         if (c->model.workspace != e->cur_desktop) {
             c->model.workspace = d;
             _set_net_wm_desktop(e, c);
-            XMapWindow(e->dpy, c->win);
+            XMapWindow(e->dpy, _fr_win(c));
+            if (_framed(c)) XMapWindow(e->dpy, c->win);
             c->model.mapped = true;
             _set_wm_state(e, c, NormalState);
             _focus(e, c);
@@ -794,8 +1189,7 @@ static void _move_to_desktop(vt_wm_x11_t *e, _client_t *c, int d) {
     }
     if (!c->model.sticky && c->model.workspace == e->cur_desktop &&
         !c->model.minimized) {
-        c->expect_unmap = true;
-        XUnmapWindow(e->dpy, c->win);
+        XUnmapWindow(e->dpy, _fr_win(c));
         c->model.mapped = false;
         _set_wm_state(e, c, IconicState);
     }
@@ -918,6 +1312,14 @@ static void _handle_client_message(vt_wm_x11_t *e, XClientMessageEvent *cm) {
     if (cm->window == e->root) {
         if (cm->message_type == a->net_current_desktop)
             _set_desktop(e, (int)cm->data.l[0]);
+        else if (cm->message_type == a->net_active_window) {
+            /* EWMH root form: the window to activate travels in l[2] */
+            _client_t *c = _find(e, (Window)cm->data.l[2]);
+            if (c) {
+                if (c->model.minimized) _minimize(e, c, false);
+                _focus(e, c);
+            }
+        }
         return;
     }
     _client_t *c = _find(e, cm->window);
@@ -1053,7 +1455,11 @@ static void _on_backend_event(void *ud, void *event) {
         _client_t *c = _find(e, mr->window);
         if (c) {
             if (c->model.minimized) _minimize(e, c, false);
-            else { XMapWindow(e->dpy, mr->window); _focus(e, c); }
+            else {
+                XMapWindow(e->dpy, mr->window);
+                if (_framed(c)) XMapWindow(e->dpy, c->frame);
+                _focus(e, c);
+            }
         } else {
             _manage(e, mr->window);
         }
@@ -1063,8 +1469,11 @@ static void _on_backend_event(void *ud, void *event) {
         XConfigureRequestEvent *cr = &ev->xconfigurerequest;
         _client_t *c = _find(e, cr->window);
         if (c) {
-            int x = (cr->value_mask & CWX) ? cr->x : c->model.x;
-            int y = (cr->value_mask & CWY) ? cr->y : c->model.y;
+            /* client coordinates are relative to its parent — the frame */
+            int x = (cr->value_mask & CWX)
+                        ? cr->x - _FR_BORDER : c->model.x;
+            int y = (cr->value_mask & CWY)
+                        ? cr->y - (c->fr_title + _FR_BORDER) : c->model.y;
             int w = (cr->value_mask & CWWidth) ? cr->width : c->model.w;
             int h = (cr->value_mask & CWHeight) ? cr->height : c->model.h;
             if (c->model.maximized || c->model.fullscreen) {
@@ -1094,14 +1503,13 @@ static void _on_backend_event(void *ud, void *event) {
         _client_t *c = _find(e, ue->window);
         if (!c) break;
         c->model.mapped = false;
-        /* We select StructureNotifyMask on the window AND
-         * SubstructureNotifyMask on the root, so every unmap of a
-         * top-level window arrives TWICE (event=window and
-         * event=root). Both describe the same physical unmap; act on
-         * the root variant only, otherwise the expect_unmap guard is
-         * consumed by the first copy and the second unmanages a
-         * window the WM itself just iconified or moved. */
-        if (ue->event != e->root) break;
+        /* Top-level unmaps arrive on the root (unframed clients) or on
+         * the frame (framed clients: the WM selected
+         * SubstructureNotifyMask there). Minimize/workspace switches
+         * unmap the FRAME, so a client unmap means a real withdrawal —
+         * except the synthetic one the reparent generates, which the
+         * expect_unmap guard absorbs. */
+        if (ue->event != e->root && ue->event != c->frame) break;
         if (c->expect_unmap) { c->expect_unmap = false; break; }
         if (!ue->send_event) {
             _set_wm_state(e, c, WithdrawnState);
@@ -1143,6 +1551,11 @@ static void _on_backend_event(void *ud, void *event) {
     case ButtonPress: {
         XButtonEvent *be = &ev->xbutton;
         _client_t *c = _find(e, be->window);
+        if (!c) c = _find_frame(e, be->window);
+        if (c && _framed(c) && be->window == c->frame) {
+            _frame_button(e, c, be);
+            break;
+        }
         if (c && (be->state & Mod1Mask) && !c->model.fullscreen) {
             _raise(e, c);
             if (be->button == Button1)
@@ -1157,6 +1570,12 @@ static void _on_backend_event(void *ud, void *event) {
         } else {
             XAllowEvents(e->dpy, AsyncPointer, CurrentTime);
         }
+        break;
+    }
+    case Expose: {
+        if (ev->xexpose.count > 0) break;   /* only the last of a batch */
+        _client_t *c = _find_frame(e, ev->xexpose.window);
+        if (c) _frame_paint(e, c);
         break;
     }
     case MotionNotify: {
@@ -1187,12 +1606,14 @@ static void _on_backend_event(void *ud, void *event) {
     }
     case FocusIn: {
         _client_t *c = _find(e, ev->xfocus.window);
-        if (c) c->model.focused = true;
+        if (!c) c = _find_frame(e, ev->xfocus.window);
+        if (c && !c->model.focused) { c->model.focused = true; _frame_paint(e, c); }
         break;
     }
     case FocusOut: {
         _client_t *c = _find(e, ev->xfocus.window);
-        if (c) c->model.focused = false;
+        if (!c) c = _find_frame(e, ev->xfocus.window);
+        if (c) { c->model.focused = false; _frame_paint(e, c); }
         break;
     }
     default:
@@ -1208,7 +1629,7 @@ struct vt_wm_x11 *vt_wm_x11_new_impl(vt_wm_t *wm) {
     e->root = vt_x11_root();
     e->n_desktops = (int)(wm->workspaces.size > 0 ? wm->workspaces.size : 4);
     e->cur_desktop = 0;
-    e->sloppy_focus = true;
+    e->sloppy_focus = false;      /* default: click-to-focus */
     e->snap_enabled = true;
     vt_vec_init(&e->clients, sizeof(_client_t *), 8);
     vt_vec_init(&e->stacking, sizeof(_client_t *), 8);
@@ -1393,10 +1814,17 @@ int vt_wm_x11_start(struct vt_wm_x11 *eng) {
          * XDefineCursor the server falls back to the parent's, which on
          * a bare Xorg/XLibre with no cursor theme loaded can render as
          * an invisible pointer. Pin a real arrow on the root AND on our
-         * WM check window so the pointer is always visible. */
+         * WM check window so the pointer is always visible. Frames get
+         * the same cursor when they are created. */
         XDefineCursor(dpy, e->root, e->cur_default);
         XDefineCursor(dpy, e->wmwin, e->cur_default);
     }
+#if defined(VT_HAVE_XFT)
+    e->tfont = XftFontOpenName(dpy, DefaultScreen(dpy), "sans-9:bold");
+    if (!e->tfont)
+        e->tfont = XftFontOpenName(dpy, DefaultScreen(dpy), "sans-9");
+    vt_logi("wm-x11: decoration font %s", e->tfont ? "loaded" : "unavailable");
+#endif
 
     /* register shortcuts as XGrabs */
     for (size_t i = 0; i < e->wm->shortcuts.size; i++) {
@@ -1443,6 +1871,9 @@ int vt_wm_x11_start(struct vt_wm_x11 *eng) {
 void vt_wm_x11_stop(struct vt_wm_x11 *eng) {
     vt_wm_x11_t *e = (vt_wm_x11_t *)eng;
     if (!e) return;
+#if defined(VT_HAVE_XFT)
+    if (e->tfont) { XftFontClose(e->dpy, e->tfont); e->tfont = NULL; }
+#endif
     if (e->cur_default_set) {
         /* hand the pointer back to the server default (theme unload) */
         XUndefineCursor(e->dpy, e->root);
@@ -1462,6 +1893,7 @@ void vt_wm_x11_free(struct vt_wm_x11 *eng) {
     vt_vec_clear(&e->wm->windows);
     for (size_t i = 0; i < e->clients.size; i++) {
         _client_t *c = *(_client_t **)vt_vec_at(&e->clients, i);
+        if (_framed(c)) _frame_destroy(e, c, true);
         _client_free(c);
     }
     vt_vec_fini(&e->clients);
@@ -1537,6 +1969,14 @@ bool vt_wm_x11_is_dock(struct vt_wm_x11 *eng, uint32_t id) {
     vt_wm_x11_t *e = (vt_wm_x11_t *)eng;
     _client_t *c = e ? _find(e, (Window)id) : NULL;
     return c ? (c->is_dock || c->is_desktop) : false;
+}
+
+void vt_wm_x11_set_focus_mode(struct vt_wm_x11 *eng, bool sloppy) {
+    vt_wm_x11_t *e = (vt_wm_x11_t *)eng;
+    if (!e) return;
+    e->sloppy_focus = sloppy;
+    vt_logi("wm-x11: focus mode: %s", sloppy ? "sloppy (follows pointer)"
+                                             : "click-to-focus");
 }
 unsigned long vt_wm_x11_opacity(struct vt_wm_x11 *eng, uint32_t id) {
     vt_wm_x11_t *e = (vt_wm_x11_t *)eng;

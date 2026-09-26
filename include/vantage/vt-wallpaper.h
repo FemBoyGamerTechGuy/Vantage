@@ -1,7 +1,7 @@
 /*
  * vt-wallpaper.h — Vantage wallpaper engine
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Supports static images, gradients, programmatically-generated backgrounds,
  * and **live video wallpapers** using ffmpeg (libavcodec/libavformat).

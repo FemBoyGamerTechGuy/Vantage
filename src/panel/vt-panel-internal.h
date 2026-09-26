@@ -1,7 +1,7 @@
 /*
  * vt-panel-internal.h — internal panel drawing API (not installed)
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * The panel renders with Xlib + XRender + Xft on its own connection.
  * Applets draw through this small API, which keeps them independent of
@@ -80,6 +80,7 @@ typedef struct {
     int  (*measure)(vt_applet_env_t *env);              /* preferred width */
     void (*render)(vt_applet_env_t *env);
     void (*on_click)(vt_applet_env_t *env, int x, int y, int button);
+    void (*on_wheel)(vt_applet_env_t *env, int dir);    /* +1 up / -1 down */
     void (*on_tick)(vt_applet_env_t *env, uint64_t now_ms); /* periodic */
     void (*on_ipc_event)(vt_applet_env_t *env, uint32_t msg, const char *payload);
 } vt_applet_impl_t;
@@ -92,9 +93,18 @@ extern const vt_applet_impl_t _applet_volume;
 extern const vt_applet_impl_t _applet_network;
 extern const vt_applet_impl_t _applet_battery;
 extern const vt_applet_impl_t _applet_tray;
+extern const vt_applet_impl_t _applet_user;
 
 /* helper: launch a command */
 void vt_panel_spawn(const char *cmd);
+
+/* Session-manager IPC: send a command to vantage-session.sock
+ * (logout etc.) — a thin client that connects, sends, disconnects. */
+void vt_panel_send_session(uint32_t msg, const char *payload);
+
+/* Open the username/session menu (used by the launcher's Quit Session
+ * entry as well — implemented by the USER applet). */
+void vt_panel_user_menu_open(struct vt_panel *p);
 
 /* Find the applet env for a kind (state may be NULL if not added). */
 vt_applet_env_t vt_panel_find_env(vt_panel_t *p, vt_panel_applet_kind_t kind);

@@ -1,7 +1,7 @@
 /*
  * vt-backend.c — Display backend factory
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Selects and instantiates the appropriate backend based on user config
  * and what is available at runtime. The backend implementations live in

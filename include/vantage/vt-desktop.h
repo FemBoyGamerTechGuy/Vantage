@@ -1,7 +1,7 @@
 /*
  * vt-desktop.h — Vantage desktop surface
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Owns the root desktop surface: hosts the wallpaper, optional desktop
  * icons, and the desktop context menu.

@@ -10,6 +10,11 @@ if dep_x11.found()
     wm_deps += [dep_xcursor]
     wm_cargs += ['-DVT_HAVE_XCURSOR']
   endif
+  # decorations: title text via Xft (optional — frames still work without)
+  if dep_xft.found() and dep_xrender.found()
+    wm_deps += [dep_xft, dep_xrender]
+    wm_cargs += ['-DVT_HAVE_XFT']
+  endif
 endif
 
 lib_vantage_wm = static_library('vantage-wm',

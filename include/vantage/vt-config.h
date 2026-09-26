@@ -1,7 +1,7 @@
 /*
  * vt-config.h — Vantage configuration system
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Vantage uses a simple INI-like keyfile format (sections, keys, values).
  * Configuration files live under ~/.config/vantage/X.conf and can be

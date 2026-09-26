@@ -1,7 +1,7 @@
 /*
  * vt-gpu.c — GPU enumeration and device selection
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Reads /dev/dri/card* and /dev/dri/renderD* nodes, resolves PCI vendor
  * IDs from sysfs, and dispatches to vendor-specific setup (NVIDIA

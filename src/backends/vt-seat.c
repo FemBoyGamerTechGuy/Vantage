@@ -1,7 +1,7 @@
 /*
  * vt-seat.c — Session / seat acquisition (libseat preferred, direct VT fallback)
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * The negotiation is deliberately chatty: every step is logged so a real
  * TTY run pinpoints exactly where session setup stops.
@@ -521,6 +521,35 @@ int vt_seat_vt_activate(vt_seat_t *s, int timeout_ms) {
 #endif
     if (s->mode == VT_SEAT_MODE_DIRECT)
         return _direct_activate(s, timeout_ms);
+    return -1;
+}
+
+int vt_seat_vt_switch_to(vt_seat_t *s, int vt) {
+    /* Switch to an ARBITRARY VT — the compositor owns the keyboard via
+     * evdev, so the kernel console hotkeys never fire; this is what
+     * makes Ctrl+Alt+F3 an escape hatch out of a wedged session. */
+    if (!s || vt <= 0) return -1;
+#if defined(VT_HAVE_LIBSEAT)
+    if (s->mode == VT_SEAT_MODE_LIBSEAT && s->ls) {
+        if (libseat_switch_session(s->ls, vt) == 0) {
+            vt_logi("seat: libseat switching to session on VT %d", vt);
+            return 0;
+        }
+        vt_logw("seat: libseat_switch_session(%d) failed: %s", vt,
+                strerror(errno));
+        return -1;
+    }
+#endif
+    if (s->mode == VT_SEAT_MODE_DIRECT && s->tty_fd >= 0) {
+        if (ioctl(s->tty_fd, VT_ACTIVATE, vt) < 0) {
+            vt_logw("seat: VT_ACTIVATE(%d) failed: %s", vt,
+                    strerror(errno));
+            return -1;
+        }
+        vt_logi("seat: VT_ACTIVATE(%d) issued — release/acquire will "
+                "follow", vt);
+        return 0;
+    }
     return -1;
 }
 

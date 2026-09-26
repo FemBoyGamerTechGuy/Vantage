@@ -1,7 +1,7 @@
 /*
  * vantage-diagnostics.c — Diagnostic dump
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Prints a snapshot of Vantage's view of the current system: backend,
  * renderer, GPU, OpenGL version, EGL version, monitors, refresh rates,

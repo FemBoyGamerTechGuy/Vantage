@@ -1,7 +1,7 @@
 /*
  * vt-wm.h — Vantage window manager
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Window placement, focus, stacking, workspaces, shortcuts. The public
  * model (vt_window_t / vt_wm_t) is backend-agnostic; the concrete engines
@@ -149,6 +149,9 @@ void vt_wm_x11_tile_id(struct vt_wm_x11 *eng, uint32_t id, vt_wm_tile_t t);
 void vt_wm_x11_desktop(struct vt_wm_x11 *eng, int d);
 void vt_wm_x11_move_to_desktop_id(struct vt_wm_x11 *eng, uint32_t id, int d);
 bool vt_wm_x11_is_dock(struct vt_wm_x11 *eng, uint32_t id);
+/* Focus policy: true = sloppy (pointer-follows), false = click-to-focus
+ * (the default — hovering must never steal keyboard focus). */
+void vt_wm_x11_set_focus_mode(struct vt_wm_x11 *eng, bool sloppy);
 unsigned long vt_wm_x11_opacity(struct vt_wm_x11 *eng, uint32_t id);
 /* Engine lifecycle, called by vt_wm_start / vt_wm_free */
 struct vt_wm_x11 *vt_wm_x11_new_impl(vt_wm_t *wm);

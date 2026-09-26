@@ -1,7 +1,7 @@
 /*
  * vt-wallpaper.c — Wallpaper engine core
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Supports: solid color, gradient, static image, live video, shader.
  *

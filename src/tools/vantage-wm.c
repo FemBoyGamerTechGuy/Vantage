@@ -1,7 +1,7 @@
 /*
  * vantage-wm.c — Vantage window manager + compositor server
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Runs the WM engine, the XRender composite manager (when available and
  * enabled), and the WM IPC server that panel/desktop/settings/CLI tools
@@ -222,6 +222,18 @@ static void _wl_event_sink(void *ud, void *event) {
         }
         if (wm->on_window_event)
             wm->on_window_event(wm, w, VT_WM_EVENT_FOCUS);
+        break;
+    }
+    case VT_BACKEND_WL_EVENT_WORKSPACE: {
+        /* compositor panel switched workspaces: sync the WM model and
+         * tell subscribers exactly like an X11 desktop switch does */
+        int d = (int)ev->window_id;
+        if (d >= 0 && d < (int)wm->workspaces.size) {
+            wm->cur_ws = d;
+            if (wm->on_desktop_changed)
+                wm->on_desktop_changed(wm, d);
+            vt_logi("wm: wayland desktop -> %d (compositor panel)", d + 1);
+        }
         break;
     }
     default:
@@ -477,6 +489,12 @@ static void _hk_ws_prev(vt_wm_t *wm, void *ud) {
     int n = vt_wm_workspace_count(wm);
     if (n > 0) vt_wm_workspace_switch(wm, (vt_wm_workspace_current(wm) - 1 + n) % n);
 }
+static void _hk_logout(vt_wm_t *wm, void *ud) {
+    (void)wm; (void)ud;
+    vt_logi("wm: logout hotkey — shutting down cleanly (graceful "
+            "unwind, exit 0)");
+    _stop = 1;
+}
 
 static void _hk_tile_focused(vt_wm_t *wm, void *ud, vt_wm_tile_t t) {
     (void)ud;
@@ -505,6 +523,7 @@ static void _register_defaults(vt_wm_t *wm) {
     vt_wm_shortcut_register(wm, "Ctrl+Alt+T",  _spawn_term, NULL);
     vt_wm_shortcut_register(wm, "Ctrl+Alt+Right", _hk_ws_next, NULL);
     vt_wm_shortcut_register(wm, "Ctrl+Alt+Left",  _hk_ws_prev, NULL);
+    vt_wm_shortcut_register(wm, "Ctrl+Alt+Delete", _hk_logout, NULL);
     vt_wm_shortcut_register(wm, "Alt+Left",    _hk_tile_left, NULL);
     vt_wm_shortcut_register(wm, "Alt+Right",   _hk_tile_right, NULL);
     vt_wm_shortcut_register(wm, "Alt+Up",      _hk_tile_top, NULL);
@@ -606,6 +625,14 @@ int main(int argc, char **argv) {
     }
 
     _register_defaults(wm);
+
+    /* focus policy: [wm] focus = click (default) | sloppy */
+    if (backend->kind == VT_BACKEND_X11) {
+        const char *focus = vt_config_get(cfg, "wm", "focus", "click");
+        bool sloppy = vt_strcaseeq(focus, "sloppy") ||
+                      vt_strcaseeq(focus, "follows-mouse");
+        vt_wm_x11_set_focus_mode(wm->engine, sloppy);
+    }
 
     if (vt_wm_start(wm) != VT_OK) {
         vt_loge("wm: failed to start (another WM running?)");

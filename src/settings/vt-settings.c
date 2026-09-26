@@ -1,7 +1,7 @@
 /*
  * vt-settings.c — Modular settings system
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * The settings system is a collection of small "ops" structs, one per
  * settings module (appearance, displays, keyboard, etc.). Each ops

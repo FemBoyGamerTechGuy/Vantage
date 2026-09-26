@@ -1,7 +1,7 @@
 /*
  * vt-gpu.h — GPU detection and acceleration hooks
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Vantage enumerates available GPUs from /dev/dri/card* and render nodes,
  * reads the PCI vendor id, and dispatches to a vendor-specific path:

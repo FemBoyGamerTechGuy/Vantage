@@ -1,7 +1,7 @@
 /*
  * vantage-settings.c — Settings CLI
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * A small text-based tool for reading/writing Vantage settings, applying
  * them live, and regenerating theme files. Designed to be driven by any

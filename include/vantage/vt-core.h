@@ -1,7 +1,7 @@
 /*
  * vt-core.h — Vantage core utility library (public API)
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * libvantage-core provides foundational utilities for every other Vantage
  * component: memory, logging, strings, lists, hash tables, dynamic arrays,

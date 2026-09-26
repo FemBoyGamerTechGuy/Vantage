@@ -1,7 +1,7 @@
 #!/bin/bash
 # harness-wayland.sh — Vantage Wayland-compositor integration harness
 #
-# SPDX-License-Identifier: GPL-2.0-or-later
+# SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
 #
 # Boots vantage-wm --wayland as a native Wayland compositor
 # (libwayland-server, wl_compositor + wl_seat + wl_output +
@@ -181,11 +181,22 @@ w, h, _ = vals
 pix = data[pos:pos + w*h*3]
 target = bytes((0x5a, 0x9a, 0x3a))    # client color 0x5a9a3a (ARGB 0xff5a9a3a)
 hits = pix.count(target)
-print(f"frame: {w}x{h}, client-color pixels={hits}")
-sys.exit(0 if hits > 1000 else 1)
+# panel assertions: top bar is the panel background; the REAL panel is
+# drawn (accent start button present, old placeholder squares GONE)
+top = pix[:w*32*3]
+panel_bg = top.count(bytes((0x23, 0x26, 0x2b)))
+accent = pix.count(bytes((0x4f, 0x9a, 0xdc)))
+placeholder_red = pix.count(bytes((0xe0, 0x5a, 0x5a)))
+placeholder_green = pix.count(bytes((0x7a, 0xc8, 0x60)))
+print(f"frame: {w}x{h}, client-color pixels={hits}, panel-bg(top)={panel_bg}, "
+      f"accent={accent}, placeholder-red={placeholder_red}, "
+      f"placeholder-green={placeholder_green}")
+panel_ok = panel_bg > w * 8 and accent > 50
+placeholders_gone = placeholder_red == 0 and placeholder_green == 0
+sys.exit(0 if (hits > 1000 and panel_ok and placeholders_gone) else 1)
 PYEOF
-  [ $? -eq 0 ] && ok "client pixels present in compositor framebuffer" \
-    || bad "client color not found in frame dump"
+  [ $? -eq 0 ] && ok "client pixels + REAL compositor panel in frame dump" \
+    || bad "frame dump check failed (pixels/panel/placeholders)"
 else
   bad "no frame dump at /tmp/vantage-wayland.ppm"
 fi

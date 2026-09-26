@@ -1,7 +1,7 @@
 /*
  * vt-compositor.c — Damage-tracked compositor core
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Owns frame scheduling, damage tracking, and surface composition.
  *

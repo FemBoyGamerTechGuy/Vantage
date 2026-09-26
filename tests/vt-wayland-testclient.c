@@ -1,7 +1,7 @@
 /*
  * vt-wayland-testclient.c — minimal Wayland client for smoke tests
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Connects to the Vantage Wayland compositor, creates an xdg_toplevel,
  * fills a shm buffer with a known color pattern and commits. Used to

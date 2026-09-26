@@ -156,14 +156,91 @@ honestly reports `drm: FAILED — DRM master refused` (the running X
 server owns the card); the real KMS path is exercised only by a TTY
 launch (method 1 above).
 
+### Test tiers
+
+1. **Headless protocol** — `harness-wayland.sh` (runs in `meson test`):
+   socket, xdg-shell, pixels, panel, IPC, logout against the in-memory
+   framebuffer.
+2. **Real DRM/VT session** — `harness-wayland-real.sh`
+   (`meson test` runs it but it SKIPS unless `/dev/dri` exists and the
+   run happens on a console): boots the compositor with
+   `VANTAGE_WAYLAND_REQUIRE_KMS=1` — no headless fallback allowed — and
+   asserts the real seat/VT/master/CRTC/scanout/input stages, xdg client
+   pixels on the real output, the compositor panel, and a clean SIGINT
+   unwind (CRTC restored, VT text, exit 0). On the target hardware:
+   `./build test` from a TTY, or
+   `VANTAGE_WAYLAND_SELFTEST=1 tests/harness-wayland-real.sh`.
+3. **GPU/NVIDIA reporting** — `vantage-diagnostics --gpu`: vendor,
+   renderer, hardware vs software (llvmpipe-class) rendering, never
+   claiming acceleration that is not there.
+
 ## Cursor
 
-The compositor cursor uses the hardware cursor plane (64x64 ARGB) when
-the driver offers it; otherwise a software sprite is alpha-blended at
-the pointer position. The image comes from Xcursor
+The pointer is ALWAYS visible: the software cursor sprite is the source
+of truth, blended into the scanout framebuffer on every frame, and the
+64x64 ARGB hardware cursor plane is used on top when the driver actually
+supports it (including NVIDIA, where legacy cursor ioctls can silently
+fail — the sprite covers that case). The image comes from Xcursor
 (`$XCURSOR_THEME`, `left_ptr`) with a built-in arrow fallback, so the
-pointer is always visible. Clients can replace it per-surface via
+pointer is never invisible. Clients can replace it per-surface via
 `wl_pointer.set_cursor` (rendered as the software sprite).
+
+## The compositor panel
+
+The native Wayland session draws a REAL panel with the compositor itself
+(vt-wl-panel.c) — not XWayland, not X11 clients, and not placeholder
+blocks:
+
+* LEFT: Vantage start button → categorized application menu built from
+  XDG `.desktop` entries (Accessories, Development, Education, Games,
+  Graphics, Internet, Multimedia, Office, System, Utilities, Other) with
+  a Quit Session entry; window list of xdg toplevels (click to focus,
+  right-click to close)
+* RIGHT: workspace buttons (with glow on the active one), clock with a
+  calendar popup (previous/next month), username menu with Lock Screen /
+  Suspend / Switch User / Log Out / Reboot / Shutdown / Exit Session
+
+Text is rasterized with FreeType + fontconfig; a built-in bitmap font is
+the fallback so labels never disappear. Applications actually launch
+(`sh -c` exec from the .desktop `Exec=` line). Session actions use the
+real mechanisms — `loginctl` (logind/elogind) where available, direct
+power ioctls as the fallback — and failures are reported honestly in
+the menu status line.
+
+## Input requirements (no session manager)
+
+When the session runs through elogind/logind or seatd, input devices are
+opened through the seat automatically. On a bare TTY login with no
+session manager, Linux requires the user to be in the `input` group
+before `/dev/input/event*` can be opened:
+
+```sh
+sudo usermod -aG input $USER   # then log out and back in
+```
+
+Without it the compositor logs a loud diagnostic
+(`wayland: input: NO usable input devices …`) and keyboard/pointer will
+not work — that is a permission problem, not a Vantage bug.
+
+## Escape hatches / recovery
+
+The compositor owns the keyboard via evdev, so the kernel's own
+Ctrl+Alt+F1..F12 console switching never fires. Vantage implements it
+itself:
+
+| Key                    | Action                                        |
+|------------------------|-----------------------------------------------|
+| Ctrl+Alt+F1..F12       | switch to that VT (DRM master dropped/retaken, CRTC restored) |
+| Ctrl+Alt+Delete        | clean logout (graceful unwind, exit 0)        |
+| Ctrl+Alt+Left/Right    | previous/next workspace                       |
+| Alt+F4                 | close the focused window                      |
+| Escape                 | close any open panel menu                     |
+
+A wedged session therefore never requires a hardware reboot: switch to
+another VT with Ctrl+Alt+F3, log in, and either `vantage-remote logout`
+(the IPC socket lives in $XDG_RUNTIME_DIR) or `pkill -TERM vantage-wm`
+— SIGTERM takes the same clean-unwind path (CRTC restore, VT text
+mode, exit 0).
 
 ## Honest limitations
 

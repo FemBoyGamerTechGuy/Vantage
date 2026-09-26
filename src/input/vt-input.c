@@ -1,7 +1,7 @@
 /*
  * vt-input.c — Input device event dispatching
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Uses libxkbcommon for layout handling when available. Falls back to
  * a hardcoded US layout when xkb is unavailable.

@@ -7,7 +7,7 @@ project('vantage', 'c',
     'b_lto=true',
     'default_library=both',
   ],
-  license : 'GPL-2.0-or-later',
+  license : 'LicenseRef-Vantage-Proprietary',
   meson_version : '>= 0.59',
 )
 
@@ -84,11 +84,14 @@ dep_xrender         = dependency('xrender',        required : false)
 dep_xcomposite      = dependency('xcomposite',     required : false)
 dep_xdamage         = dependency('xdamage',        required : false)
 dep_xfixes          = dependency('xfixes',         required : false)
+dep_xtst            = dependency('xtst',           required : false)
 dep_xrandr          = dependency('xrandr',         required : false)
 dep_xinerama        = dependency('xinerama',       required : false)
 dep_xcursor         = dependency('xcursor',        required : false)
 dep_xres            = dependency('xres',          required : false)
 dep_xft             = dependency('xft',            required : false)
+dep_freetype        = dependency('freetype2',     required : false)
+dep_fontconfig      = dependency('fontconfig',    required : false)
 dep_xi              = dependency('xi',             required : false)
 dep_x11xcb          = dependency('x11-xcb',        required : false)
 dep_xkbcommon       = dependency('xkbcommon',      required : false)

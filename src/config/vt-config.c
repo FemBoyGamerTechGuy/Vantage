@@ -1,7 +1,7 @@
 /*
  * vt-config.c — Vantage configuration system
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * INI-like parser supporting:
  *   [section]            -- starts a section

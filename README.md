@@ -25,9 +25,14 @@ New features, minimal overhead.
 - **Hardware-accelerated rendering** on NVIDIA (proprietary + NVK),
   AMD (Mesa/radeonsi/radv), and Intel (Mesa/iris/anv). Software
   fallback always available.
-- **A real EWMH/ICCCM window manager**: focus (click + sloppy),
-  workspaces, maximize/fullscreen/minimize, edge-snap tiling, alt-drag
-  move/resize, XGrabKey hotkeys, workarea with panel struts.
+- **A real EWMH/ICCCM window manager**: click-to-focus by default
+  (hover never steals the keyboard; `[wm] focus=sloppy` opts into
+  focus-follows-mouse), workspaces, maximize/fullscreen/minimize,
+  edge-snap tiling, alt-drag move/resize, XGrabKey hotkeys, workarea
+  with panel struts, and **server-side decorations** — every normal
+  window gets a title bar with close/maximize/minimize buttons, accent
+  borders and edge resize grips (Kitty and Mirage get real title
+  bars).
 - **A damage-tracked compositor** (XComposite + XDamage + XRender):
   per-window opacity, optional shadows, fullscreen fast-path, frame
   pacing. Everything expensive is individually switchable and OFF by
@@ -36,8 +41,23 @@ New features, minimal overhead.
   fullscreen window covers the desktop, plus PNG/JPEG still wallpapers
   loaded directly through libpng/libjpeg (no gdk-pixbuf).
 - **A real panel**: dock window with struts, XRender/Xft drawing, live
-  tasklist, workspace switcher, XDG application launcher menu, XEmbed
-  system tray, ALSA volume, network and battery applets.
+  tasklist, workspace switcher (rounded, glowing active button), XDG
+  application launcher menu with the standard categories and a Quit
+  Session entry, calendar popup, ALSA volume slider, network and
+  battery applets, and a username/session menu (Lock, Suspend, Switch
+  User, Log Out, Reboot, Shutdown, Exit) — all on real system
+  mechanisms (logind/elogind, ACPI).
+- **A compositor-drawn panel on native Wayland** (no XWayland, no
+  placeholder blocks): Vantage start button with a categorized
+  .desktop application menu that actually launches apps, xdg window
+  list, workspace buttons, clock + calendar, and the full session
+  menu — rendered with FreeType text directly into the scanout
+  framebuffer.
+- **Recovery without reboots**: on Wayland the compositor implements
+  Ctrl+Alt+F1..F12 VT switching itself (evdev owns the keyboard, so
+  the kernel combos never fire) plus Ctrl+Alt+Delete clean logout;
+  SIGTERM/SIGINT always restore the CRTC, return the VT to text mode
+  and exit 0.
 - **Cross-toolkit theming** — one JSON theme file drives GTK3 CSS,
   GTK4 CSS, `settings.ini`, Qt6 QSS, a qt6ct conf and a KColorScheme
   file.
@@ -150,7 +170,9 @@ vantage-remote watch          # stream window events
 
 ## License
 
-GPL-2.0-or-later. See [LICENSE](LICENSE).
+Vantage is proprietary, source-available software. See [LICENSE](LICENSE)
+for the full terms (restricted copying, redistribution, modification and
+publication; no sublicensing; trademark protection).
 
 ## Status
 

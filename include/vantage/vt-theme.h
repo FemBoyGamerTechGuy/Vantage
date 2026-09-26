@@ -1,7 +1,7 @@
 /*
  * vt-theme.h — Vantage theme engine
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * A single JSON theme file describes the visual design system: colors,
  * radii, spacing, typography, icon theme, dark/light variant, widget

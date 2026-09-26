@@ -1,7 +1,7 @@
 /*
  * vt-integ-network.c — Network state polling (NM > ConnMan > /proc fallback)
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  *
  * Vantage probes the network backend at runtime. The simplest fallback
  * reads /proc/net/wireless (signal) and /proc/net/route (default route)
