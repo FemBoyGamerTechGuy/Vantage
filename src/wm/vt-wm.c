@@ -227,6 +227,11 @@ void vt_wm_workspace_switch(vt_wm_t *wm, int ws) {
         vt_wm_x11_desktop((struct vt_wm_x11 *)wm->engine, ws);
         return;
     }
+    /* Wayland: the compositor backend paints per-workspace — switch ITS
+     * state too, or the WM model and the visible desktop disagree (the
+     * remote/panel/keyboard would "switch" nothing visible). */
+    if (wm->backend && wm->backend->set_workspace)
+        wm->backend->set_workspace(wm->backend, ws);
     wm->cur_ws = ws;
     if (wm->on_desktop_changed) wm->on_desktop_changed(wm, ws);
     vt_logi("wm: switched to workspace %d", ws + 1);

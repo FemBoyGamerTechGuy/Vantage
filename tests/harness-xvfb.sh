@@ -99,6 +99,23 @@ data = (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr) +
         chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
 open(sys.argv[1], 'wb').write(data)
 PYICON
+# themed START icon: a solid gold "start-here" in the fixture theme —
+# proves the Programs button uses the ICON THEME (like an XFCE start
+# button), falling back to the drawn glyph only when themes lack it
+python3 - "$ICON_DIR/start-here.png" <<'PYICON2'
+import struct, zlib, sys
+w = h = 24
+rgb = (0xd4, 0xb1, 0x06)   # distinctive gold — used nowhere else
+raw = b''.join(b'\x00' + bytes(rgb) * w for _ in range(h))
+def chunk(t, d):
+    c = t + d
+    return struct.pack('>I', len(d)) + c + struct.pack(
+        '>I', zlib.crc32(c) & 0xffffffff)
+ihdr = struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)
+data = (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr) +
+        chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+open(sys.argv[1], 'wb').write(data)
+PYICON2
 cat > "$XDG_DATA_HOME/icons/vt-harness-theme/index.theme" <<'EOF'
 [Icon Theme]
 Name=vt-harness-theme
@@ -302,6 +319,20 @@ else
   bad "no server-side decorations: $(cat "$FRAME_LOG")"
 fi
 
+echo "== harness-xvfb: CSD windows stay undecorated (_MOTIF_WM_HINTS) =="
+# GTK/Chromium/Firefox windows that draw their own headerbars set
+# _MOTIF_WM_HINTS decorations=0. A WM that ignores this DOUBLE-DECORATES
+# them — its own titlebar stacked over the app's (the reported browser
+# bug on the X11 session).
+MOTIF_LOG="$WORK/motif.log"
+"$(tc vt-x11-testclient)" --motif-probe > "$MOTIF_LOG" 2>&1
+MRC=$?
+if [ $MRC -eq 0 ] && grep -q "motif-undecorated=yes" "$MOTIF_LOG"; then
+  ok "CSD window left undecorated (no double titlebar)"
+else
+  bad "MOTIF CSD window got decorated anyway: $(cat "$MOTIF_LOG")"
+fi
+
 echo "== harness-xvfb: focus policy (click-to-focus, no hover steal) =="
 FOCUS_LOG="$WORK/focus.log"
 "$(tc vt-x11-testclient)" --focus-probe > "$FOCUS_LOG" 2>&1
@@ -343,8 +374,17 @@ c2 = bytes((0x9a, 0x3a, 0x5f))   # test window 2
 hits1 = pix.count(c1)
 hits2 = pix.count(c2)
 distinct = len(set(pix[i:i+3] for i in range(0, min(len(pix), w*3*40), 3)))
-print(f"pixels: {w}x{h}, window1={hits1}px, window2={hits2}px, distinct-colors(top40rows)={distinct}")
-sys.exit(0 if (hits1 > 500 and hits2 > 500 and distinct >= 3) else 1)
+# the Programs button's THEMED start icon (solid gold PNG from the
+# fixture theme) — proves the button uses the icon theme, not a glyph
+start_icon = pix[:w*34*3].count(bytes((0xd4, 0xb1, 0x06)))
+# the workspace PAGER miniatures: the (focused) window on this desktop
+# renders as an accent block inside the bar; both test windows live on
+# ws 1, so its cell shows one focused miniature
+pager_foc = pix[:w*34*3].count(bytes((0x6f, 0xaa, 0xe8)))
+print(f"pixels: {w}x{h}, window1={hits1}px, window2={hits2}px, distinct-colors(top40rows)={distinct}, "
+      f"start-icon-gold={start_icon}, pager-focused={pager_foc}")
+ok = hits1 > 500 and hits2 > 500 and distinct >= 3
+sys.exit(0 if (ok and start_icon > 100 and pager_foc > 6) else 1)
 PYEOF
 
 echo "== harness-xvfb: Programs menu (shared app database) =="

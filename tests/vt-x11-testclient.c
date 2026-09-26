@@ -26,6 +26,12 @@
  *     only when the client was reparented into a frame with non-zero
  *     top extent (a real title bar).
  *
+ *   vt-x11-testclient --motif-probe
+ *     Verifies CSD handling: maps a window with _MOTIF_WM_HINTS
+ *     decorations=0 (what GTK/Chromium/Firefox set when they draw their
+ *     own headerbars) and asserts the WM leaves it UNDECORATED (no
+ *     double titlebar). Prints motif-undecorated=yes on success.
+ *
  *   vt-x11-testclient --focus-probe
  *     Verifies the focus policy: focuses window A, HOVERS window B
  *     (pointer warp, no click) and asserts the active window is still A
@@ -133,6 +139,7 @@ int main(int argc, char **argv) {
     bool ewmh_only = false;
     bool cursor_only = false;
     bool frame_only = false;
+    bool motif_only = false;
     bool focus_only = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--seconds") && i + 1 < argc) seconds = atoi(argv[++i]);
@@ -145,6 +152,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--cursor-probe")) cursor_only = true;
         else if (!strcmp(argv[i], "--frame-probe")) frame_only = true;
         else if (!strcmp(argv[i], "--focus-probe")) focus_only = true;
+        else if (!strcmp(argv[i], "--motif-probe")) motif_only = true;
     }
     Display *d = XOpenDisplay(NULL);
     if (!d) { fprintf(stderr, "cannot open display\n"); return 1; }
@@ -251,6 +259,58 @@ int main(int argc, char **argv) {
         fflush(stdout);
         bool ok = parent != root && parent != None && t > 0;
         printf(ok ? "framed=yes\n" : "framed=no\n");
+        fflush(stdout);
+        XDestroyWindow(d, w);
+        XCloseDisplay(d);
+        return ok ? 0 : 1;
+    }
+
+    if (motif_only) {
+        /* CSD probe: set _MOTIF_WM_HINTS decorations=0 (what GTK and
+         * Chromium/Firefox do when they draw their own headerbars) and
+         * verify the WM does NOT double-decorate the window. */
+        int s = DefaultScreen(d);
+        Window root = RootWindow(d, s);
+        Window w = make_window(d, "CSD Probe", 120, 120, 300, 200,
+                               0x5f9a3a);
+        /* _MOTIF_WM_HINTS: flags, functions, decorations, input, status */
+        unsigned long hints[5] = { 1L << 2 /* MWM_HINTS_DECORATIONS */,
+                                   0, 0, 0, 0 };
+        Atom motif = XInternAtom(d, "_MOTIF_WM_HINTS", False);
+        XChangeProperty(d, w, motif, XA_CARDINAL, 32, PropModeReplace,
+                        (unsigned char *)hints, 5);
+        XMapWindow(d, w);
+        XFlush(d);
+        Window parent = None;
+        for (int t = 0; t < 50; t++) {
+            Window r, *kids = NULL;
+            unsigned int nk = 0;
+            if (XQueryTree(d, w, &r, &parent, &kids, &nk)) {
+                if (kids) XFree(kids);
+                if (parent != root && parent != None) break;
+            }
+            msleep(50);
+        }
+        Atom fe = XInternAtom(d, "_NET_FRAME_EXTENTS", False);
+        Atom actual;
+        int fmt;
+        unsigned long n, bytes;
+        unsigned char *data = NULL;
+        long l = 0, r_ = 0, t = 0, b = 0;
+        if (XGetWindowProperty(d, w, fe, 0, 4, False, XA_CARDINAL, &actual,
+                               &fmt, &n, &bytes, &data) == Success && data
+                               && n >= 4) {
+            long *v = (long *)(void *)data;
+            l = v[0]; r_ = v[1]; t = v[2]; b = v[3];
+            XFree(data);
+        }
+        printf("motif-parent=0x%lx motif-extents=%ld,%ld,%ld,%ld\n",
+               (unsigned long)parent, l, r_, t, b);
+        fflush(stdout);
+        /* NOT reparented (still a root child) and zero extents */
+        bool ok = (parent == root || parent == None) &&
+                  l == 0 && r_ == 0 && t == 0 && b == 0;
+        printf(ok ? "motif-undecorated=yes\n" : "motif-undecorated=no\n");
         fflush(stdout);
         XDestroyWindow(d, w);
         XCloseDisplay(d);

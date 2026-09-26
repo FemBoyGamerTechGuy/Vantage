@@ -23,6 +23,14 @@
 #include <gdk-pixbuf/gdk-pixbuf.h>
 #endif
 
+#if defined(VT_HAVE_LIBRSVG)
+#include <librsvg/rsvg.h>
+#endif
+
+#if defined(VT_HAVE_LIBRSVG) && defined(VT_HAVE_CAIRO)
+#include <cairo.h>
+#endif
+
 /* reuse the wallpaper engine's direct PNG decoder (no gdk-pixbuf
  * needed for the most common icon format) */
 bool vt_image_probe_png(const char *path);
@@ -229,7 +237,7 @@ static int _dir_declared_size(const char *sub) {
 static bool _find_file(const char *dirpath, const char *name,
                        char *out, size_t out_n) {
     for (int e = 0; _exts[e]; e++) {
-        char p[768];
+        char p[1536];
         snprintf(p, sizeof(p), "%s/%s%s", dirpath, name, _exts[e]);
         if (access(p, R_OK) == 0) {
             snprintf(out, out_n, "%s", p);
@@ -247,7 +255,7 @@ static bool _lookup_in_theme(const vt_icon_theme_t *t, int base_i,
     DIR *d = opendir(tdir);
     if (!d) return false;
     bool found = false;
-    char best_path[768];
+    char best_path[1600];
     int best_size = 0;
     bool best_scalable = false;
     struct dirent *de;
@@ -255,7 +263,7 @@ static bool _lookup_in_theme(const vt_icon_theme_t *t, int base_i,
         if (de->d_name[0] == '.') continue;
         int dsz = _dir_declared_size(de->d_name);
         bool scalable = strncmp(de->d_name, "scalable", 8) == 0;
-        char lvl1[600];
+        char lvl1[1100];
         snprintf(lvl1, sizeof(lvl1), "%s/%s", tdir, de->d_name);
         /* icon spec Directories are two-level ("48x48/apps"); search
          * the subdirectories of each size directory */
@@ -264,12 +272,12 @@ static bool _lookup_in_theme(const vt_icon_theme_t *t, int base_i,
         struct dirent *se;
         while ((se = readdir(sub))) {
             if (se->d_name[0] == '.') continue;
-            char lvl2[768];
+            char lvl2[1400];
             snprintf(lvl2, sizeof(lvl2), "%s/%s", lvl1, se->d_name);
-            char cand[900];
+            char cand[1600];
             if (!_find_file(lvl2, name, cand, sizeof(cand))) continue;
             if (!found) {
-                snprintf(best_path, sizeof(best_path), "%s", cand);
+                snprintf(best_path, sizeof(best_path), "%.1599s", cand);
                 best_size = dsz;
                 best_scalable = scalable;
                 found = true;
@@ -290,7 +298,7 @@ static bool _lookup_in_theme(const vt_icon_theme_t *t, int base_i,
                 else better = false;
             } else better = false;
             if (better) {
-                snprintf(best_path, sizeof(best_path), "%s", cand);
+                snprintf(best_path, sizeof(best_path), "%.1599s", cand);
                 best_size = dsz;
                 best_scalable = scalable;
             }
@@ -339,6 +347,182 @@ int vt_icon_theme_lookup(const vt_icon_theme_t *t, const char *icon,
 }
 
 /* -------------------------------------------------------------- pixels */
+
+/* SVG via librsvg + cairo: rasterize at the EXACT target size so the
+ * panel never shows an upscaled raster. Without librsvg, SVG files
+ * fail honestly and callers fall back (logged once per file). */
+static int _load_svg_argb(const char *path, int target, uint32_t **out_px,
+                          int *out_w, int *out_h) {
+#if defined(VT_HAVE_LIBRSVG) && defined(VT_HAVE_CAIRO)
+    if (target <= 0 || target > 512) target = 48;
+    GError *err = NULL;
+    RsvgHandle *h = rsvg_handle_new_from_file(path, &err);
+    if (!h) {
+        if (err) g_error_free(err);
+        return -1;
+    }
+    cairo_surface_t *cs = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
+                                                     target, target);
+    cairo_t *cr = cairo_create(cs);
+    gboolean ok = FALSE;
+#if LIBRSVG_CHECK_VERSION(2, 52, 0)
+    /* librsvg >= 2.52: render into the given viewport */
+    RsvgRectangle vp = { .x = 0, .y = 0,
+                         .width = (double)target, .height = (double)target };
+    ok = rsvg_handle_render_document(h, cr, &vp, &err);
+#else
+    /* legacy API: scale the default dimensions to the target */
+    {
+        RsvgDimensionData dim;
+        rsvg_handle_get_dimensions(h, &dim);
+        double sx = dim.width > 0 ? (double)target / dim.width : 1.0;
+        double sy = dim.height > 0 ? (double)target / dim.height : 1.0;
+        cairo_scale(cr, sx, sy);
+        ok = rsvg_handle_render_cairo(h, cr);
+    }
+#endif
+    int rc = -1;
+    cairo_surface_flush(cs);
+    unsigned char *data = cairo_image_surface_get_data(cs);
+    int stride = cairo_image_surface_get_stride(cs);
+    if (ok && data && cairo_image_surface_get_width(cs) == target &&
+        cairo_image_surface_get_height(cs) == target) {
+        uint32_t *px = vt_malloc(sizeof(uint32_t) *
+                                 (size_t)target * (size_t)target);
+        if (px) {
+            for (int y = 0; y < target; y++)
+                for (int x = 0; x < target; x++)
+                    px[y * target + x] = *(const uint32_t *)(const void *)
+                        (data + (size_t)y * stride + (size_t)x * 4);
+            *out_px = px;
+            *out_w = target;
+            *out_h = target;
+            rc = 0;
+        }
+    }
+    cairo_surface_destroy(cs);
+    if (err) g_error_free(err);
+    g_object_unref(h);
+    return rc;
+#else
+    (void)path; (void)target; (void)out_px; (void)out_w; (void)out_h;
+    return -1;
+#endif
+}
+
+int vt_icon_load_argb_sized(const char *path, int target,
+                            uint32_t **out_pixels, int *out_w, int *out_h) {
+    if (!path || !out_pixels || !out_w || !out_h) return -1;
+    *out_pixels = NULL;
+    *out_w = *out_h = 0;
+
+    size_t plen = strlen(path);
+    if (plen > 4 && vt_strcaseeq(path + plen - 4, ".svg"))
+        return _load_svg_argb(path, target, out_pixels, out_w, out_h);
+    return vt_icon_load_argb(path, out_pixels, out_w, out_h);
+}
+
+/* ----------------------------------------------------------- resampling */
+/* ARGB premultiply-free box/bilinear rescaler (see vt-icons.h). */
+uint32_t *vt_icon_scale_argb(const uint32_t *src, int sw, int sh,
+                             int dw, int dh) {
+    if (!src || sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return NULL;
+    uint32_t *out = vt_malloc(sizeof(uint32_t) * (size_t)dw * (size_t)dh);
+    if (!out) return NULL;
+    if (sw == dw && sh == dh) {
+        memcpy(out, src, sizeof(uint32_t) * (size_t)dw * dh);
+        return out;
+    }
+    if (dw > sw || dh > sh) {
+        /* bilinear upscale */
+        for (int y = 0; y < dh; y++) {
+            double fy = (y + 0.5) * (double)sh / dh - 0.5;
+            int y0 = (int)fy;
+            if (y0 < 0) y0 = 0;
+            int y1 = y0 + 1 < sh ? y0 + 1 : sh - 1;
+            double ty = fy - y0;
+            if (ty < 0) ty = 0;
+            for (int x = 0; x < dw; x++) {
+                double fx = (x + 0.5) * (double)sw / dw - 0.5;
+                int x0 = (int)fx;
+                if (x0 < 0) x0 = 0;
+                int x1 = x0 + 1 < sw ? x0 + 1 : sw - 1;
+                double tx = fx - x0;
+                if (tx < 0) tx = 0;
+                uint32_t a = src[y0 * sw + x0], b = src[y0 * sw + x1];
+                uint32_t c = src[y1 * sw + x0], d2 = src[y1 * sw + x1];
+                uint32_t ch[4];
+                for (int k = 0; k < 4; k++) {
+                    int shift = 24 - 8 * k;
+                    double top = ((a >> shift) & 0xff) * (1.0 - tx) +
+                                 ((b >> shift) & 0xff) * tx;
+                    double bot = ((c >> shift) & 0xff) * (1.0 - tx) +
+                                 ((d2 >> shift) & 0xff) * tx;
+                    double v = top * (1.0 - ty) + bot * ty;
+                    int iv = (int)(v + 0.5);
+                    if (iv < 0) iv = 0;
+                    if (iv > 255) iv = 255;
+                    ch[k] = (uint32_t)iv;
+                }
+                out[y * dw + x] = (ch[0] << 24) | (ch[1] << 16) |
+                                  (ch[2] << 8) | ch[3];
+            }
+        }
+        return out;
+    }
+    /* box-filter downscale: each destination pixel averages the exact
+     * source-area rectangle — no skipped columns, no aliasing */
+    for (int y = 0; y < dh; y++) {
+        int sy0 = (int)((int64_t)y * sh / dh);
+        int sy1 = (int)((int64_t)(y + 1) * sh / dh);
+        if (sy1 <= sy0) sy1 = sy0 + 1;
+        if (sy1 > sh) sy1 = sh;
+        for (int x = 0; x < dw; x++) {
+            int sx0 = (int)((int64_t)x * sw / dw);
+            int sx1 = (int)((int64_t)(x + 1) * sw / dw);
+            if (sx1 <= sx0) sx1 = sx0 + 1;
+            if (sx1 > sw) sx1 = sw;
+            uint64_t ar = 0, ag = 0, ab = 0, aa = 0;
+            size_t n = 0;
+            for (int sy = sy0; sy < sy1; sy++)
+                for (int sx = sx0; sx < sx1; sx++) {
+                    uint32_t p = src[sy * sw + sx];
+                    aa += p >> 24;
+                    ar += (p >> 16) & 0xff;
+                    ag += (p >> 8) & 0xff;
+                    ab += p & 0xff;
+                    n++;
+                }
+            if (!n) n = 1;
+            out[y * dw + x] =
+                (uint32_t)((aa / n) << 24) |
+                (uint32_t)((ar / n) << 16) |
+                (uint32_t)((ag / n) << 8) |
+                (uint32_t)(ab / n);
+        }
+    }
+    return out;
+}
+
+uint32_t *vt_icon_lookup_argb(const vt_icon_theme_t *t, const char *name,
+                              int size) {
+    if (!t || !name || !*name) return NULL;
+    char path[1024];
+    if (vt_icon_theme_lookup(t, name, size > 0 ? size : 24, path,
+                             sizeof(path)) != 0)
+        return NULL;
+    uint32_t *px = NULL;
+    int w = 0, h = 0;
+    if (vt_icon_load_argb_sized(path, size, &px, &w, &h) != 0 || !px)
+        return NULL;
+    if (size > 0 && (w != size || h != size)) {
+        uint32_t *scaled = vt_icon_scale_argb(px, w, h, size, size);
+        vt_free(px);
+        return scaled;
+    }
+    return px;
+}
+
 int vt_icon_load_argb(const char *path, uint32_t **out_pixels,
                       int *out_w, int *out_h) {
     if (!path || !out_pixels || !out_w || !out_h) return -1;

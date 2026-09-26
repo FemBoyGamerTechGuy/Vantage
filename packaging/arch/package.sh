@@ -120,6 +120,7 @@ declare -A SONAME_MAP=(
     [libfreetype.so]=freetype2 [libfontconfig.so]=fontconfig
     [libjpeg.so]=libjpeg-turbo [libturbojpeg.so]=libjpeg-turbo
     [libgdk_pixbuf-2.0.so]=gdk-pixbuf2
+    [librsvg-2.so]=librsvg    [libcairo.so]=cairo
     [libgobject-2.0.so]=glib2 [libglib-2.0.so]=glib2 [libgio-2.0.so]=glib2
     [libgmodule-2.0.so]=glib2 [libgthread-2.0.so]=glib2
     # system services

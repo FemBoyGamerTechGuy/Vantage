@@ -269,13 +269,18 @@ static int _h_wm_query(vt_ipc_t *ipc, const vt_ipc_msg_t *req,
         if (w->maximized) flags[fi++] = 'X';
         if (w->fullscreen) flags[fi++] = 'S';
         if (w->urgent) flags[fi++] = 'U';
-        vt_strbuilder_appendf(&sb, "%u\t%s\t%d\t%s\t%s\t%s\n",
+        /* geometry columns feed the panel's workspace PAGER: each cell
+         * draws the windows of that desktop at their real relative
+         * position and size */
+        vt_strbuilder_appendf(&sb,
+                              "%u\t%s\t%d\t%s\t%s\t%s\t%d\t%d\t%d\t%d\n",
                               w->id,
                               w->title ? w->title : "",
                               w->workspace,
                               flags,
                               w->class_str ? w->class_str : "",
-                              w->app_id ? w->app_id : "");
+                              w->app_id ? w->app_id : "",
+                              w->x, w->y, w->w, w->h);
     }
     resp->payload = (uint8_t *)vt_strbuilder_finish(&sb, &out_len);
     resp->len = (uint32_t)out_len;

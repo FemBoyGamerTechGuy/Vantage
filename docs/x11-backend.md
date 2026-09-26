@@ -161,3 +161,21 @@ Vantage's compositor talks to the X server's Composite extension. It
 redirects toplevel windows and uses the damage extension to track
 repaint regions, compositing through XRender (see
 `src/compositor/vt-compositor-x11.c`).
+
+## CSD windows and _MOTIF_WM_HINTS
+
+Applications that draw their own headerbars (GTK apps with client-side
+decorations, Chromium, Firefox with the system titlebar disabled) set
+`_MOTIF_WM_HINTS` with `decorations=0`. Vantage honors it: those
+windows are left UNDECORATED — no double titlebar stacked over the
+app's own. The request is re-evaluated at runtime (PropertyNotify), so
+an app toggling its CSD on/off is followed immediately. Partial
+decoration requests (border-only, etc.) still get the Vantage frame.
+
+The panel's Programs button uses the active icon theme's `start-here`
+icon (XFCE-style); menu and taskbar icons render at 24px/20px with
+area-averaged resampling, and SVG icon themes rasterize at the exact
+display size. The workspace switcher is a real PAGER: every cell shows
+that desktop's windows at their true relative position and size
+(minimized windows stay in the taskbar only, per the user's
+preference), click switches desktops, the wheel cycles them.

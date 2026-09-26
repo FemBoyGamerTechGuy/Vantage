@@ -236,6 +236,73 @@ static void _read_protocols(_client_t *c, Display *dpy) {
     }
 }
 
+static void _set_frame_extents(vt_wm_x11_t *e, _client_t *c);
+static void _frame_paint(vt_wm_x11_t *e, _client_t *c);
+static void _frame_create(vt_wm_x11_t *e, _client_t *c);
+static void _frame_destroy(vt_wm_x11_t *e, _client_t *c, bool destroyed);
+static bool _framed(const _client_t *c);
+
+/* --------------------------------------------------- _MOTIF_WM_HINTS */
+/* mwm.h field semantics (de facto standard): hints[0]=flags,
+ * hints[2]=decorations. MWM_HINTS_DECORATIONS=1<<2,
+ * MWM_DECOR_ALL=1, MWM_DECOR_TITLE=1<<3 (2), MWM_DECOR_BORDER=1<<4 (4).
+ *
+ * GTK/Chromium/Firefox windows that draw their own headerbars set
+ * decorations=0 here. A WM that ignores this DOUBLE-DECORATES those
+ * windows — its own titlebar stacked on top of the app's. */
+#define _MWM_HINTS_DECORATIONS (1L << 2)
+#define _MWM_DECOR_ALL         (1L << 0)
+#define _MWM_DECOR_TITLE       (1L << 3)
+#define _MWM_DECOR_BORDER      (1L << 4)
+
+/* returns true when the client asks for NO server-side decorations */
+static bool _motif_undecorated(_client_t *c, Display *dpy) {
+    const vt_x11_atoms_t *a = vt_x11_atoms();
+    unsigned char *data = NULL;
+    unsigned long n = 0;
+    bool undecorated = false;
+    if (vt_x11_get_window_property(c->win, a->motif_wm_hints, a->cardinal,
+                                   &data, &n) && data && n >= 3) {
+        unsigned long *h = (unsigned long *)(void *)data;
+        if (h[0] & _MWM_HINTS_DECORATIONS) {
+            unsigned long decor = h[2];
+            if (decor & _MWM_DECOR_ALL) {
+                undecorated = false;
+            } else {
+                /* no title AND no border → the window draws everything */
+                if (!(decor & (_MWM_DECOR_TITLE | _MWM_DECOR_BORDER)))
+                    undecorated = true;
+                /* partial decorations (e.g. border only): still frame it —
+                 * a minimal honest frame beats a floating borderless box */
+            }
+        }
+        XFree(data);
+    }
+    return undecorated;
+}
+
+/* (re-)apply the motif decoration request: creates or removes the SSD
+ * frame. Apps toggle this at runtime (browser CSD on/off). */
+static void _apply_motif(vt_wm_x11_t *e, _client_t *c) {
+    if (c->is_dock || c->is_desktop || c->model.fullscreen) return;
+    bool want = !_motif_undecorated(c, e->dpy);
+    if (want && !c->framed) {
+        _frame_create(e, c);
+        if (_framed(c)) {
+            XMapWindow(e->dpy, c->frame);
+            _frame_paint(e, c);
+        }
+        vt_logi("wm: 0x%lx re-framed (MOTIF decorations requested)",
+                (unsigned long)c->win);
+    } else if (!want && c->framed) {
+        _frame_destroy(e, c, false);
+        vt_logi("wm: 0x%lx decorations removed (client-side decorations)",
+                (unsigned long)c->win);
+    }
+    _set_frame_extents(e, c);
+    _emit_win(e, c, VT_WM_EVENT_STATE);
+}
+
 static void _read_type_and_state(_client_t *c) {
     const vt_x11_atoms_t *a = vt_x11_atoms();
     unsigned char *data = NULL;
@@ -375,8 +442,6 @@ static void _set_state_atoms(vt_wm_x11_t *e, _client_t *c) {
                          PropModeReplace, (const unsigned char *)list, n);
 }
 
-static void _set_frame_extents(vt_wm_x11_t *e, _client_t *c);
-static void _frame_paint(vt_wm_x11_t *e, _client_t *c);
 static void _send_configure(vt_wm_x11_t *e, _client_t *c);
 static void _close(vt_wm_x11_t *e, _client_t *c);
 static void _maximize(vt_wm_x11_t *e, _client_t *c, bool on);
@@ -385,7 +450,6 @@ static void _focus(vt_wm_x11_t *e, _client_t *c);
 static void _raise(vt_wm_x11_t *e, _client_t *c);
 static void _op_start(vt_wm_x11_t *e, _client_t *c, int mode, int edge,
                       int px, int py);
-
 /* ------------------------------------------------------ decorations */
 #define _FR_BORDER 2
 #define _FR_TITLE  26
@@ -1099,8 +1163,12 @@ static void _manage(vt_wm_x11_t *e, Window w) {
     _set_net_wm_desktop(e, c);
     _set_allowed_actions(e, c);
 
-    /* decorations: docks/desktops stay undecorated */
-    if (!c->is_dock && !c->is_desktop) _frame_create(e, c);
+    /* decorations: docks/desktops stay undecorated; MOTIF-decorating
+     * windows (CSD apps: GTK headerbars, Chromium, Firefox with the
+     * system titlebar off) manage their own chrome and must not be
+     * double-decorated */
+    if (!c->is_dock && !c->is_desktop && !_motif_undecorated(c, e->dpy))
+        _frame_create(e, c);
     _set_frame_extents(e, c);
     _set_state_atoms(e, c);
 
@@ -1536,6 +1604,10 @@ static void _handle_property(vt_wm_x11_t *e, XPropertyEvent *pe) {
             c->model.title = t;
             _emit_win(e, c, VT_WM_EVENT_TITLE);
         }
+    } else if (pe->atom == a->motif_wm_hints) {
+        /* the app turned its own decorations on/off (browser CSD
+         * toggles do exactly this) — follow it immediately */
+        _apply_motif(e, c);
     } else if (pe->atom == XA_WM_NORMAL_HINTS) {
         c->has_size_hints = false;
         c->min_w = c->min_h = c->max_w = c->max_h = 0;

@@ -70,6 +70,20 @@ int  vt_wallpaper_step(vt_wallpaper_t *w, vt_renderer_t *r, uint32_t output_w,
 void vt_wallpaper_render(vt_wallpaper_t *w, vt_renderer_t *r,
                           vt_rect_t area);
 
+/* Load the [wallpaper] section of the user's vantage.conf into w —
+ * the ONE parser shared by the X11 desktop and the Wayland background
+ * so both sessions show the same wallpaper. */
+int  vt_wallpaper_config_load(vt_wallpaper_t *w);
+
+/* Render the wallpaper DIRECTLY into a CPU ARGB-8888 buffer (the
+ * Wayland compositor's framebuffer path — no renderer needed).
+ * pw x ph destination, row stride = pw. Solid color: fill; gradient:
+ * per-pixel interpolation (smooth, no banding steps); image: scaled
+ * to cover and center-cropped. Video: falls back to color_a + a loud
+ * log (video needs the renderer stepping path). */
+void vt_wallpaper_render_argb(vt_wallpaper_t *w, uint32_t *pix,
+                               int pw, int ph);
+
 #ifdef __cplusplus
 }
 #endif

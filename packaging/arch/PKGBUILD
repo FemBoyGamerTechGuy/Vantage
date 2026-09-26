@@ -13,8 +13,9 @@ depends=(
   # X11 backend
   'libx11' 'libxcb' 'libxcomposite' 'libxdamage' 'libxext' 'libxft'
   'libxi' 'libxrandr' 'libxrender' 'libxcursor'
-  # shared runtime bits (freetype2/fontconfig: WM titles + panel text)
-  'json-c' 'systemd-libs' 'freetype2' 'fontconfig'
+  # shared runtime bits (freetype2/fontconfig: WM titles + panel text;
+  # librsvg + cairo: SVG icon themes rasterized at panel display size)
+  'json-c' 'systemd-libs' 'freetype2' 'fontconfig' 'librsvg' 'cairo'
 )
 makedepends=(
   'meson' 'ninja' 'gcc' 'pkg-config' 'wayland-protocols'

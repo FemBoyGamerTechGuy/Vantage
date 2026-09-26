@@ -37,6 +37,8 @@
 #include <vantage/vt-seat.h>
 #include <vantage/vt-kms.h>
 #include <vantage/vt-ipc.h>
+#include <vantage/vt-wallpaper.h>
+#include "xdg-decoration-protocol.h"
 
 #if defined(VT_HAVE_WAYLAND)
 
@@ -120,18 +122,29 @@ static bool _env_flag(const char *name) {
 typedef struct _wl_surf {
     struct wl_resource *res;
     struct wl_resource *buf_res;      /* current wl_buffer */
-    uint32_t *pixels;                 /* mapped shm contents (BGRA/XRGB) */
+    uint32_t *pixels;                 /* OUR copy of the last commit */
+    uint32_t *own;                    /* backing store for pixels */
+    size_t   own_cap;                 /* capacity in uint32 units */
     int32_t  w, h;
     int32_t  stride;                  /* row stride in uint32 units */
     int32_t  dx, dy;                  /* attach offset */
     int      x, y;                    /* composited position */
     int      ws;                      /* workspace (all if sticky-ish) */
     bool     mapped;
+    bool     minimized;               /* set_minimized: hidden but alive */
     bool     has_pending_xdg;         /* xdg toplevel exists */
     struct _xdg_toplevel *toplevel;
+    struct _xdg_popup    *popup;      /* xdg_popup role */
     struct wl_list link;              /* stacking (head = bottom) */
     struct wl_list frame_cbs;         /* pending wl_callback */
-    /* cursor-surface duties (wl_pointer.set_cursor) */
+    /* xdg_surface.set_window_geometry: the window rect inside the
+     * buffer (CSD shadows live in the buffer but outside the geometry).
+     * SET, never accumulated — accumulating made windows drift across
+     * the screen on every resize. */
+    int32_t  win_gx, win_gy, win_gw, win_gh;
+    bool     have_win_geo;
+    int32_t  last_gx, last_gy;        /* previous geometry offset (anchor) */
+    /* wl_pointer.set_cursor duties */
     bool     is_cursor;
     int      hotspot_x, hotspot_y;
     /* wl_subsurface duties: children are painted relative to this
@@ -139,13 +152,17 @@ typedef struct _wl_surf {
     struct _wl_surf *parent;
     struct wl_list  subs;             /* child subsurfaces */
     struct wl_list  sub_link;
+    /* server-side decoration requested via xdg-decoration (SSD):
+     * drawn by the compositor around this surface */
+    bool     ssd;
+    struct wl_resource *decor_res;   /* zxdg_toplevel_decoration_v1 */
 } _wl_surf_t;
 
 typedef struct _xdg_toplevel {
     struct wl_resource *res;
     _wl_surf_t *surf;
     uint64_t    id;                   /* stable window id for the WM */
-    bool maximized, fullscreen, resizing, activated;
+    bool maximized, fullscreen, resizing, activated, minimized;
     char *title;
     char *app_id;
 } _xdg_toplevel_t;
@@ -153,7 +170,22 @@ typedef struct _xdg_toplevel {
 typedef struct _xdg_popup {
     struct wl_resource *res;
     _wl_surf_t *surf;
+    _wl_surf_t *parent;              /* anchor parent (surface coords) */
+    int32_t rel_x, rel_y;            /* position relative to the parent */
+    bool grabbed;                    /* popup grab active (menus) */
 } _xdg_popup_t;
+
+/* xdg_positioner state (popup placement) — parsed for real, so GTK
+ * menus/combo boxes appear where the app asked instead of being
+ * dumped centered on the screen at a fixed 320x200. */
+typedef struct {
+    int32_t  ax, ay, aw, ah;         /* anchor rect (parent coords) */
+    int32_t  size_w, size_h;
+    uint32_t anchor, gravity;
+    int32_t  off_x, off_y;
+    uint32_t constraint;
+    bool     has_size;
+} _xdg_pos_t;
 
 typedef struct _cb_node {
     struct wl_list link;
@@ -234,13 +266,20 @@ typedef struct {
     /* clipboard */
     struct wl_list data_devs;        /* _data_dev_t */
     struct _data_src *selection;
+    /* desktop background: the SAME wallpaper engine the X11 desktop
+     * uses, rendered once into an ARGB buffer (config [wallpaper]) */
+    vt_wallpaper_t *wall;
+    uint32_t *bg_pix;
+    /* xdg-decoration protocol */
+    struct wl_global *decor_g;
     /* cursor sprite */
     uint32_t cursor_img[64 * 64];
     int cur_img_w, cur_img_h, cur_img_hx, cur_img_hy;
     bool cur_client_set;               /* client provided a cursor */
     _wl_surf_t *cursor_surf;
+    uint32_t mods_depressed;           /* current keyboard modifiers */
 
-    /* interactive move/resize (xdg toplevel requests) */
+    /* interactive move/resize (xdg toplevel requests + Super+drag) */
     bool op_active;                    /* interactive op in progress */
     bool op_resize;
     _wl_surf_t *op_surf;
@@ -250,7 +289,20 @@ typedef struct {
 
 static _wl_state_t *_wls = NULL;
 
+/* SSD frame metrics + geometry (xdg-decoration server mode) — the
+ * drawing helpers live with the painting code; the geometry helper is
+ * needed early by input hit-testing. */
+#define _WL_SSD_BORDER 2
+#define _WL_SSD_TITLE  26
+#define _WL_SSD_BTN    22
+static void _ssd_frame_geom(const _wl_surf_t *s, int *fx, int *fy,
+                            int *fw, int *fh);
+
 /* used by the WM host (vantage-wm) to route compositor hotkeys */
+static bool _hotkey_try(vt_backend_t *self, const char *combo);
+static void _kbd_enter_focus(_wl_state_t *st, _wl_surf_t *s);
+static void _decor_notify(_wl_surf_t *s);
+static void _focus_top_on_ws(_wl_state_t *st);
 static bool _hotkey_try(vt_backend_t *self, const char *combo) {
     if (self && self->hotkey) return self->hotkey(self, combo);
     return false;
@@ -274,6 +326,7 @@ static void _emit_win(_wl_state_t *st, vt_backend_wl_event_kind_t kind,
     ev.focused = t->activated;
     ev.maximized = t->maximized;
     ev.fullscreen = t->fullscreen;
+    ev.minimized = t->minimized;
     vt_backend_t *b = NULL;
     /* emit through the backend's sink list: find backend from st */
     if (_wls && _wls->backend_self) b = _wls->backend_self;
@@ -313,43 +366,156 @@ static void _surf_frame(struct wl_client *cli, struct wl_resource *res,
 static void _surf_commit(struct wl_client *cli, struct wl_resource *res) {
     (void)cli;
     _wl_surf_t *s = wl_resource_get_user_data(res);
+    _wl_state_t *st = _wls;
+    if (!st) return;
+
     if (s->buf_res) {
         struct wl_shm_buffer *shm = wl_shm_buffer_get(s->buf_res);
         if (shm) {
-            wl_shm_buffer_begin_access(shm);
-            s->pixels = (uint32_t *)wl_shm_buffer_get_data(shm);
-            s->w = wl_shm_buffer_get_width(shm);
-            s->h = wl_shm_buffer_get_height(shm);
-            /* the client's row stride is NOT width*4 in general —
-             * toolkits pad rows. Reading with w as the stride shears
-             * the whole window into a diagonal smear. */
+            int32_t w = wl_shm_buffer_get_width(shm);
+            int32_t h = wl_shm_buffer_get_height(shm);
             int32_t bytes = wl_shm_buffer_get_stride(shm);
-            s->stride = bytes / 4 >= s->w ? bytes / 4 : s->w;
+            int32_t stride = bytes / 4 >= w ? bytes / 4 : w;
+            if (w > 0 && h > 0 && stride > 0) {
+                /* COPY the buffer and END the shm access immediately:
+                 *
+                 * 1. libwayland asserts (wl_shm_buffer_begin_access)
+                 *    when two different pools are opened at once — the
+                 *    old never-ended access ABORTED the compositor the
+                 *    moment a real toolkit committed its second pool.
+                 *    Every app died with "Broken pipe" — the whole
+                 *    Wayland session crashed. This copy fixes that.
+                 * 2. Keeping a raw pointer into the pool dangles when
+                 *    the client destroys the buffer/pool after the next
+                 *    attach (toolkits cycle buffers constantly).
+                 * 3. With our own copy the buffer can be RELEASED right
+                 *    away, so clients never stall waiting for
+                 *    wl_buffer.release (they would after two commits). */
+                size_t need = (size_t)stride * (size_t)h;
+                if (!s->own || s->own_cap < need) {
+                    vt_free(s->own);
+                    s->own_cap = need + need / 2;
+                    s->own = vt_malloc(sizeof(uint32_t) * s->own_cap);
+                }
+                if (s->own) {
+                    wl_shm_buffer_begin_access(shm);
+                    memcpy(s->own, wl_shm_buffer_get_data(shm),
+                           need * sizeof(uint32_t));
+                    wl_shm_buffer_end_access(shm);
+                    s->pixels = s->own;
+                    s->w = w;
+                    s->h = h;
+                    s->stride = stride;
+                }
+            }
+            wl_buffer_send_release(s->buf_res);
+        } else {
+            /* Not a shm buffer (EGL/dmabuf): we advertise no
+             * linux-dmabuf/wl_drm, so this should not happen — say so
+             * loudly instead of silently painting garbage. */
+            static bool warned_nonshm = false;
+            if (!warned_nonshm) {
+                warned_nonshm = true;
+                vt_logw("wayland: client committed a non-shm buffer — "
+                        "only wl_shm buffers are composited");
+            }
         }
-        if (!s->mapped && s->w > 0 && s->h > 0) {
-            s->mapped = true;
-            wl_list_insert(_wls->surfaces.prev, &s->link);
-            /* center the first frame */
-            if (s->x == 0 && s->y == 0) {
+        s->buf_res = NULL;
+    }
+
+    /* buffer/offset bookkeeping before mapping math */
+    if (s->dx || s->dy) {
+        if (s->mapped) {
+            s->x -= s->dx;
+            s->y -= s->dy;
+        }
+        s->dx = 0;
+        s->dy = 0;
+    }
+
+    if (!s->mapped && s->w > 0 && s->h > 0) {
+        s->mapped = true;
+        s->minimized = false;
+        wl_list_insert(_wls->surfaces.prev, &s->link);
+        if (s->popup) {
+            /* popups map ON TOP (surfaces list head = bottom; inserting
+             * at prev = top) — they are menus */
+            if (s->popup->grabbed && s->res) {
+                /* grabbed popups take keyboard focus (menu navigation) */
+                _wl_surf_t *old = st->kbd_focus;
+                if (old && old->res) {
+                    _kbd_res_t *kr;
+                    wl_list_for_each(kr, &st->kbd_reses, link) {
+                        if (wl_resource_get_client(kr->res) ==
+                            wl_resource_get_client(old->res))
+                            wl_keyboard_send_leave(kr->res, ++st->serial,
+                                                   old->res);
+                    }
+                }
+                st->kbd_focus = s;
+                _kbd_res_t *kr;
+                wl_list_for_each(kr, &st->kbd_reses, link) {
+                    if (wl_resource_get_client(kr->res) ==
+                        wl_resource_get_client(s->res)) {
+                        struct wl_array keys;
+                        wl_array_init(&keys);
+                        wl_keyboard_send_enter(kr->res, ++st->serial, s->res,
+                                               &keys);
+                        wl_array_release(&keys);
+                    }
+                }
+            }
+            vt_logd("wayland: popup mapped %ux%u at +%d+%d (rel)",
+                    (unsigned)s->w, (unsigned)s->h,
+                    (int)s->popup->rel_x, (int)s->popup->rel_y);
+        } else if (s->toplevel) {
+            /* new windows appear on the CURRENT workspace (s->ws was
+             * only ever set on taskbar-restore — every window stayed on
+             * workspace 1 forever) */
+            s->ws = st->ws_cur;
+            /* place the first frame: maximized/fullscreen anchor below
+             * the panel (or at the very top for fullscreen); everything
+             * else centers inside the workarea */
+            if (s->toplevel->fullscreen) {
+                s->x = 0;
+                s->y = 0;
+            } else if (s->toplevel->maximized && st->panel) {
+                s->x = 0;
+                s->y = vt_wl_panel_height(st->panel);
+            } else if (s->x == 0 && s->y == 0) {
                 s->x = (_wls->out_w - s->w) / 2;
                 s->y = (_wls->out_h - s->h) / 2;
+                if (st->panel) {
+                    int bar = vt_wl_panel_height(st->panel);
+                    int wa_h = _wls->out_h - bar;
+                    s->y = bar + (wa_h - s->h) / 2;
+                    if (s->y < bar) s->y = bar;
+                }
                 if (s->x < 0) s->x = 0;
                 if (s->y < 0) s->y = 0;
             }
             vt_logi("wayland: window 0x%llx '%s' mapped %dx%d at +%d+%d",
-                    (unsigned long long)(s->toplevel ? s->toplevel->id : 0),
-                    s->toplevel && s->toplevel->title ?
-                        s->toplevel->title : "(untitled)",
+                    (unsigned long long)(s->toplevel->id),
+                    s->toplevel->title ? s->toplevel->title : "(untitled)",
                     s->w, s->h, s->x, s->y);
-            if (s->toplevel) {
-                s->toplevel->activated = true;
-                _emit_win(_wls, VT_BACKEND_WL_EVENT_WIN_MAP, s->toplevel);
-            }
+            if (s->toplevel->minimized) s->toplevel->minimized = false;
+            _emit_win(_wls, VT_BACKEND_WL_EVENT_WIN_MAP, s->toplevel);
             /* new window takes keyboard focus */
             _wls->kbd_focus = s;
             _wls->focused_toplevel = s->toplevel;
+            _wls->dirty = true;
+            /* tell the client which decoration mode won (xdg-decoration
+             * clients render their own chrome when we answer "client") */
+            _decor_notify(s);
+            _kbd_enter_focus(st, s);
         }
         _wls->dirty = true;
+    } else if (s->mapped && s->w > 0) {
+        _wls->dirty = true;
+        if (s->toplevel && s->toplevel->minimized) {
+            s->toplevel->minimized = false;
+            s->minimized = false;
+        }
     }
 }
 
@@ -374,9 +540,16 @@ static void _surf_set_buffer_scale(struct wl_client *cli,
                                     int32_t scale) {
     (void)cli; (void)res; (void)scale;
 }
-static void _surf_offset(struct wl_client *cli, struct wl_resource *res,
-                         int32_t x, int32_t y) {
-    (void)cli; (void)res; (void)x; (void)y;
+static void _surf_offset(struct wl_client *cli,
+                         struct wl_resource *res, int32_t x, int32_t y) {
+    (void)cli;
+    _wl_surf_t *s = wl_resource_get_user_data(res);
+    if (!s) return;
+    /* wl_surface.offset (v5): the next commit moves the surface's
+     * content by (-x, -y). GTK4 uses this when its CSD shadow size
+     * changes; ignoring it sheared client windows. */
+    s->dx = x;
+    s->dy = y;
 }
 
 static void _region_destroy(struct wl_client *cli, struct wl_resource *res);
@@ -428,6 +601,13 @@ static void _surf_resource_destroy(struct wl_resource *res) {
         wl_list_remove(&s->sub_link);
         s->parent = NULL;
     }
+    if (s->popup) {
+        /* the popup OBJECT is owned by its wl_resource (freed in
+         * _popup_res_destroy); here we only detach — freeing in both
+         * places was a double free / use-after-free */
+        s->popup->surf = NULL;
+        s->popup = NULL;
+    }
     if (s->mapped) {
         wl_list_remove(&s->link);
         if (_wls) {
@@ -443,6 +623,7 @@ static void _surf_resource_destroy(struct wl_resource *res) {
         vt_free(s->toplevel->app_id);
         vt_free(s->toplevel);
     }
+    vt_free(s->own);
     vt_free(s);
     if (_wls) _wls->dirty = true;
 }
@@ -816,13 +997,6 @@ typedef struct {
     _wl_surf_t *surf;
 } _xdg_surf_data_t;
 
-static void _xdg_wm_base_ping(struct wl_client *cli,
-                              struct wl_resource *res, uint32_t serial) {
-    /* clients may ping us — reply with a server ping so they pong back */
-    (void)cli; (void)serial;
-    xdg_wm_base_send_ping(res, serial);
-}
-
 static void _xdg_wm_base_destroy(struct wl_client *cli,
                                  struct wl_resource *res) {
     (void)cli;
@@ -848,15 +1022,26 @@ static void _xdg_surface_set_window_geometry(struct wl_client *cli,
                                               int32_t w, int32_t h) {
     (void)cli;
     _xdg_surf_data_t *d = wl_resource_get_user_data(res);
-    if (d && d->surf) {
-        d->surf->x += x;
-        d->surf->y += y;
-        if (w > 0) d->surf->w = w;
-        if (h > 0) d->surf->h = h;
-        if (d->surf->toplevel)
-            _emit_win(_wls, VT_BACKEND_WL_EVENT_WIN_GEOMETRY,
-                      d->surf->toplevel);
+    if (!d || !d->surf) return;
+    _wl_surf_t *s = d->surf;
+    /* SET the geometry (buffer-relative window rect); CSD shadows live
+     * in the buffer outside it. Keep the window's VISIBLE origin
+     * stable when the client's shadow margins change (anchor the old
+     * geometry origin), and never accumulate — the old `x += x` made
+     * every resize drag the window across the screen. */
+    if (s->have_win_geo) {
+        s->x += s->last_gx - x;
+        s->y += s->last_gy - y;
     }
+    s->win_gx = x;
+    s->win_gy = y;
+    s->last_gx = x;
+    s->last_gy = y;
+    if (w > 0) s->win_gw = w;
+    if (h > 0) s->win_gh = h;
+    s->have_win_geo = true;
+    if (s->toplevel)
+        _emit_win(_wls, VT_BACKEND_WL_EVENT_WIN_GEOMETRY, s->toplevel);
 }
 
 /* toplevel implementation */
@@ -951,7 +1136,13 @@ static void _toplevel_maximize(struct wl_client *cli,
     (void)cli;
     _xdg_toplevel_t *t = wl_resource_get_user_data(res);
     if (t) t->maximized = true;
-    _toplevel_configure(res, _wls->out_w, _wls->out_h,
+    if (t && t->surf && _wls && _wls->panel) {
+        /* workarea: the panel's strip is NOT part of a maximized window */
+        t->surf->x = 0;
+        t->surf->y = vt_wl_panel_height(_wls->panel);
+    }
+    _toplevel_configure(res, _wls->out_w,
+                        _wls->out_h - (_wls->panel ? vt_wl_panel_height(_wls->panel) : 0),
                         XDG_TOPLEVEL_STATE_MAXIMIZED);
     if (t) _emit_win(_wls, VT_BACKEND_WL_EVENT_WIN_STATE, t);
 }
@@ -987,6 +1178,35 @@ static void _toplevel_unfullscreen(struct wl_client *cli,
     wl_array_release(&states);
     if (t) _emit_win(_wls, VT_BACKEND_WL_EVENT_WIN_STATE, t);
 }
+static void _toplevel_set_minimized(struct wl_client *cli,
+                                    struct wl_resource *res) {
+    (void)cli;
+    _xdg_toplevel_t *t = wl_resource_get_user_data(res);
+    _wl_state_t *st = _wls;
+    if (!t || !t->surf || !st) return;
+    /* real minimize: hidden from compositing, restored from the
+     * taskbar. (This used to be aliased onto unset_maximized — a
+     * bogus empty configure and nothing was ever minimized.) */
+    t->minimized = true;
+    t->surf->minimized = true;
+    if (st->kbd_focus == t->surf) st->kbd_focus = NULL;
+    st->dirty = true;
+    vt_logi("wayland: window 0x%llx minimized",
+            (unsigned long long)t->id);
+    _emit_win(st, VT_BACKEND_WL_EVENT_WIN_STATE, t);
+    /* focus falls to the top-most remaining mapped toplevel */
+    _wl_surf_t *s;
+    wl_list_for_each_reverse(s, &st->surfaces, link) {
+        if (!s->mapped || s->is_cursor || s->minimized || !s->toplevel)
+            continue;
+        if (s->ws != st->ws_cur) continue;
+        st->kbd_focus = s;
+        st->focused_toplevel = s->toplevel;
+        _kbd_enter_focus(st, s);
+        _emit_win(st, VT_BACKEND_WL_EVENT_WIN_FOCUS, s->toplevel);
+        break;
+    }
+}
 static const struct xdg_toplevel_interface _toplevel_impl = {
     .destroy = _toplevel_destroy,
     .set_parent = _toplevel_set_parent,
@@ -1001,8 +1221,7 @@ static const struct xdg_toplevel_interface _toplevel_impl = {
     .unset_maximized = _toplevel_unmaximize,
     .set_fullscreen = _toplevel_fullscreen,
     .unset_fullscreen = _toplevel_unfullscreen,
-    .set_minimized = (void (*)(struct wl_client *,
-                               struct wl_resource *))_toplevel_unmaximize,
+    .set_minimized = _toplevel_set_minimized,
 };
 
 /* we need per-surface xdg data to route get_toplevel */
@@ -1060,24 +1279,62 @@ static void _xdg_get_toplevel(struct wl_client *cli,
     xdg_surface_send_configure(res, 2);
 }
 
-/* positioner (popup placement) — accept and ignore geometry details */
+/* positioner (popup placement) — parsed for REAL: menus land where the
+ * client asked (anchored to the parent), with the positioner's own
+ * size, not a made-up 320x200 centered on the screen. */
 static void _pos_destroy(struct wl_client *cli, struct wl_resource *res) {
     (void)cli;
+    _xdg_pos_t *p = wl_resource_get_user_data(res);
+    vt_free(p);
     wl_resource_destroy(res);
 }
 static void _pos_set_size(struct wl_client *cli, struct wl_resource *res,
-                          int32_t w, int32_t h) { (void)cli; (void)res; (void)w; (void)h; }
+                          int32_t w, int32_t h) {
+    (void)cli;
+    _xdg_pos_t *p = wl_resource_get_user_data(res);
+    if (!p || w < 1 || h < 1) return;
+    p->size_w = w;
+    p->size_h = h;
+    p->has_size = true;
+}
 static void _pos_set_anchor(struct wl_client *cli, struct wl_resource *res,
-                            uint32_t a) { (void)cli; (void)res; (void)a; }
+                            uint32_t a) {
+    (void)cli;
+    _xdg_pos_t *p = wl_resource_get_user_data(res);
+    if (p) p->anchor = a;
+}
 static void _pos_set_gravity(struct wl_client *cli,
                              struct wl_resource *res,
-                             uint32_t g) { (void)cli; (void)res; (void)g; }
+                             uint32_t g) {
+    (void)cli;
+    _xdg_pos_t *p = wl_resource_get_user_data(res);
+    if (p) p->gravity = g;
+}
 static void _pos_set_offset(struct wl_client *cli, struct wl_resource *res,
-                            int32_t x, int32_t y) { (void)cli; (void)res; (void)x; (void)y; }
+                            int32_t x, int32_t y) {
+    (void)cli;
+    _xdg_pos_t *p = wl_resource_get_user_data(res);
+    if (!p) return;
+    p->off_x = x;
+    p->off_y = y;
+}
 static void _pos_set_anchor_rect(struct wl_client *cli,
                                  struct wl_resource *res,
                                  int32_t x, int32_t y, int32_t w, int32_t h) {
-    (void)cli; (void)res; (void)x; (void)y; (void)w; (void)h;
+    (void)cli;
+    _xdg_pos_t *p = wl_resource_get_user_data(res);
+    if (!p) return;
+    p->ax = x;
+    p->ay = y;
+    p->aw = w;
+    p->ah = h;
+}
+static void _pos_set_constraint(struct wl_client *cli,
+                                struct wl_resource *res,
+                                uint32_t constraint) {
+    (void)cli;
+    _xdg_pos_t *p = wl_resource_get_user_data(res);
+    if (p) p->constraint = constraint;
 }
 static const struct xdg_positioner_interface _pos_impl = {
     .destroy = _pos_destroy,
@@ -1085,42 +1342,218 @@ static const struct xdg_positioner_interface _pos_impl = {
     .set_anchor_rect = _pos_set_anchor_rect,
     .set_anchor = _pos_set_anchor,
     .set_gravity = _pos_set_gravity,
-    .set_constraint_adjustment = (void (*)(struct wl_client *,
-                                           struct wl_resource *,
-                                           uint32_t))_pos_set_anchor,
+    .set_constraint_adjustment = _pos_set_constraint,
     .set_offset = _pos_set_offset,
 };
 
 static void _xdg_create_positioner(struct wl_client *cli,
                                    struct wl_resource *res, uint32_t id) {
+    _xdg_pos_t *p = vt_malloc0(sizeof(*p));
+    if (!p) { wl_client_post_no_memory(cli); return; }
     struct wl_resource *r = wl_resource_create(cli,
         &xdg_positioner_interface, wl_resource_get_version(res), id);
-    if (!r) { wl_client_post_no_memory(cli); return; }
-    wl_resource_set_implementation(r, &_pos_impl, NULL, NULL);
+    if (!r) { vt_free(p); wl_client_post_no_memory(cli); return; }
+    wl_resource_set_implementation(r, &_pos_impl, p, NULL);
+}
+
+/* compute the popup rect (relative to the parent surface) from the
+ * positioner state — the icon-theme-spec-style anchor/gravity dance */
+static void _popup_place(const _xdg_pos_t *pos, _wl_surf_t *parent,
+                         int out_w, int out_h, int32_t *rx, int32_t *ry,
+                         int32_t *rw, int32_t *rh) {
+    int32_t w = pos->has_size ? pos->size_w : 200;
+    int32_t h = pos->has_size ? pos->size_h : 200;
+    if (w > out_w) w = out_w;
+    if (h > out_h) h = out_h;
+
+    /* anchor point on the anchor rect */
+    double ax = parent->x + pos->ax;
+    double ay = parent->y + pos->ay;
+    if (pos->anchor & XDG_POSITIONER_ANCHOR_LEFT)
+        { /* x stays */ }
+    if (pos->anchor & XDG_POSITIONER_ANCHOR_RIGHT)
+        ax += pos->aw;
+    if (pos->anchor & (XDG_POSITIONER_ANCHOR_TOP | XDG_POSITIONER_ANCHOR_BOTTOM))
+        ax += pos->aw / 2.0;
+    if (pos->anchor & XDG_POSITIONER_ANCHOR_TOP)
+        { /* y stays */ }
+    if (pos->anchor & XDG_POSITIONER_ANCHOR_BOTTOM)
+        ay += pos->ah;
+    if (pos->anchor & (XDG_POSITIONER_ANCHOR_LEFT | XDG_POSITIONER_ANCHOR_RIGHT))
+        ay += pos->ah / 2.0;
+
+    /* gravity: which corner of the POPUP sits at the anchor point */
+    double x = ax, y = ay;
+    if (pos->gravity & XDG_POSITIONER_GRAVITY_LEFT)   x -= w;
+    if (pos->gravity & XDG_POSITIONER_GRAVITY_RIGHT)  { /* extends right */ }
+    if (pos->gravity & XDG_POSITIONER_GRAVITY_TOP)    { /* extends down */ }
+    if (pos->gravity & XDG_POSITIONER_GRAVITY_BOTTOM) y -= h;
+
+    x += pos->off_x;
+    y += pos->off_y;
+
+    /* constraint adjustment: slide into the output, flip when it does
+     * not fit and flipping helps (menus must never cover their anchor
+     * and vanish off-screen) */
+    bool flip_x = pos->constraint & XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_X;
+    bool flip_y = pos->constraint & XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y;
+    bool slide_x = pos->constraint &
+        XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X;
+    bool slide_y = pos->constraint &
+        XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y;
+    if (x + w > out_w) {
+        if (flip_x) x = ax - w;
+        if (slide_x || x + w > out_w) {
+            if (x + w > out_w) x = out_w - w;
+        }
+    }
+    if (x < 0) x = 0;
+    if (y + h > out_h) {
+        if (flip_y) y = ay - pos->ah - h;
+        if (y + h > out_h) y = out_h - h;
+    }
+    if (y < 0) y = 0;
+    (void)slide_y;
+    (void)slide_x;
+
+    *rx = (int32_t)x - parent->x;
+    *ry = (int32_t)y - parent->y;
+    *rw = w;
+    *rh = h;
+}
+
+/* ---- xdg_popup requests (destroy/grab/reposition) — a NULL impl
+ * here made libwayland kill the client the moment a GTK menu closed
+ * (unknown request → protocol error → "app just crashed"). */
+static void _popup_destroy_req(struct wl_client *cli,
+                               struct wl_resource *res) {
+    (void)cli;
+    _xdg_popup_t *p = wl_resource_get_user_data(res);
+    if (p && p->surf) {
+        p->surf->popup = NULL;
+        if (p->surf->mapped) {
+            p->surf->mapped = false;
+            wl_list_remove(&p->surf->link);
+        }
+        if (_wls) {
+            if (_wls->kbd_focus == p->surf) _wls->kbd_focus = NULL;
+            if (_wls->ptr_focus == p->surf) _wls->ptr_focus = NULL;
+            _wls->dirty = true;
+        }
+    }
+    wl_resource_destroy(res);
+}
+static void _popup_grab_req(struct wl_client *cli, struct wl_resource *res,
+                            struct wl_resource *seat, uint32_t serial) {
+    (void)cli; (void)seat; (void)serial;
+    _xdg_popup_t *p = wl_resource_get_user_data(res);
+    if (p) p->grabbed = true;
+}
+static void _popup_reposition_req(struct wl_client *cli,
+                                  struct wl_resource *res,
+                                  struct wl_resource *positioner,
+                                  uint32_t token) {
+    (void)cli;
+    _xdg_popup_t *p = wl_resource_get_user_data(res);
+    _xdg_pos_t *pos = wl_resource_get_user_data(positioner);
+    if (!p || !pos || !p->parent || !_wls) return;
+    int32_t rx, ry, rw, rh;
+    _popup_place(pos, p->parent, _wls->out_w, _wls->out_h,
+                 &rx, &ry, &rw, &rh);
+    p->rel_x = rx;
+    p->rel_y = ry;
+    xdg_popup_send_configure(res, rx, ry, rw, rh);
+    if (p->surf && p->surf->res)
+        xdg_surface_send_configure(p->surf->res, token);
+    _wls->dirty = true;
+}
+static const struct xdg_popup_interface _popup_impl = {
+    .destroy = _popup_destroy_req,
+    .grab = _popup_grab_req,
+    .reposition = _popup_reposition_req,
+};
+
+static void _popup_res_destroy(struct wl_resource *res) {
+    _xdg_popup_t *p = wl_resource_get_user_data(res);
+    if (!p) return;
+    /* detach from a still-alive surface (the surface may already be
+     * gone — it NULLs p->surf on its own destruction) */
+    if (p->surf) p->surf->popup = NULL;
+    vt_free(p);
+}
+
+/* dismiss a grabbed popup: popup_done → the client unmaps/destroys it */
+static void _popup_done(_wl_state_t *st, _wl_surf_t *s) {
+    if (!st || !s || !s->popup || !s->popup->res) return;
+    xdg_popup_send_popup_done(s->popup->res);
+    s->popup->grabbed = false;
+    /* hide it NOW — the client's destroy/unmap follows asynchronously */
+    if (s->mapped) {
+        s->mapped = false;
+        wl_list_remove(&s->link);
+    }
+    if (st->kbd_focus == s) {
+        st->kbd_focus = NULL;
+        /* restore focus to the parent's toplevel */
+        _wl_surf_t *ps = s->popup ? s->popup->parent : NULL;
+        while (ps && !ps->toplevel && ps->popup) ps = ps->popup->parent;
+        if (ps && ps->toplevel) {
+            st->kbd_focus = ps;
+            st->focused_toplevel = ps->toplevel;
+            _kbd_enter_focus(st, ps);
+        }
+    }
+    st->dirty = true;
 }
 
 static void _xdg_get_popup(struct wl_client *cli,
                            struct wl_resource *res,
                            uint32_t id, struct wl_resource *parent,
                            struct wl_resource *positioner) {
-    (void)parent; (void)positioner;
     _xdg_surf_data_t *d = wl_resource_get_user_data(res);
+    _wl_surf_t *psurf = parent ? wl_resource_get_user_data(parent) : NULL;
+    _xdg_pos_t *pos = positioner
+        ? wl_resource_get_user_data(positioner) : NULL;
+    if (!d || !psurf || !pos || !pos->has_size) {
+        wl_resource_post_error(res, XDG_WM_BASE_ERROR_INVALID_POSITIONER,
+                               "get_popup requires a sized positioner and "
+                               "a parent surface");
+        return;
+    }
     _xdg_popup_t *p = vt_malloc0(sizeof(*p));
     if (!p) { wl_client_post_no_memory(cli); return; }
     p->surf = d->surf;
+    p->parent = psurf;
+    d->surf->popup = p;
+    int32_t rx, ry, rw, rh;
+    _popup_place(pos, psurf, _wls ? _wls->out_w : 1024,
+                 _wls ? _wls->out_h : 768, &rx, &ry, &rw, &rh);
+    p->rel_x = rx;
+    p->rel_y = ry;
     struct wl_resource *pres = wl_resource_create(cli,
         &xdg_popup_interface, wl_resource_get_version(res), id);
     if (!pres) { vt_free(p); wl_client_post_no_memory(cli); return; }
-    wl_resource_set_implementation(pres, NULL, p, NULL);
-    xdg_popup_send_configure(pres, 0, 0, 320, 200);
+    wl_resource_set_implementation(pres, &_popup_impl, p,
+                                   _popup_res_destroy);
+    p->res = pres;
+    /* configure sequence per spec: popup.configure, then the
+     * xdg_surface configure that lets the client commit */
+    xdg_popup_send_configure(pres, rx, ry, rw, rh);
+    xdg_surface_send_configure(res, ++_wls->serial);
+    vt_logd("wayland: popup %dx%d rel +%d+%d (parent %p)",
+            (int)rw, (int)rh, (int)rx, (int)ry, (void *)psurf);
+}
+
+static void _xdg_wm_base_pong(struct wl_client *cli,
+                              struct wl_resource *res, uint32_t serial) {
+    (void)cli; (void)res; (void)serial;
 }
 
 static const struct xdg_wm_base_interface _xdg_wm_base_impl = {
     .destroy = _xdg_wm_base_destroy,
     .create_positioner = _xdg_create_positioner,
     .get_xdg_surface = _xdg_wm_base_get_xdg_surface,
-    .pong = (void (*)(struct wl_client *, struct wl_resource *,
-                      uint32_t))_xdg_wm_base_ping,
+    .pong = _xdg_wm_base_pong,
 };
 
 static void _bind_xdg_wm_base(struct wl_client *cli, void *data,
@@ -1298,6 +1731,137 @@ static void _bind_seat(struct wl_client *cli, void *data,
     wl_resource_set_implementation(res, &_seat_impl, NULL, NULL);
     wl_seat_send_capabilities(res, WL_SEAT_CAPABILITY_POINTER |
                                    WL_SEAT_CAPABILITY_KEYBOARD);
+}
+
+/* send wl_keyboard.enter for s to its client's keyboards (leave the
+ * old focus first). Shared by focus paths so every transition is
+ * paired and client-scoped. */
+static void _kbd_enter_focus(_wl_state_t *st, _wl_surf_t *s) {
+    if (!st || !s || !s->res) return;
+    _wl_surf_t *old = st->kbd_focus;
+    if (old && old != s && old->res) {
+        _kbd_res_t *kr;
+        wl_list_for_each(kr, &st->kbd_reses, link) {
+            if (wl_resource_get_client(kr->res) ==
+                wl_resource_get_client(old->res))
+                wl_keyboard_send_leave(kr->res, ++st->serial, old->res);
+        }
+    }
+    _kbd_res_t *kr;
+    wl_list_for_each(kr, &st->kbd_reses, link) {
+        if (wl_resource_get_client(kr->res) ==
+            wl_resource_get_client(s->res)) {
+            struct wl_array keys;
+            wl_array_init(&keys);
+            wl_keyboard_send_enter(kr->res, ++st->serial, s->res, &keys);
+            wl_array_release(&keys);
+        }
+    }
+    st->kbd_focus = s;
+}
+
+/* ------------------------------------------------ xdg-decoration v1 */
+/* Compositors that decorate EVERY toplevel double-decorate CSD apps
+ * (the user's browser drew its own frame AND ours). The protocol is
+ * the honest fix: advertise it, honor the client's requested mode,
+ * DEFAULT to client-side (no double decoration ever), and draw our
+ * own SSD frame only for toplevels that explicitly asked for it. */
+typedef struct {
+    _wl_surf_t *surf;
+    struct wl_resource *res;
+} _decor_t;
+
+static void _decor_notify(_wl_surf_t *s) {
+    if (!s || !s->toplevel || !s->toplevel->res) return;
+    uint32_t mode = s->ssd ? ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE
+                            : ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE;
+    /* the mode event goes to the zxdg_toplevel_decoration_v1 object,
+     * remembered per-surface via decor_res below */
+    if (s->decor_res)
+        zxdg_toplevel_decoration_v1_send_configure(s->decor_res, mode);
+}
+
+static void _decor_destroy_req(struct wl_client *cli,
+                               struct wl_resource *res) {
+    (void)cli;
+    _decor_t *d = wl_resource_get_user_data(res);
+    if (d) {
+        if (d->surf) d->surf->decor_res = NULL;
+        vt_free(d);
+    }
+    wl_resource_destroy(res);
+}
+static void _decor_set_mode(struct wl_client *cli, struct wl_resource *res,
+                            uint32_t mode) {
+    (void)cli;
+    _decor_t *d = wl_resource_get_user_data(res);
+    if (!d || !d->surf) return;
+    bool ssd = (mode == ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+    if (d->surf->ssd != ssd) {
+        d->surf->ssd = ssd;
+        if (_wls) _wls->dirty = true;
+        vt_logd("wayland: toplevel decoration mode -> %s",
+                ssd ? "server" : "client");
+    }
+    zxdg_toplevel_decoration_v1_send_configure(res, mode);
+}
+static void _decor_unset_mode(struct wl_client *cli,
+                              struct wl_resource *res) {
+    /* unset = follow the compositor default (client-side here) */
+    _decor_set_mode(cli, res,
+                    ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);
+}
+static const struct zxdg_toplevel_decoration_v1_interface _decor_impl = {
+    .destroy = _decor_destroy_req,
+    .set_mode = _decor_set_mode,
+    .unset_mode = _decor_unset_mode,
+};
+static void _decor_res_destroy(struct wl_resource *res) {
+    _decor_t *d = wl_resource_get_user_data(res);
+    if (!d) return;
+    if (d->surf && d->surf->decor_res == res) d->surf->decor_res = NULL;
+    vt_free(d);
+}
+static void _decor_mgr_get_decoration(struct wl_client *cli,
+                                      struct wl_resource *res, uint32_t id,
+                                      struct wl_resource *toplevel_res) {
+    _xdg_toplevel_t *t = wl_resource_get_user_data(toplevel_res);
+    if (!t || !t->surf) {
+        wl_resource_post_error(res,
+            ZXDG_TOPLEVEL_DECORATION_V1_ERROR_UNCONFIGURED_BUFFER,
+            "get_toplevel_decoration needs a valid toplevel");
+        return;
+    }
+    _decor_t *d = vt_malloc0(sizeof(*d));
+    if (!d) { wl_client_post_no_memory(cli); return; }
+    d->surf = t->surf;
+    struct wl_resource *r = wl_resource_create(
+        cli, &zxdg_toplevel_decoration_v1_interface, 1, id);
+    if (!r) { vt_free(d); wl_client_post_no_memory(cli); return; }
+    wl_resource_set_implementation(r, &_decor_impl, d, _decor_res_destroy);
+    d->res = r;
+    t->surf->decor_res = r;
+    /* answer with the effective mode right away */
+    zxdg_toplevel_decoration_v1_send_configure(
+        r, t->surf->ssd ? ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE
+                        : ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);
+}
+static void _decor_mgr_destroy(struct wl_client *cli,
+                               struct wl_resource *res) {
+    (void)cli;
+    wl_resource_destroy(res);
+}
+static const struct zxdg_decoration_manager_v1_interface _decor_mgr_impl = {
+    .destroy = _decor_mgr_destroy,
+    .get_toplevel_decoration = _decor_mgr_get_decoration,
+};
+static void _bind_decor_mgr(struct wl_client *cli, void *data,
+                             uint32_t version, uint32_t id) {
+    (void)data; (void)version;
+    struct wl_resource *res = wl_resource_create(
+        cli, &zxdg_decoration_manager_v1_interface, 1, id);
+    if (!res) { wl_client_post_no_memory(cli); return; }
+    wl_resource_set_implementation(res, &_decor_mgr_impl, NULL, NULL);
 }
 
 /* --------------------------------------------------------- wl_output */
@@ -1493,12 +2057,26 @@ static _wl_surf_t *_surface_at(_wl_state_t *st, int x, int y) {
     if (st->panel && vt_wl_panel_contains(st->panel, x, y)) return NULL;
     /* surfaces list is bottom→top: iterate reversed */
     wl_list_for_each_reverse(s, &st->surfaces, link) {
-        if (!s->mapped || s->is_cursor) continue;
+        if (!s->mapped || s->is_cursor || s->minimized) continue;
         if (s->toplevel && s->ws != st->ws_cur) continue;
-        if (x >= s->x && x < s->x + s->w &&
-            y >= s->y && y < s->y + s->h) {
+        int sx = s->x, sy = s->y;
+        if (s->popup && s->popup->parent) {
+            sx = s->popup->parent->x + s->popup->rel_x;
+            sy = s->popup->parent->y + s->popup->rel_y;
+        }
+        if (x >= sx && x < sx + s->w &&
+            y >= sy && y < sy + s->h) {
             found = s;
             break;
+        }
+        /* SSD frame counts as the window for input too */
+        if (s->ssd && s->toplevel) {
+            int fx, fy, fw, fh;
+            _ssd_frame_geom(s, &fx, &fy, &fw, &fh);
+            if (x >= fx && x < fx + fw && y >= fy && y < fy + fh) {
+                found = s;
+                break;
+            }
         }
     }
     return found;
@@ -1515,6 +2093,9 @@ static void _pointer_focus_update(_wl_state_t *st, bool force) {
                 wl_resource_get_client(st->ptr_focus->res)) {
                 wl_pointer_send_leave(pr->res, ++st->serial,
                                       st->ptr_focus->res);
+                if (wl_resource_get_version(pr->res) >=
+                    WL_POINTER_FRAME_SINCE_VERSION)
+                    wl_pointer_send_frame(pr->res);
             }
         }
     }
@@ -1524,9 +2105,17 @@ static void _pointer_focus_update(_wl_state_t *st, bool force) {
         wl_list_for_each(pr, &st->ptr_reses, link) {
             if (wl_resource_get_client(pr->res) ==
                 wl_resource_get_client(s->res)) {
+                int sx = s->x, sy = s->y;
+                if (s->popup && s->popup->parent) {
+                    sx = s->popup->parent->x + s->popup->rel_x;
+                    sy = s->popup->parent->y + s->popup->rel_y;
+                }
                 wl_pointer_send_enter(pr->res, ++st->serial, s->res,
-                                      (wl_fixed_t)(st->cursor_x - s->x) * 256,
-                                      (wl_fixed_t)(st->cursor_y - s->y) * 256);
+                                      (wl_fixed_t)(st->cursor_x - sx) * 256,
+                                      (wl_fixed_t)(st->cursor_y - sy) * 256);
+                if (wl_resource_get_version(pr->res) >=
+                    WL_POINTER_FRAME_SINCE_VERSION)
+                    wl_pointer_send_frame(pr->res);
             }
         }
         /* click-to-focus for the keyboard */
@@ -1576,10 +2165,19 @@ static void _pointer_motion(_wl_state_t *st, double dx, double dy) {
         _ptr_res_t *pr;
         wl_list_for_each(pr, &st->ptr_reses, link) {
             if (wl_resource_get_client(pr->res) ==
-                wl_resource_get_client(s->res))
+                wl_resource_get_client(s->res)) {
+                int sx = s->x, sy = s->y;
+                if (s->popup && s->popup->parent) {
+                    sx = s->popup->parent->x + s->popup->rel_x;
+                    sy = s->popup->parent->y + s->popup->rel_y;
+                }
                 wl_pointer_send_motion(pr->res, 0,
-                    (wl_fixed_t)(st->cursor_x - s->x) * 256,
-                    (wl_fixed_t)(st->cursor_y - s->y) * 256);
+                    (wl_fixed_t)(st->cursor_x - sx) * 256,
+                    (wl_fixed_t)(st->cursor_y - sy) * 256);
+                if (wl_resource_get_version(pr->res) >=
+                    WL_POINTER_FRAME_SINCE_VERSION)
+                    wl_pointer_send_frame(pr->res);
+            }
         }
     }
     /* interactive move/resize */
@@ -1620,15 +2218,112 @@ static void _pointer_button(_wl_state_t *st, uint32_t button,
         st->dirty = true;
         return;
     }
+    /* a grabbed popup is dismissed when the press is NOT inside it or
+     * its parent chain (menus close when you click elsewhere) */
+    if (pressed) {
+        _wl_surf_t *top;
+        wl_list_for_each_reverse(top, &st->surfaces, link) {
+            if (top->popup && top->mapped && top->popup->grabbed) {
+                bool inside =
+                    (top == st->ptr_focus);
+                _wl_surf_t *anc = top->popup->parent;
+                while (!inside && anc) {
+                    if (anc == st->ptr_focus) inside = true;
+                    anc = anc->popup ? anc->popup->parent : NULL;
+                }
+                if (!inside) {
+                    _popup_done(st, top);
+                    return;   /* the dismiss click is consumed */
+                }
+                break;
+            }
+            if (top->mapped && !top->popup) break; /* top-most non-popup */
+        }
+    }
     _wl_surf_t *s = st->ptr_focus;
     if (s && s->res) {
+        /* Super+drag: move/resize ANY window (also CSD-less ones that
+         * have no titlebar to drag) — the daily-driver escape hatch */
+        if (pressed && (st->mods_depressed & 0x40) && s->toplevel) {
+            if (button == 0x110) {
+                st->op_active = true;
+                st->op_resize = false;
+                st->op_surf = s;
+                st->op_grab_x = st->cursor_x - s->x;
+                st->op_grab_y = st->cursor_y - s->y;
+                return;
+            } else if (button == 0x112) {
+                st->op_active = true;
+                st->op_resize = true;
+                st->op_surf = s;
+                st->op_grab_x = st->cursor_x;
+                st->op_grab_y = st->cursor_y;
+                st->op_start_w = s->w;
+                st->op_start_h = s->h;
+                return;
+            }
+        }
+        /* SSD frame interactions (titlebar drag, buttons, edges) */
+        if (s->ssd && s->toplevel && pressed && button == 0x110) {
+            int fx, fy, fw, fh;
+            _ssd_frame_geom(s, &fx, &fy, &fw, &fh);
+            int lx = st->cursor_x - fx, ly = st->cursor_y - fy;
+            if (lx >= 0 && lx < fw && ly >= 0 && ly < fh) {
+                int bx = fw - _WL_SSD_BORDER - _WL_SSD_BTN;
+                if (ly <= _WL_SSD_TITLE + _WL_SSD_BORDER) {
+                    if (lx >= bx) {
+                        /* close */
+                        xdg_toplevel_send_close(s->toplevel->res);
+                        return;
+                    } else if (lx >= bx - (_WL_SSD_BTN + 2)) {
+                        _toplevel_configure(s->toplevel->res, st->out_w,
+                                            st->out_h,
+                                            XDG_TOPLEVEL_STATE_MAXIMIZED);
+                        s->toplevel->maximized = true;
+                        return;
+                    } else if (lx >= bx - 2 * (_WL_SSD_BTN + 2)) {
+                        /* minimize via our own SSD button */
+                        s->toplevel->minimized = true;
+                        s->minimized = true;
+                        st->dirty = true;
+                        return;
+                    }
+                    /* titlebar drag → move */
+                    st->op_active = true;
+                    st->op_resize = false;
+                    st->op_surf = s;
+                    st->op_grab_x = st->cursor_x - s->x;
+                    st->op_grab_y = st->cursor_y - s->y;
+                    return;
+                }
+                /* edges/corners → resize */
+                int m = _WL_SSD_BORDER + 4;
+                bool l = lx < m, r = lx > fw - m,
+                     t = ly < _WL_SSD_TITLE + m,
+                     b = ly > fh - m;
+                if (l || r || t || b) {
+                    st->op_active = true;
+                    st->op_resize = true;
+                    st->op_surf = s;
+                    st->op_grab_x = st->cursor_x;
+                    st->op_grab_y = st->cursor_y;
+                    st->op_start_w = s->w;
+                    st->op_start_h = s->h;
+                    return;
+                }
+            }
+        }
         _ptr_res_t *pr;
         wl_list_for_each(pr, &st->ptr_reses, link) {
             if (wl_resource_get_client(pr->res) ==
-                wl_resource_get_client(s->res))
+                wl_resource_get_client(s->res)) {
                 wl_pointer_send_button(pr->res, ++st->serial, 0, button,
                                        pressed ? WL_POINTER_BUTTON_STATE_PRESSED
                                                : WL_POINTER_BUTTON_STATE_RELEASED);
+                if (wl_resource_get_version(pr->res) >=
+                    WL_POINTER_FRAME_SINCE_VERSION)
+                    wl_pointer_send_frame(pr->res);
+            }
         }
     }
 }
@@ -1681,6 +2376,10 @@ static bool _combo_from_xkb(_wl_state_t *st, xkb_keysym_t sym, char *buf,
 
 static void _kbd_modifiers_send(_wl_state_t *st) {
     if (!st->kbd_focus || !st->kbd_focus->res) return;
+#if defined(VT_HAVE_XKBCOMMON)
+    st->mods_depressed = xkb_state_serialize_mods(st->xkb_st,
+                                                  XKB_STATE_MODS_DEPRESSED);
+#endif
     _kbd_res_t *kr;
     wl_list_for_each(kr, &st->kbd_reses, link) {
         if (wl_resource_get_client(kr->res) ==
@@ -2022,9 +2721,120 @@ static int _drm_fd_cb(int fd, uint32_t mask, void *data) {
 
 /* ------------------------------------------------------------ painting */
 
+/* draw the compositor-side SSD frame (title bar + border + buttons) */
+static void _ssd_frame_geom(const _wl_surf_t *s, int *fx, int *fy,
+                            int *fw, int *fh) {
+    *fx = s->x - _WL_SSD_BORDER;
+    *fy = s->y - (_WL_SSD_TITLE + _WL_SSD_BORDER);
+    *fw = s->w + 2 * _WL_SSD_BORDER;
+    *fh = s->h + _WL_SSD_TITLE + 2 * _WL_SSD_BORDER;
+}
+
+static void _ssd_paint(_wl_state_t *st, _wl_surf_t *s) {
+    if (!s->ssd || !s->toplevel) return;
+    int fx, fy, fw, fh;
+    _ssd_frame_geom(s, &fx, &fy, &fw, &fh);
+    bool active = (st->kbd_focus == s);
+    uint32_t border = active ? 0xff4f9adc : 0xff26282e;
+    uint32_t bar    = active ? 0xff2b2f36 : 0xff1a1c22;
+    uint32_t fg     = active ? 0xffeceef0 : 0xff909399;
+    uint32_t *fb = st->fb;
+    int W = st->out_w, H = st->out_h;
+    /* title bar + borders (opaque writes; the client covers the middle) */
+    for (int y = fy; y < fy + _WL_SSD_TITLE + _WL_SSD_BORDER; y++) {
+        if (y < 0 || y >= H) continue;
+        for (int x = fx; x < fx + fw; x++) {
+            if (x < 0 || x >= W) continue;
+            fb[y * W + x] = bar;
+        }
+    }
+    for (int y = fy + _WL_SSD_TITLE + _WL_SSD_BORDER;
+         y < fy + fh - _WL_SSD_BORDER; y++) {
+        for (int k = 0; k < 2; k++) {
+            int xl = fx + k * (fw - _WL_SSD_BORDER);
+            if (y < 0 || y >= H || xl < 0 || xl >= W) continue;
+            fb[y * W + xl] = border;
+        }
+    }
+    for (int x = fx; x < fx + fw; x++) {
+        int yb = fy + fh - _WL_SSD_BORDER;
+        if (yb < 0 || yb >= H || x < 0 || x >= W) continue;
+        fb[yb * W + x] = border;
+    }
+    /* window buttons: [–][▢][×] at the right end (drawn as shapes) */
+    int bx = fx + fw - _WL_SSD_BORDER - _WL_SSD_BTN;
+    int by = fy + 3;
+    struct { char kind; uint32_t col; } btns[3] = {
+        { 'x', 0xffe05a5a }, { 'm', 0xff4f9adc }, { 'n', 0xff7ac860 },
+    };
+    for (int i = 0; i < 3; i++) {
+        int x0 = bx - i * (_WL_SSD_BTN + 2);
+        int cy = by + (_WL_SSD_TITLE - 12) / 2;
+        for (int yy = by + 2; yy < by + _WL_SSD_TITLE - 4; yy++)
+            for (int xx = x0 + 2; xx < x0 + _WL_SSD_BTN - 2; xx++) {
+                if (xx < 0 || xx >= W || yy < 0 || yy >= H) continue;
+                fb[yy * W + xx] = (bar & 0xffffff00u) | 0x33;
+            }
+        for (int k = 0; k < 6; k++) {
+            switch (btns[i].kind) {
+            case 'x':   /* × glyph */
+                if (k < 6) {
+                    int px = x0 + 8 + k, py = cy + k;
+                    if (px >= 0 && px < W && py >= 0 && py < H)
+                        fb[py * W + px] = btns[i].col;
+                    px = x0 + 13 - k;
+                    if (px >= 0 && px < W && py >= 0 && py < H)
+                        fb[py * W + px] = btns[i].col;
+                }
+                break;
+            case 'm': { /* ▢ glyph */
+                int px = x0 + 7 + k, py = cy;
+                if (px >= 0 && px < W && py >= 0 && py < H)
+                    fb[py * W + px] = btns[i].col;
+                int qx = x0 + 7, qy = cy + k;
+                if (qx >= 0 && qx < W && qy >= 0 && qy < H)
+                    fb[qy * W + qx] = btns[i].col;
+                int rx2 = x0 + 12, ry2 = cy + k;
+                if (rx2 >= 0 && rx2 < W && ry2 >= 0 && ry2 < H)
+                    fb[ry2 * W + rx2] = btns[i].col;
+                int sx = x0 + 7 + k, sy = cy + 5;
+                if (sx >= 0 && sx < W && sy >= 0 && sy < H)
+                    fb[sy * W + sx] = btns[i].col;
+                break;
+            }
+            default: {  /* – glyph */
+                int px = x0 + 7 + k, py = cy + 2;
+                if (px >= 0 && px < W && py >= 0 && py < H)
+                    fb[py * W + px] = btns[i].col;
+                break;
+            }
+            }
+        }
+    }
+    /* title text: reuse the panel's glyph rasterizer through a tiny
+     * local copy (the panel module owns FreeType); we draw with the
+     * built-in 5x7-free path via vt_wl_panel text when available */
+    if (st->panel && s->toplevel->title && *s->toplevel->title) {
+        extern int vt_wl_panel_ssd_title(vt_wl_panel_t *p, uint32_t *fb,
+                                         int fbw, int fbh, int x, int y,
+                                         int max_w, const char *utf8,
+                                         uint32_t argb);
+        vt_wl_panel_ssd_title(st->panel, fb, W, H, fx + 8,
+                              fy + 2, bx - fx - 12,
+                              s->toplevel->title, fg);
+    }
+}
+
 static void _paint_background(_wl_state_t *st) {
-    /* plain desktop background — the real panel is drawn by
-     * vt-wl-panel.c on top of everything (not placeholder blocks) */
+    /* the SAME wallpaper the X11 desktop shows (config [wallpaper]):
+     * rendered once into bg_pix at startup, blitted every frame.
+     * Previously this was a flat hardcoded gray — the user's "blue
+     * background is fucked on Wayland" was exactly this divergence. */
+    if (st->bg_pix) {
+        memcpy(st->fb, st->bg_pix,
+               sizeof(uint32_t) * (size_t)st->out_w * (size_t)st->out_h);
+        return;
+    }
     for (int y = 0; y < st->out_h; y++) {
         uint32_t row = 0xff1a1a1a;
         for (int x = 0; x < st->out_w; x++)
@@ -2039,9 +2849,21 @@ static void _panel_cb_focus(uint64_t id, void *ud) {
     _wl_surf_t *s;
     wl_list_for_each(s, &st->surfaces, link) {
         if (s->toplevel && s->toplevel->id == id) {
+            /* taskbar restore: bring a minimized window back */
+            if (s->minimized) {
+                s->minimized = false;
+                s->toplevel->minimized = false;
+                s->ws = st->ws_cur;
+                vt_logi("wayland: window 0x%llx restored from taskbar",
+                        (unsigned long long)id);
+            }
+            /* raise to the top of the stack */
+            wl_list_remove(&s->link);
+            wl_list_insert(st->surfaces.prev, &s->link);
             st->kbd_focus = s;
             st->focused_toplevel = s->toplevel;
             _pointer_focus_update(st, true);
+            _kbd_enter_focus(st, s);
             _emit_win(st, VT_BACKEND_WL_EVENT_WIN_FOCUS, s->toplevel);
             st->dirty = true;
             return;
@@ -2070,6 +2892,7 @@ static void _panel_cb_ws(int ws, void *ud) {
     st->ws_cur = ws;
     vt_wl_panel_set_workspaces(st->panel, st->ws_count, st->ws_cur);
     _panel_emit_ws(st);
+    _focus_top_on_ws(st);
     st->dirty = true;
     vt_logi("wayland: workspace -> %d", ws + 1);
 }
@@ -2121,16 +2944,25 @@ static void _panel_cb_logout(const char *action, void *ud) {
 }
 
 static void _panel_sync_windows(_wl_state_t *st) {
-    vt_wl_panel_win_t wins[16];
+    vt_wl_panel_win_t wins[32];
     size_t n = 0;
     _wl_surf_t *s;
     wl_list_for_each_reverse(s, &st->surfaces, link) {
         if (!s->mapped || s->is_cursor || !s->toplevel) continue;
-        if (s->ws != st->ws_cur) continue;
+        /* ALL workspaces: the taskbar shows the current one, the pager
+         * miniatures need every workspace's windows with their real
+         * position and size */
         wins[n].id = s->toplevel->id;
         wins[n].title = s->toplevel->title ? s->toplevel->title : "";
+        wins[n].app_id = s->toplevel->app_id ? s->toplevel->app_id : "";
         wins[n].focused = (st->kbd_focus == s);
-        if (++n >= 16) break;
+        wins[n].minimized = s->minimized;
+        wins[n].ws = s->ws;
+        wins[n].x = s->x;
+        wins[n].y = s->y;
+        wins[n].w = s->w;
+        wins[n].h = s->h;
+        if (++n >= 32) break;
     }
     vt_wl_panel_set_windows(st->panel, wins, n);
 }
@@ -2173,14 +3005,59 @@ static void _paint(void) {
     if (!st || !st->dirty) return;
     _paint_background(st);
     /* surfaces bottom→top (client windows; cursor surfaces skipped;
-     * windows on other workspaces are hidden). Subsurfaces paint
-     * directly above their parent, at their relative position. */
+     * windows on other workspaces or minimized are hidden). Subsurfaces
+     * paint directly above their parent, at their relative position.
+     * Popups paint at parent + rel (menus follow their anchor window). */
     _wl_surf_t *s;
     wl_list_for_each(s, &st->surfaces, link) {
         if (!s->mapped || !s->pixels || s->is_cursor) continue;
         if (s->parent) continue;            /* painted with the parent */
+        if (s->minimized) continue;
         if (s->toplevel && s->ws != st->ws_cur) continue;
+        if (s->toplevel) {
+            /* our SSD frame first (client paints inside it) */
+            _ssd_paint(st, s);
+            _wl_surf_t *sub;
+            wl_list_for_each(sub, &s->subs, sub_link) {
+                if (!sub->mapped || !sub->pixels || sub->minimized) continue;
+                int cx2 = s->x + sub->dx, cy2 = s->y + sub->dy;
+                for (int sy = 0; sy < sub->h; sy++) {
+                    int dy = cy2 + sy;
+                    if (dy < 0 || dy >= st->out_h) continue;
+                    for (int sx = 0; sx < sub->w; sx++) {
+                        int dx = cx2 + sx;
+                        if (dx < 0 || dx >= st->out_w) continue;
+                        st->fb[dy * st->out_w + dx] =
+                            sub->pixels[sy * sub->stride + sx];
+                    }
+                }
+            }
+        }
         int x = s->x, y = s->y;
+        if (s->popup) {
+            /* popup: position = parent origin + relative offset */
+            _wl_surf_t *ps = s->popup->parent;
+            if (ps) {
+                x = ps->x + s->popup->rel_x;
+                y = ps->y + s->popup->rel_y;
+            }
+            /* popup children (submenus): paint with this popup */
+            _wl_surf_t *sub;
+            wl_list_for_each(sub, &s->subs, sub_link) {
+                if (!sub->mapped || !sub->pixels) continue;
+                int cx2 = x + sub->dx, cy2 = y + sub->dy;
+                for (int sy = 0; sy < sub->h; sy++) {
+                    int dy = cy2 + sy;
+                    if (dy < 0 || dy >= st->out_h) continue;
+                    for (int sx = 0; sx < sub->w; sx++) {
+                        int dx = cx2 + sx;
+                        if (dx < 0 || dx >= st->out_w) continue;
+                        st->fb[dy * st->out_w + dx] =
+                            sub->pixels[sy * sub->stride + sx];
+                    }
+                }
+            }
+        }
         for (int sy = 0; sy < s->h; sy++) {
             int dy = y + sy;
             if (dy < 0 || dy >= st->out_h) continue;
@@ -2191,23 +3068,12 @@ static void _paint(void) {
                     s->pixels[sy * s->stride + sx];
             }
         }
-        /* children above the parent */
-        _wl_surf_t *sub;
-        wl_list_for_each(sub, &s->subs, sub_link) {
-            if (!sub->mapped || !sub->pixels) continue;
-            int cx2 = x + sub->dx, cy2 = y + sub->dy;
-            for (int sy = 0; sy < sub->h; sy++) {
-                int dy = cy2 + sy;
-                if (dy < 0 || dy >= st->out_h) continue;
-                for (int sx = 0; sx < sub->w; sx++) {
-                    int dx = cx2 + sx;
-                    if (dx < 0 || dx >= st->out_w) continue;
-                    st->fb[dy * st->out_w + dx] =
-                        sub->pixels[sy * sub->stride + sx];
-                }
-            }
-        }
-        /* fire frame callbacks */
+    }
+    /* fire frame callbacks for EVERY surface (also hidden ones):
+     * clients that commit while on another workspace / minimized must
+     * not have their callbacks queue up forever — that stalls redraws
+     * and leaks callback objects. */
+    wl_list_for_each(s, &st->surfaces, link) {
         _cb_node_t *n, *tmp;
         wl_list_for_each_safe(n, tmp, &s->frame_cbs, link) {
             wl_callback_send_done(n->cb, 0);
@@ -2581,6 +3447,14 @@ static int _wl_init(vt_backend_t *self) {
     st->ddm_g = wl_global_create(st->display,
                                  &wl_data_device_manager_interface, 3, NULL,
                                  _bind_ddm);
+    /* xdg-decoration: CSD apps stay undecorated (client mode is the
+     * default); clients that WANT our frame request server mode */
+    st->decor_g = wl_global_create(
+        st->display, &zxdg_decoration_manager_v1_interface, 1, NULL,
+        _bind_decor_mgr);
+    if (!st->decor_g)
+        vt_logw("wayland: xdg-decoration global creation failed "
+                "(clients cannot request server-side decorations)");
     if (!st->subcomp_g || !st->ddm_g)
         vt_logw("wayland: wl_subcompositor/wl_data_device_manager "
                 "global creation failed");
@@ -2665,6 +3539,7 @@ static int _wl_init(vt_backend_t *self) {
     st->ws_count = 4;
     st->ws_cur = 0;
     st->panel = vt_wl_panel_create(st->out_w, 32);
+    vt_wl_panel_set_screen(st->panel, st->out_w, st->out_h);
     vt_wl_panel_set_workspaces(st->panel, st->ws_count, st->ws_cur);
     {
         vt_wl_panel_cbs_t cbs = {
@@ -2678,11 +3553,25 @@ static int _wl_init(vt_backend_t *self) {
 
     /* ---- stage 15/15: desktop (first frame) -------------------------- */
     _stage_begin(14, "first frame");
+    /* the desktop background = the user's [wallpaper] config, exactly
+     * what the X11 desktop shows (same engine, same file) */
+    st->wall = vt_wallpaper_new();
+    vt_wallpaper_config_load(st->wall);
+    st->bg_pix = vt_malloc(sizeof(uint32_t) *
+                           (size_t)st->out_w * (size_t)st->out_h);
+    if (st->bg_pix) {
+        vt_wallpaper_render_argb(st->wall, st->bg_pix, st->out_w, st->out_h);
+        vt_logi("wayland: desktop background from [wallpaper] config "
+                "(mode=%s)",
+                st->wall->kind == VT_WALLPAPER_GRADIENT ? "gradient" :
+                st->wall->kind == VT_WALLPAPER_IMAGE ? "image" :
+                st->wall->kind == VT_WALLPAPER_COLOR ? "color" : "video");
+    }
     _paint();
     _present();
-    _stage_ok(14, "desktop painted %dx%d (%s), cursor software sprite, "
-              "compositor panel (Vantage menu, window list, workspaces, "
-              "clock, session menu)",
+    _stage_ok(14, "desktop painted %dx%d (%s), wallpaper background, "
+              "cursor software sprite, compositor panel (Vantage menu, "
+              "taskbar, pager, clock, session menu)",
               st->out_w, st->out_h,
               st->kms ? vt_kms_out_name(st->kms, 0) : "headless");
     vt_logi("[wayland] desktop: ready");
@@ -2723,6 +3612,8 @@ static void _wl_fini(vt_backend_t *self) {
     }
     if (st->src) wl_event_source_remove(st->src);
     wl_display_destroy(st->display);
+    if (st->wall) vt_wallpaper_free(st->wall);
+    vt_free(st->bg_pix);
     vt_free(st->fb);
     vt_free(st->socket_name);
     vt_free(st);
@@ -2794,6 +3685,52 @@ static int _wl_test_input(vt_backend_t *self, const char *spec) {
     return -1;
 }
 
+/* focus the top-most window on the CURRENT workspace (used after
+ * workspace switches — every WM focuses something on the desktop you
+ * switch to; leaving focus on an invisible window means keystrokes go
+ * nowhere and the pager shows no focused miniature) */
+static void _focus_top_on_ws(_wl_state_t *st) {
+    if (!st) return;
+    _wl_surf_t *s;
+    wl_list_for_each_reverse(s, &st->surfaces, link) {
+        if (!s->mapped || s->is_cursor || s->minimized || !s->toplevel)
+            continue;
+        if (s->ws != st->ws_cur) continue;
+        if (st->kbd_focus != s) {
+            st->kbd_focus = s;
+            st->focused_toplevel = s->toplevel;
+            _kbd_enter_focus(st, s);
+            _emit_win(st, VT_BACKEND_WL_EVENT_WIN_FOCUS, s->toplevel);
+        }
+        return;
+    }
+    /* nothing on this workspace: clear the focus */
+    if (st->kbd_focus && st->kbd_focus->res) {
+        _kbd_res_t *kr;
+        wl_list_for_each(kr, &st->kbd_reses, link) {
+            if (wl_resource_get_client(kr->res) ==
+                wl_resource_get_client(st->kbd_focus->res))
+                wl_keyboard_send_leave(kr->res, ++st->serial,
+                                       st->kbd_focus->res);
+        }
+    }
+    st->kbd_focus = NULL;
+    st->focused_toplevel = NULL;
+}
+
+static int _wl_set_workspace(vt_backend_t *self, int ws) {
+    _wl_state_t *st = (self && self->priv && self->priv == (void *)_wls)
+                      ? _wls : NULL;
+    if (!st || ws < 0 || ws >= st->ws_count || ws == st->ws_cur) return -1;
+    st->ws_cur = ws;
+    vt_wl_panel_set_workspaces(st->panel, st->ws_count, st->ws_cur);
+    _panel_emit_ws(st);
+    _focus_top_on_ws(st);
+    st->dirty = true;
+    vt_logi("wayland: workspace -> %d (remote)", ws + 1);
+    return 0;
+}
+
 static bool _wl_supports_compositing(vt_backend_t *self) { (void)self; return true; }
 static bool _wl_can_swap_buffers(vt_backend_t *self) { (void)self; return true; }
 
@@ -2814,6 +3751,7 @@ vt_backend_t *_vt_backend_wayland_new(void) {
     b->can_swap_buffers = _wl_can_swap_buffers;
     b->close_window = _wl_close_window;
     b->test_input = _wl_test_input;
+    b->set_workspace = _wl_set_workspace;
     b->set_user_data = _wl_set_user_data;
     b->get_user_data = _wl_get_user_data;
     vt_vec_init(&b->outputs, sizeof(vt_output_t), 2);

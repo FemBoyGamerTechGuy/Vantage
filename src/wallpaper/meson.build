@@ -21,6 +21,12 @@ if dep_gdkpixbuf.found()
   wallpaper_cargs += ['-DVT_HAVE_GDKPIXBUF']
 endif
 
+# SVG icon rendering at the exact display size (crisp theme icons)
+if dep_librsvg.found() and dep_cairo.found()
+  wallpaper_deps += [dep_librsvg, dep_cairo]
+  wallpaper_cargs += ['-DVT_HAVE_LIBRSVG', '-DVT_HAVE_CAIRO']
+endif
+
 lib_vantage_wallpaper = static_library('vantage-wallpaper',
   sources : src_wallpaper,
   include_directories : vantage_includes,

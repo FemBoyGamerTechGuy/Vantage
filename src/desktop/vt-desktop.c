@@ -71,36 +71,10 @@ static void _dt_menu_handle(struct vt_desktop *d, XEvent *ev);
 
 /* ------------------------------------------------------------- wallpaper */
 static void _dt_wallpaper_from_config(struct vt_desktop *d) {
+    /* ONE shared [wallpaper] parser (vt-wallpaper.c) for the X11 desktop
+     * and the Wayland background — both sessions show the same wallpaper */
     _dt_priv_t *p = d->priv;
-    vt_config_t *cfg = vt_config_new_defaults();
-    vt_config_load(cfg, vt_config_default_path());
-    const char *mode = vt_config_get(cfg, "wallpaper", "mode", "gradient");
-    vt_wallpaper_t *w = p->wall;
-    if (vt_strcaseeq(mode, "color")) {
-        vt_wallpaper_set_kind(w, VT_WALLPAPER_COLOR);
-    } else if (vt_strcaseeq(mode, "image")) {
-        vt_wallpaper_set_kind(w, VT_WALLPAPER_IMAGE);
-        vt_wallpaper_set_path(w, vt_config_get(cfg, "wallpaper", "path",
-                                               ""));
-    } else if (vt_strcaseeq(mode, "video")) {
-        vt_wallpaper_set_kind(w, VT_WALLPAPER_VIDEO);
-        vt_wallpaper_set_path(w, vt_config_get(cfg, "wallpaper", "path",
-                                               ""));
-        vt_wallpaper_set_loop(w, vt_config_get_bool(cfg, "wallpaper",
-                                                    "loop", true));
-    } else {
-        vt_wallpaper_set_kind(w, VT_WALLPAPER_GRADIENT);
-    }
-    vt_color_t a, b;
-    a.r = 0.07f; a.g = 0.09f; a.b = 0.14f; a.a = 1.0f;
-    b.r = 0.15f; b.g = 0.19f; b.b = 0.31f; b.a = 1.0f;
-    const char *ca = vt_config_get(cfg, "wallpaper", "color_a", NULL);
-    const char *cb = vt_config_get(cfg, "wallpaper", "color_b", NULL);
-    if (ca) sscanf(ca, "%f,%f,%f", &a.r, &a.g, &a.b);
-    if (cb) sscanf(cb, "%f,%f,%f", &b.r, &b.g, &b.b);
-    int dir = (int)vt_config_get_int(cfg, "wallpaper", "gradient_dir", 1);
-    vt_wallpaper_set_color(w, a, b, dir);
-    vt_config_free(cfg);
+    vt_wallpaper_config_load(p->wall);
 }
 
 static bool _dt_fullscreen_covers(_dt_priv_t *p) {

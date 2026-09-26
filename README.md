@@ -41,26 +41,45 @@ New features, minimal overhead.
   fullscreen window covers the desktop, plus PNG/JPEG still wallpapers
   loaded directly through libpng/libjpeg (no gdk-pixbuf).
 - **A real panel**: dock window with struts, XRender/Xft drawing, live
-  tasklist with per-window `_NET_WM_ICON` icons, workspace switcher
-  (rounded, glowing active button that follows the real WM state), a
-  **Programs menu** built from the shared `.desktop` database (search
-  bar, scrolling, icon-theme icons, locale-aware names — Russian and
-  other non-English entries render correctly via per-codepoint font
-  fallback), calendar popup, ALSA volume slider (real mixer values),
-  a functional network indicator, and a username/session menu (Lock,
-  Suspend, Switch User, Log Out, Reboot, Shutdown, Exit) — all on real
-  system mechanisms (logind/elogind, ACPI).
+  tasklist with per-window `_NET_WM_ICON` icons (area-averaged at 20px),
+  a **workspace PAGER** (every cell is a miniature of that desktop with
+  its windows at their true position and size — click to switch, wheel
+  to cycle), a **Programs menu** built from the shared `.desktop`
+  database (search bar, scrolling, **themed start-button icon and 24px
+  menu icons** — SVG themes rasterize at the exact display size,
+  locale-aware names — Russian and other non-English entries render
+  correctly via per-codepoint font fallback), calendar popup, ALSA
+  volume slider (real mixer values), a functional network indicator,
+  and a username/session menu (Lock, Suspend, Switch User, Log Out,
+  Reboot, Shutdown, Exit) — all on real system mechanisms
+  (logind/elogind, ACPI).
 - **A compositor-drawn panel on native Wayland** (no XWayland, no
   placeholder blocks): Programs button with the SAME shared application
-  database and menu features (search, scrolling, icons, categories),
-  xdg window list, workspace buttons, network + volume (ALSA) controls,
-  clock + calendar, and the full session menu — rendered with FreeType
-  text directly into the scanout framebuffer.
-- **Real Wayland clients work**: xdg-shell toplevels and popups,
-  wl_subcompositor subsurfaces and an in-session clipboard
-  (wl_data_device_manager) — applications launched from the menu
-  inherit the compositor's `WAYLAND_DISPLAY` and actually appear;
-  launched children are reaped, never zombified.
+  database and menu features (search, scrolling, themed start icon,
+  24px theme icons, categories), a real taskbar (app icons via `app_id`,
+  adaptive widths, focused/minimized states, click-to-focus,
+  click-again-to-minimize), the workspace PAGER with live miniatures,
+  network + volume (ALSA) controls, clock + calendar, and the full
+  session menu — rendered with FreeType text directly into the scanout
+  framebuffer. The desktop background is the SAME `[wallpaper]` config
+  the X11 desktop renders (gradient/color/image, cover-scaled).
+- **Real Wayland clients work — and stay alive**: xdg-shell toplevels
+  AND popups (real positioner placement, grabs, popup_done dismissal),
+  xdg-decoration (CSD apps are never double-decorated; server-mode
+  windows get a compositor titlebar), wl_subcompositor subsurfaces and
+  an in-session clipboard (wl_data_device_manager). Client buffers are
+  copied at commit and released immediately (double-buffered apps never
+  stall); GTK3/GTK4 applications run against the compositor in CI-grade
+  headless tests. Applications launched from the menu inherit the
+  compositor's `WAYLAND_DISPLAY` and actually appear; launched children
+  are reaped, never zombified.
+- **CSD apps never double-decorated on X11 either**: `_MOTIF_WM_HINTS`
+  is honored (GTK/Chromium/Firefox headerbar windows stay undecorated,
+  re-evaluated live when an app toggles its own decorations).
+- **Daily-driver window management**: Alt+Tab cycling, Super+drag
+  move/resize (Wayland — works even on undecorated windows), minimize
+  from the SSD titlebar or the taskbar, workspaces that follow focus,
+  maximized windows respect the panel workarea.
 - **Logout that always returns you to the TTY**: the panel routes
   session actions through the session manager (SIGTERM + grace, no
   SIGKILL), and the supervisor never restarts a compositor that exited

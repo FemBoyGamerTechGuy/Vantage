@@ -65,7 +65,9 @@
 
 /* ------------------------------------------------------------ geometry */
 #define _BAR_H_DEF   34
-#define _ROW         26
+#define _ROW         30
+#define _PAGER_W     64               /* pager cell width */
+#define _PAGER_H     24               /* pager miniature height */
 
 static inline uint32_t _blend_px(uint32_t dst, uint32_t src) {
     uint32_t a = src >> 24;
@@ -108,22 +110,6 @@ static void _blend_argb(uint32_t *fb, int fbw, int fbh, int x, int y,
                                           px[sy * pw + sx]);
         }
     }
-}
-
-/* nearest-neighbor ARGB rescale */
-static uint32_t *_argb_scale(const uint32_t *src, int sw, int sh,
-                             int dw, int dh) {
-    uint32_t *out = vt_malloc(sizeof(uint32_t) * (size_t)dw * dh);
-    for (int y = 0; y < dh; y++) {
-        int sy = (int)((int64_t)y * sh / dh);
-        if (sy >= sh) sy = sh - 1;
-        for (int x = 0; x < dw; x++) {
-            int sx = (int)((int64_t)x * sw / dw);
-            if (sx >= sw) sx = sw - 1;
-            out[y * dw + x] = src[sy * sw + sx];
-        }
-    }
-    return out;
 }
 
 /* UTF-8 decode helper: returns codepoint, advances *s */
@@ -437,9 +423,11 @@ static void _round_rect(uint32_t *fb, int fbw, int fbh, int x, int y, int w,
 }
 
 /* ------------------------------------------------------------ icons */
+#define _ICON_SZ 24                       /* crisp display size */
+
 typedef struct {
     char *key;                 /* icon name */
-    uint32_t *px;              /* 18x18 ARGB */
+    uint32_t *px;              /* _ICON_SZ x _ICON_SZ ARGB (quality-scaled) */
     bool tried;
 } _icon_t;
 
@@ -448,7 +436,6 @@ static vt_vec_t _icon_cache;
 
 static uint32_t *_icon_get(const char *name) {
     if (!name || !*name) return NULL;
-#if defined(VT_HAVE_GDKPIXBUF) || defined(VT_HAVE_PNG)
     if (!_icons) {
         _icons = vt_icon_theme_load();
         vt_vec_init(&_icon_cache, sizeof(_icon_t), 32);
@@ -458,31 +445,23 @@ static uint32_t *_icon_get(const char *name) {
         if (vt_streq(e->key, name)) return e->px;
     }
     _icon_t e = { .key = vt_strdup(name), .px = NULL, .tried = true };
-    char path[1024];
-    if (vt_icon_theme_lookup(_icons, name, 24, path, sizeof(path)) == 0) {
-        uint32_t *full = NULL;
-        int w = 0, h = 0;
-        if (vt_icon_load_argb(path, &full, &w, &h) == 0 && w > 0 && h > 0) {
-            if (w == 18 && h == 18) e.px = full;
-            else {
-                e.px = _argb_scale(full, w, h, 18, 18);
-                vt_free(full);
-            }
-        }
-    }
+    /* lookup at the DISPLAY size: SVG sources rasterize exactly, PNG
+     * sources are box-filtered (area-averaged) — no more crushed
+     * nearest-neighbour 18px smears */
+    e.px = vt_icon_lookup_argb(_icons, name, _ICON_SZ);
     vt_vec_push(&_icon_cache, &e);
     return e.px;
-#else
-    (void)_icons; (void)_icon_cache;
-    return NULL;
-#endif
 }
 
 /* ------------------------------------------------------------ windows */
 typedef struct {
     uint64_t id;
     char *title;
+    char *app_id;                 /* taskbar icon key */
     bool focused;
+    bool minimized;
+    int ws;
+    int x, y, w, h;               /* pager miniature geometry */
 } _wlwin_t;
 
 /* ------------------------------------------------------------ panel */
@@ -505,6 +484,7 @@ static const char *const _wl_user_actions[_WL_UA_COUNT] = {
 
 struct vt_wl_panel {
     int  w;                /* screen width  */
+    int  screen_w, screen_h; /* full screen size (pager scaling) */
     int  bar_h;            /* bar height    */
     vt_apps_t *apps;       /* shared .desktop database */
     bool apps_loaded;
@@ -528,7 +508,7 @@ struct vt_wl_panel {
     time_t vol_sync;
     int  vol_drag;         /* volume popup dragging */
     bool net_up;
-    char net_name[24];
+    char net_name[48];
     int  net_wifi;         /* -1 wired, 0..100 wireless */
     time_t net_sync;
     vt_wl_panel_cbs_t cb;
@@ -585,14 +565,15 @@ static void _net_sync(vt_wl_panel_t *p) {
     while ((de = readdir(d))) {
         if (de->d_name[0] == '.') continue;
         if (vt_streq(de->d_name, "lo")) continue;
-        char path[256];
+        char path[320];
         size_t len = 0;
-        snprintf(path, sizeof(path), "/sys/class/net/%s/operstate",
+        snprintf(path, sizeof(path), "/sys/class/net/%.240s/operstate",
                  de->d_name);
         char *state = vt_file_read_all(path, &len);
         if (state && vt_strstartswith(state, "up")) {
             p->net_up = true;
-            snprintf(p->net_name, sizeof(p->net_name), "%s", de->d_name);
+            snprintf(p->net_name, sizeof(p->net_name), "%.32s",
+                     de->d_name);
             /* wireless link quality */
             snprintf(path, sizeof(path), "/proc/net/wireless");
             char *w = vt_file_read_all(path, &len);
@@ -628,6 +609,8 @@ static void _net_sync(vt_wl_panel_t *p) {
 vt_wl_panel_t *vt_wl_panel_create(int width, int bar_height) {
     vt_wl_panel_t *p = vt_malloc0(sizeof(*p));
     p->w = width;
+    p->screen_w = width;
+    p->screen_h = 768;
     p->bar_h = bar_height >= 28 ? bar_height : _BAR_H_DEF;
     vt_vec_init(&p->wins, sizeof(_wlwin_t), 8);
     p->ws_count = 4;
@@ -668,6 +651,12 @@ void vt_wl_panel_resize(vt_wl_panel_t *p, int width) {
     if (p) p->w = width;
 }
 
+void vt_wl_panel_set_screen(vt_wl_panel_t *p, int w, int h) {
+    if (!p) return;
+    p->screen_w = w > 0 ? w : 1024;
+    p->screen_h = h > 0 ? h : 768;
+}
+
 int vt_wl_panel_height(const vt_wl_panel_t *p) {
     return p ? p->bar_h : _BAR_H_DEF;
 }
@@ -691,22 +680,29 @@ void vt_wl_panel_set_windows(vt_wl_panel_t *p, const vt_wl_panel_win_t *wins,
     for (size_t i = 0; i < p->wins.size; i++) {
         _wlwin_t *w = vt_vec_at(&p->wins, i);
         vt_free(w->title);
+        vt_free(w->app_id);
     }
     vt_vec_clear(&p->wins);
-    for (size_t i = 0; i < n && i < 16; i++) {
+    for (size_t i = 0; i < n && i < 32; i++) {
         _wlwin_t w = { .id = wins[i].id,
                        .title = vt_strdup(wins[i].title ? wins[i].title : ""),
-                       .focused = wins[i].focused };
+                       .app_id = vt_strdup(wins[i].app_id ? wins[i].app_id
+                                                          : ""),
+                       .focused = wins[i].focused,
+                       .minimized = wins[i].minimized,
+                       .ws = wins[i].ws,
+                       .x = wins[i].x, .y = wins[i].y,
+                       .w = wins[i].w, .h = wins[i].h };
         vt_vec_push(&p->wins, &w);
     }
 }
 
 /* ------------------------------------------------------------- layout */
-/* LEFT:  [ Programs (110) ] [ window buttons … ]
- * RIGHT: [ ws ] [ net ] [ vol ] [ clock ] [ username ] */
+/* LEFT:  [ Programs (132, themed icon) ] [ window buttons … ]
+ * RIGHT: [ pager ] [ net ] [ vol ] [ clock ] [ username ] */
 
 static int _seg_start_x(void)   { return 8; }
-static int _seg_start_w(void)   { return 110; }
+static int _seg_start_w(void)   { return 132; }
 
 static int _rx_user(const vt_wl_panel_t *p) {
     return p->w - _text_width(p->username) - 42;
@@ -723,7 +719,7 @@ static int _rx_clock(const vt_wl_panel_t *p) {
 static int _rx_vol(const vt_wl_panel_t *p)   { return _rx_clock(p) - 8 - _VOL_W; }
 #define _NET_W 64
 static int _rx_net(const vt_wl_panel_t *p)   { return _rx_vol(p) - 8 - _NET_W; }
-static int _rx_ws(const vt_wl_panel_t *p)    { return _rx_net(p) - 8 - p->ws_count * 26; }
+static int _rx_ws(const vt_wl_panel_t *p)    { return _rx_net(p) - 8 - p->ws_count * (_PAGER_W + 4); }
 
 /* ------------------------------------------------------------- apps db */
 static void _apps_load(vt_wl_panel_t *p) {
@@ -953,19 +949,20 @@ static void _paint_apps_menu(vt_wl_panel_t *p, uint32_t *fb, int fbw,
                        w - _MENU_CAT_W - 4, _ROW - 2, _C_BTN_HI);
         uint32_t *icon = _icon_get(a->icon);
         if (icon)
-            _blend_argb(fb, fbw, fbh, x + _MENU_CAT_W + 8, ry + 3,
-                        icon, 18, 18);
+            _blend_argb(fb, fbw, fbh, x + _MENU_CAT_W + 8, ry + (_ROW - _ICON_SZ) / 2,
+                        icon, _ICON_SZ, _ICON_SZ);
         else {
             /* honest fallback: a dim generic app glyph */
-            _round_rect(fb, fbw, fbh, x + _MENU_CAT_W + 8, ry + 3, 18, 18,
+            _round_rect(fb, fbw, fbh, x + _MENU_CAT_W + 8,
+                        ry + (_ROW - _ICON_SZ) / 2, _ICON_SZ, _ICON_SZ,
                         4, _C_BTN_HI);
-            _fill_rect(fb, fbw, fbh, x + _MENU_CAT_W + 14, ry + 9, 6, 2,
-                       _C_DIM);
-            _fill_rect(fb, fbw, fbh, x + _MENU_CAT_W + 14, ry + 13, 6, 2,
-                       _C_DIM);
+            _fill_rect(fb, fbw, fbh, x + _MENU_CAT_W + 8 + _ICON_SZ / 2 - 3,
+                       ry + _ROW / 2 - 5, 6, 2, _C_DIM);
+            _fill_rect(fb, fbw, fbh, x + _MENU_CAT_W + 8 + _ICON_SZ / 2 - 3,
+                       ry + _ROW / 2 - 1, 6, 2, _C_DIM);
         }
-        _text_draw(fb, fbw, fbh, x + _MENU_CAT_W + 34, ry + 6, a->name,
-                   sel ? 0xffffffff : _C_FG);
+        _text_draw(fb, fbw, fbh, x + _MENU_CAT_W + 34 + _ICON_SZ - 24,
+                   ry + 6, a->name, sel ? 0xffffffff : _C_FG);
     }
     if (total == 0)
         _text_draw(fb, fbw, fbh, x + _MENU_CAT_W + 34, pane_y + 10,
@@ -1095,60 +1092,137 @@ void vt_wl_panel_paint(vt_wl_panel_t *p, uint32_t *fb, int fbw, int fbh) {
     _fill_rect(fb, fbw, fbh, 0, 0, fbw, h, 0xff23262b);
     _hline(fb, fbw, fbh, 0, h - 1, fbw, 0xff393e48);
 
-    /* --- Programs button --- */
+    /* --- Programs button (THEMED icon, like an XFCE-style start
+     *     button: start-here from the active icon theme, falling back
+     *     to the drawn grid glyph when the theme has none) --- */
     int sx = _seg_start_x(), sw = _seg_start_w();
-    _round_rect(fb, fbw, fbh, sx, 5, sw, h - 10, 8, _C_ACCENT);
+    _round_rect(fb, fbw, fbh, sx, 4, sw, h - 8, 8, _C_ACCENT);
     uint32_t fg = 0xffffffff;
-    /* grid glyph */
-    for (int gy = 0; gy < 3; gy++)
-        for (int gx = 0; gx < 3; gx++)
-            _fill_rect(fb, fbw, fbh, sx + 12 + gx * 6, 12 + gy * 6, 3, 3,
-                       fg);
+    {
+        const char *env = getenv("VANTAGE_START_ICON");
+        uint32_t *icon = NULL;
+        if (env && *env) icon = _icon_get(env);
+        if (!icon) icon = _icon_get("start-here");
+        if (!icon) icon = _icon_get("vantage-start");
+        if (icon)
+            _blend_argb(fb, fbw, fbh, sx + 8, (h - _ICON_SZ) / 2,
+                        icon, _ICON_SZ, _ICON_SZ);
+        else {
+            /* honest fallback: the drawn grid glyph */
+            for (int gy = 0; gy < 3; gy++)
+                for (int gx = 0; gx < 3; gx++)
+                    _fill_rect(fb, fbw, fbh, sx + 12 + gx * 6, 11 + gy * 6,
+                               3, 3, fg);
+        }
+    }
     _text_draw(fb, fbw, fbh, sx + 40, h / 2 - 7, "Programs", 0xffffffff);
 
-    /* --- task buttons (xdg toplevels) --- */
+    /* --- taskbar window buttons ---
+     * width adapts to how many windows exist and how much space is
+     * left; icons come from the icon theme via app_id; the focused
+     * window is highlighted, minimized ones dimmed, clicking the
+     * focused button minimizes it, clicking others focuses/restores. */
     int tx = sx + sw + 10;
     int tw_end = _rx_ws(p) - 10;
-    for (size_t i = 0; i < p->wins.size; i++) {
-        _wlwin_t *w = vt_vec_at(&p->wins, i);
-        int bw = 140;
-        if (tx + bw > tw_end) break;
-        uint32_t bg = w->focused ? _C_BTN_HI : _C_BTN;
-        _round_rect(fb, fbw, fbh, tx, 4, bw - 6, h - 8, 6, bg);
-        if (w->focused)
-            _hline(fb, fbw, fbh, tx + 4, 4, bw - 14, _C_ACCENT_HI);
-        const char *label = w->title ? w->title : "";
-        int lw = _text_width(label);
-        if (lw > bw - 26) {
-            char trunc[64];
-            snprintf(trunc, sizeof(trunc), "%s", label);
-            while (strlen(trunc) > 4 && _text_width(trunc) > bw - 32)
-                trunc[strlen(trunc) - 1] = 0;
-            _text_draw(fb, fbw, fbh, tx + 8, h / 2 - 7, trunc,
-                       w->focused ? _C_FG : _C_DIM);
-        } else {
-            _text_draw(fb, fbw, fbh, tx + 8, h / 2 - 7, label,
-                       w->focused ? _C_FG : _C_DIM);
+    {
+        size_t n = 0;
+        for (size_t i = 0; i < p->wins.size; i++) {
+            _wlwin_t *w = vt_vec_at(&p->wins, i);
+            if (w->ws == p->ws_cur || w->minimized) n++;
         }
-        tx += bw;
+        int avail = tw_end - tx;
+        int bw = n > 0 ? avail / (int)n - 4 : 140;
+        if (bw > 160) bw = 160;
+        if (bw < 48) bw = 48;
+        for (size_t i = 0; i < p->wins.size; i++) {
+            _wlwin_t *w = vt_vec_at(&p->wins, i);
+            if (w->ws != p->ws_cur && !w->minimized) continue;
+            if (tx + bw > tw_end) break;
+            uint32_t bg = w->focused ? _C_BTN_HI :
+                          w->minimized ? 0xff1d1f24 : _C_BTN;
+            _round_rect(fb, fbw, fbh, tx, 4, bw - 6, h - 8, 6, bg);
+            if (w->focused)
+                _hline(fb, fbw, fbh, tx + 4, 4, bw - 14, _C_ACCENT_HI);
+            int ix = tx + 7;
+            uint32_t *icon = _icon_get(w->app_id);
+            if (icon) {
+                int iy = (h - _ICON_SZ) / 2;
+                _blend_argb(fb, fbw, fbh, ix, iy, icon, _ICON_SZ, _ICON_SZ);
+                ix += _ICON_SZ + 6;
+            }
+            const char *label = w->title ? w->title : "";
+            int lw = _text_width(label);
+            int maxw = tx + bw - 14 - ix;
+            if (lw > maxw) {
+                char trunc[64];
+                snprintf(trunc, sizeof(trunc), "%s", label);
+                while (strlen(trunc) > 4 && _text_width(trunc) > maxw - 6)
+                    trunc[strlen(trunc) - 1] = 0;
+                _text_draw(fb, fbw, fbh, ix, h / 2 - 7, trunc,
+                           w->focused ? _C_FG : _C_DIM);
+            } else {
+                _text_draw(fb, fbw, fbh, ix, h / 2 - 7, label,
+                           w->focused ? _C_FG : _C_DIM);
+            }
+            if (w->minimized)
+                _fill_rect(fb, fbw, fbh, tx + 7, h - 9, _ICON_SZ > 0 ?
+                           (_ICON_SZ > bw - 20 ? bw - 20 : _ICON_SZ) : 16,
+                           2, 0x80909399);
+            tx += bw;
+        }
     }
 
-    /* --- workspace buttons --- */
-    int wx = _rx_ws(p);
-    for (int i = 0; i < p->ws_count; i++) {
-        int x = wx + i * 26;
-        bool active = (i == p->ws_cur);
-        _round_rect(fb, fbw, fbh, x, 5, 22, h - 10, 7,
-                    active ? _C_ACCENT_HI : _C_BTN);
-        if (active) {
-            _hline(fb, fbw, fbh, x + 3, 6, 16, 0xffffffff);
-            _hline(fb, fbw, fbh, x + 3, h - 7, 16, 0xffffffff);
+    /* --- workspace PAGER: each cell is a miniature of that desktop
+     *     showing the actual windows at their real relative position
+     *     and size; the active desktop is highlighted. Minimized
+     *     windows are NOT drawn (the taskbar already represents them).
+     *     Clicking a cell switches; the wheel cycles. --- */
+    {
+        int wx = _rx_ws(p);
+        for (int i = 0; i < p->ws_count; i++) {
+            int x = wx + i * (_PAGER_W + 4);
+            bool active = (i == p->ws_cur);
+            int cy = 5, ch = h - 10;
+            if (ch < _PAGER_H) ch = _PAGER_H;
+            _round_rect(fb, fbw, fbh, x, cy, _PAGER_W, ch, 6,
+                        active ? _C_BTN_HI : _C_BTN);
+            /* desktop miniature area (inset) */
+            int mx = x + 4, my = cy + 4, mw = _PAGER_W - 8, mh = ch - 8;
+            _fill_rect(fb, fbw, fbh, mx, my, mw, mh,
+                       active ? 0xff14161a : 0xff101216);
+            /* window miniatures at real relative geometry */
+            for (size_t k = 0; k < p->wins.size; k++) {
+                _wlwin_t *w = vt_vec_at(&p->wins, k);
+                if (w->ws != i || w->minimized) continue;
+                int wxm = mx + w->x * mw / p->screen_w;
+                int wym = my + w->y * mh / p->screen_h;
+                int wwm = w->w * mw / p->screen_w;
+                int whm = w->h * mh / p->screen_h;
+                if (wwm < 2) wwm = 2;
+                if (whm < 2) whm = 2;
+                if (wxm < mx) wxm = mx;
+                if (wym < my) wym = my;
+                if (wxm + wwm > mx + mw) wwm = mx + mw - wxm;
+                if (wym + whm > my + mh) whm = my + mh - wym;
+                bool foc = w->focused && active;
+                _fill_rect(fb, fbw, fbh, wxm, wym, wwm, whm,
+                           foc ? _C_ACCENT_HI : 0xff4a5160);
+                if (foc)
+                    _hline(fb, fbw, fbh, wxm, wym, wwm, 0xffffffff);
+            }
+            /* active cell ring + number */
+            if (active) {
+                _hline(fb, fbw, fbh, x + 3, cy + 1, _PAGER_W - 6, 0xffffffff);
+                _hline(fb, fbw, fbh, x + 3, cy + ch - 2, _PAGER_W - 6,
+                       0xffffffff);
+            }
+            char n[12];
+            snprintf(n, sizeof(n), "%d", i + 1);
+            int nw = _text_width(n);
+            _text_draw(fb, fbw, fbh, x + (_PAGER_W - nw) / 2,
+                       cy + ch / 2 - 7, n,
+                       active ? 0xffffffff : _C_DIM);
         }
-        char n[12];
-        snprintf(n, sizeof(n), "%d", i + 1);
-        int nw = _text_width(n);
-        _text_draw(fb, fbw, fbh, x + (22 - nw) / 2, h / 2 - 7, n,
-                   active ? 0xffffffff : _C_DIM);
     }
 
     /* --- network indicator --- */
@@ -1159,7 +1233,7 @@ void vt_wl_panel_paint(vt_wl_panel_t *p, uint32_t *fb, int fbw, int fbh) {
         if (!p->net_up) snprintf(buf, sizeof(buf), "net off");
         else if (p->net_wifi >= 0)
             snprintf(buf, sizeof(buf), "wifi %d%%", p->net_wifi);
-        else snprintf(buf, sizeof(buf), "net %s", p->net_name);
+        else snprintf(buf, sizeof(buf), "net %.26s", p->net_name);
         uint32_t c = p->net_up ? _C_FG : _C_DIM;
         int bw2 = _text_width(buf);
         _text_draw(fb, fbw, fbh, nx + (_NET_W - bw2) / 2, h / 2 - 7, buf, c);
@@ -1302,28 +1376,44 @@ bool vt_wl_panel_pointer(vt_wl_panel_t *p, int x, int y, int kind,
         int nx = _rx_net(p);
         if (x >= nx && x < nx + _NET_W) return true;  /* indicator only */
         int wx = _rx_ws(p);
-        if (x >= wx && x < wx + p->ws_count * 26) {
-            int idx = (x - wx) / 26;
+        if (x >= wx && x < wx + p->ws_count * (_PAGER_W + 4)) {
+            int idx = (x - wx) / (_PAGER_W + 4);
             if (kind == 1 && idx >= 0 && idx < p->ws_count) {
                 p->ws_cur = idx;
                 if (p->cb.switch_ws) p->cb.switch_ws(idx, p->cb_ud);
             }
             return true;
         }
+        /* taskbar window buttons: same adaptive widths the painter
+         * uses — geometry comes from ONE helper on both sides */
         int tx = sx + sw + 10;
-        for (size_t i = 0; i < p->wins.size; i++) {
-            _wlwin_t *w = vt_vec_at(&p->wins, i);
-            if (x >= tx && x < tx + 134) {
-                if (kind == 1 && button == 1) {
-                    if (p->cb.focus_window)
-                        p->cb.focus_window(w->id, p->cb_ud);
-                } else if (kind == 1 && button == 3) {
-                    if (p->cb.close_window)
-                        p->cb.close_window(w->id, p->cb_ud);
-                }
-                return true;
+        int tw_end = _rx_ws(p) - 10;
+        {
+            size_t n = 0;
+            for (size_t i = 0; i < p->wins.size; i++) {
+                _wlwin_t *w = vt_vec_at(&p->wins, i);
+                if (w->ws == p->ws_cur || w->minimized) n++;
             }
-            tx += 140;
+            int avail = tw_end - tx;
+            int bw = n > 0 ? avail / (int)n - 4 : 140;
+            if (bw > 160) bw = 160;
+            if (bw < 48) bw = 48;
+            for (size_t i = 0; i < p->wins.size; i++) {
+                _wlwin_t *w = vt_vec_at(&p->wins, i);
+                if (w->ws != p->ws_cur && !w->minimized) continue;
+                if (x >= tx && x < tx + bw - 6) {
+                    if (kind == 1 && button == 1) {
+                        if (p->cb.focus_window)
+                            p->cb.focus_window(w->id, p->cb_ud);
+                    } else if (kind == 1 && button == 3) {
+                        if (p->cb.close_window)
+                            p->cb.close_window(w->id, p->cb_ud);
+                    }
+                    return true;
+                }
+                tx += bw;
+                if (tx >= tw_end) break;
+            }
         }
         return true;    /* empty bar space: swallow */
     }
@@ -1462,6 +1552,18 @@ bool vt_wl_panel_axis(vt_wl_panel_t *p, int x, int y, int dir) {
             _vol_set(p, p->vol + (dir > 0 ? -5 : 5));
             return true;
         }
+        /* wheel over the PAGER cycles workspaces */
+        int wx = _rx_ws(p);
+        if (x >= wx && x < wx + p->ws_count * (_PAGER_W + 4)) {
+            int next = p->ws_cur + (dir > 0 ? 1 : -1);
+            if (next < 0) next = p->ws_count - 1;
+            if (next >= p->ws_count) next = 0;
+            if (next != p->ws_cur) {
+                p->ws_cur = next;
+                if (p->cb.switch_ws) p->cb.switch_ws(next, p->cb_ud);
+            }
+            return true;
+        }
         return false;
     }
     if (p->menu == _WL_MENU_APPS && vt_wl_panel_contains(p, x, y) &&
@@ -1482,6 +1584,22 @@ bool vt_wl_panel_axis(vt_wl_panel_t *p, int x, int y, int dir) {
         return true;
     }
     return false;
+}
+
+/* SSD title text helper used by the compositor backend
+ * (vt-backend-wayland.c) — draws with the panel's glyph rasterizer. */
+int vt_wl_panel_ssd_title(vt_wl_panel_t *p, uint32_t *fb, int fbw, int fbh,
+                          int x, int y, int max_w, const char *utf8,
+                          uint32_t argb) {
+    if (!p || !fb || !utf8) return 0;
+    char shown[128];
+    snprintf(shown, sizeof(shown), "%s", utf8);
+    int w = _text_width(shown);
+    while (strlen(shown) > 4 && (w > max_w)) {
+        shown[strlen(shown) - 1] = 0;
+        w = _text_width(shown);
+    }
+    return _text_draw(fb, fbw, fbh, x, y, shown, argb);
 }
 
 bool vt_wl_panel_key(vt_wl_panel_t *p, const char *combo, uint32_t cp) {

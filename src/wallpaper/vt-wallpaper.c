@@ -15,6 +15,8 @@
 
 #define VT_LOG_DOMAIN "wallpaper"
 #include <vantage/vt-wallpaper.h>
+#include <vantage/vt-config.h>
+#include <vantage/vt-icons.h>
 
 #if defined(VT_HAVE_FFMPEG)
 #include <libavformat/avformat.h>
@@ -148,9 +150,148 @@ int vt_wallpaper_load(vt_wallpaper_t *w, const char *spec) {
 }
 
 int vt_wallpaper_load_from_config(vt_wallpaper_t *w) {
-    (void)w;
-    /* TODO: load from vt-config.c, key=wallpaper */
+    return vt_wallpaper_config_load(w);
+}
+
+int vt_wallpaper_config_load(vt_wallpaper_t *w) {
+    if (!w) return VT_ERR_INVAL;
+    vt_config_t *cfg = vt_config_new_defaults();
+    if (!cfg) return VT_ERR_NOMEM;
+    vt_config_load(cfg, vt_config_default_path());
+    const char *mode = vt_config_get(cfg, "wallpaper", "mode", "gradient");
+    if (vt_strcaseeq(mode, "color")) {
+        w->kind = VT_WALLPAPER_COLOR;
+    } else if (vt_strcaseeq(mode, "image")) {
+        w->kind = VT_WALLPAPER_IMAGE;
+        vt_wallpaper_set_path(w, vt_config_get(cfg, "wallpaper", "path",
+                                               ""));
+    } else if (vt_strcaseeq(mode, "video")) {
+        w->kind = VT_WALLPAPER_VIDEO;
+        vt_wallpaper_set_path(w, vt_config_get(cfg, "wallpaper", "path",
+                                               ""));
+        w->loop = vt_config_get_bool(cfg, "wallpaper", "loop", true);
+    } else {
+        w->kind = VT_WALLPAPER_GRADIENT;
+    }
+    vt_color_t a, b;
+    a.r = 0.07f; a.g = 0.09f; a.b = 0.14f; a.a = 1.0f;
+    b.r = 0.15f; b.g = 0.19f; b.b = 0.31f; b.a = 1.0f;
+    const char *ca = vt_config_get(cfg, "wallpaper", "color_a", NULL);
+    const char *cb = vt_config_get(cfg, "wallpaper", "color_b", NULL);
+    if (ca) sscanf(ca, "%f,%f,%f", &a.r, &a.g, &a.b);
+    if (cb) sscanf(cb, "%f,%f,%f", &b.r, &b.g, &b.b);
+    w->gradient_dir = (int)vt_config_get_int(cfg, "wallpaper",
+                                              "gradient_dir", 1);
+    vt_wallpaper_set_color(w, a, b, w->gradient_dir);
+    vt_config_free(cfg);
     return VT_OK;
+}
+
+void vt_wallpaper_render_argb(vt_wallpaper_t *w, uint32_t *pix,
+                               int pw, int ph) {
+    if (!w || !pix || pw <= 0 || ph <= 0) return;
+    switch (w->kind) {
+    case VT_WALLPAPER_COLOR:
+    case VT_WALLPAPER_VIDEO: {
+        /* video needs the renderer stepping path; the CPU background
+         * honestly falls back to the base color */
+        if (w->kind == VT_WALLPAPER_VIDEO)
+            vt_logw("wallpaper: video wallpaper renders on the X11 "
+                    "renderer path — the Wayland background uses the "
+                    "base color");
+        uint32_t c = 0xff000000u |
+                     ((uint32_t)(int)(w->color_a.r * 255.0f + 0.5f) << 16) |
+                     ((uint32_t)(int)(w->color_a.g * 255.0f + 0.5f) << 8) |
+                     (uint32_t)(int)(w->color_a.b * 255.0f + 0.5f);
+        for (int i = 0; i < pw * ph; i++) pix[i] = c;
+        break;
+    }
+    case VT_WALLPAPER_GRADIENT: {
+        /* per-pixel interpolation: smooth, no 32-stripe banding.
+         * dir: 0=horizontal, 1=vertical, 2=diagonal, 3=reverse diagonal */
+        int ra = (int)(w->color_a.r * 255.0f + 0.5f);
+        int ga = (int)(w->color_a.g * 255.0f + 0.5f);
+        int ba = (int)(w->color_a.b * 255.0f + 0.5f);
+        int rb = (int)(w->color_b.r * 255.0f + 0.5f);
+        int gb = (int)(w->color_b.g * 255.0f + 0.5f);
+        int bb = (int)(w->color_b.b * 255.0f + 0.5f);
+        for (int y = 0; y < ph; y++) {
+            double ty = (double)y / (ph > 1 ? ph - 1 : 1);
+            for (int x = 0; x < pw; x++) {
+                double tx = (double)x / (pw > 1 ? pw - 1 : 1);
+                double t;
+                switch (w->gradient_dir) {
+                case 0: t = tx; break;
+                case 2: t = (tx + ty) * 0.5; break;
+                case 3: t = 1.0 - (tx + ty) * 0.5; break;
+                default: t = ty; break;
+                }
+                if (t < 0) t = 0;
+                if (t > 1) t = 1;
+                pix[y * pw + x] = 0xff000000u |
+                    (uint32_t)(ra + (int)((rb - ra) * t)) << 16 |
+                    (uint32_t)(ga + (int)((gb - ga) * t)) << 8 |
+                    (uint32_t)(ba + (int)((bb - ba) * t));
+            }
+        }
+        break;
+    }
+    case VT_WALLPAPER_IMAGE: {
+        if (!w->path || !*w->path) {
+            uint32_t c = 0xff000000u |
+                         ((uint32_t)(int)(w->color_a.r * 255.0f + 0.5f) << 16) |
+                         ((uint32_t)(int)(w->color_a.g * 255.0f + 0.5f) << 8) |
+                         (uint32_t)(int)(w->color_a.b * 255.0f + 0.5f);
+            for (int i = 0; i < pw * ph; i++) pix[i] = c;
+            break;
+        }
+        int iw = 0, ih = 0;
+        uint32_t *ip = NULL;
+        if (vt_icon_load_argb_sized(w->path, 0, &ip, &iw, &ih) != 0 || !ip) {
+            vt_logw("wallpaper: cannot decode %s — flat color background",
+                    w->path);
+            uint32_t c = 0xff000000u |
+                         ((uint32_t)(int)(w->color_a.r * 255.0f + 0.5f) << 16) |
+                         ((uint32_t)(int)(w->color_a.g * 255.0f + 0.5f) << 8) |
+                         (uint32_t)(int)(w->color_a.b * 255.0f + 0.5f);
+            for (int i = 0; i < pw * ph; i++) pix[i] = c;
+            break;
+        }
+        /* cover: scale so both axes are covered, center-crop */
+        double sc = (double)pw / iw > (double)ph / ih
+                  ? (double)pw / iw : (double)ph / ih;
+        int cw = (int)((double)iw * sc + 0.5);
+        int ch = (int)((double)ih * sc + 0.5);
+        if (cw < pw) cw = pw;
+        if (ch < ph) ch = ph;
+        uint32_t *scaled = vt_icon_scale_argb(ip, iw, ih, cw, ch);
+        vt_free(ip);
+        if (!scaled) {
+            uint32_t c = 0xff000000u |
+                         ((uint32_t)(int)(w->color_a.r * 255.0f + 0.5f) << 16) |
+                         ((uint32_t)(int)(w->color_a.g * 255.0f + 0.5f) << 8) |
+                         (uint32_t)(int)(w->color_a.b * 255.0f + 0.5f);
+            for (int i = 0; i < pw * ph; i++) pix[i] = c;
+            break;
+        }
+        int ox = (cw - pw) / 2, oy = (ch - ph) / 2;
+        for (int y = 0; y < ph; y++)
+            memcpy(pix + (size_t)y * pw, scaled + (size_t)(y + oy) * cw + ox,
+                   sizeof(uint32_t) * (size_t)pw);
+        vt_free(scaled);
+        vt_logi("wallpaper: background %s %dx%d → cover %dx%d",
+                w->path, iw, ih, pw, ph);
+        break;
+    }
+    default: {
+        uint32_t c = 0xff000000u |
+                     ((uint32_t)(int)(w->color_a.r * 255.0f + 0.5f) << 16) |
+                     ((uint32_t)(int)(w->color_a.g * 255.0f + 0.5f) << 8) |
+                     (uint32_t)(int)(w->color_a.b * 255.0f + 0.5f);
+        for (int i = 0; i < pw * ph; i++) pix[i] = c;
+        break;
+    }
+    }
 }
 
 int vt_wallpaper_step(vt_wallpaper_t *w, vt_renderer_t *r, uint32_t output_w, uint32_t output_h) {

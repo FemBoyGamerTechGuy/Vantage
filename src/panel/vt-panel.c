@@ -689,21 +689,26 @@ void vt_panel_stop(vt_panel_t *p) {
     vt_pctx_t *ctx = &pv->ctx;
     for (size_t i = 0; i < pv->slots.size; i++) {
         _applet_t *a = vt_vec_at(&pv->slots, i);
-        if (a->impl && a->impl->fini)
+        if (a->impl && a->impl->fini && a->state)
             a->impl->fini(&(vt_applet_env_t){ .panel = p, .ctx = ctx,
                                               .area = a->area,
                                               .state = a->state });
+        /* the applet OWNED that state and freed it — NULL it so a
+         * second finalize (vt_panel_free also stops) is a no-op.
+         * Double-fini read freed memory and crashed the panel at
+         * shutdown, taking whole sessions down with it. */
+        a->state = NULL;
     }
-    if (pv->ipc) vt_ipc_free(pv->ipc);
-    if (ctx->xft) XftDrawDestroy(ctx->xft);
-    if (ctx->font) XftFontClose(ctx->dpy, ctx->font);
-    if (ctx->font_bold) XftFontClose(ctx->dpy, ctx->font_bold);
-    if (ctx->win_pic) XRenderFreePicture(ctx->dpy, ctx->win_pic);
-    if (ctx->back_pic) XRenderFreePicture(ctx->dpy, ctx->back_pic);
-    if (ctx->back) XFreePixmap(ctx->dpy, ctx->back);
-    if (ctx->gc) XFreeGC(ctx->dpy, ctx->gc);
-    if (ctx->win) XDestroyWindow(ctx->dpy, ctx->win);
-    if (ctx->dpy) XCloseDisplay(ctx->dpy);
+    if (pv->ipc) { vt_ipc_free(pv->ipc); pv->ipc = NULL; }
+    if (ctx->xft) { XftDrawDestroy(ctx->xft); ctx->xft = NULL; }
+    if (ctx->font) { XftFontClose(ctx->dpy, ctx->font); ctx->font = NULL; }
+    if (ctx->font_bold) { XftFontClose(ctx->dpy, ctx->font_bold); ctx->font_bold = NULL; }
+    if (ctx->win_pic) { XRenderFreePicture(ctx->dpy, ctx->win_pic); ctx->win_pic = 0; }
+    if (ctx->back_pic) { XRenderFreePicture(ctx->dpy, ctx->back_pic); ctx->back_pic = 0; }
+    if (ctx->back) { XFreePixmap(ctx->dpy, ctx->back); ctx->back = None; }
+    if (ctx->gc) { XFreeGC(ctx->dpy, ctx->gc); ctx->gc = NULL; }
+    if (ctx->win) { XDestroyWindow(ctx->dpy, ctx->win); ctx->win = None; }
+    if (ctx->dpy) { XCloseDisplay(ctx->dpy); ctx->dpy = NULL; }
     p->running = false;
 }
 

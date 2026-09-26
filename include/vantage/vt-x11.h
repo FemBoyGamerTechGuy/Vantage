@@ -102,6 +102,8 @@ typedef struct {
     Atom string;
     Atom pixmap_atom;
     Atom wm_class_atom;
+    Atom motif_wm_hints;              /* _MOTIF_WM_HINTS (CSD apps) */
+    Atom gtk_hide_titlebar;           /* _GTK_HIDE_TITLEBAR_WHEN_MAXIMIZED */
 } vt_x11_atoms_t;
 
 const vt_x11_atoms_t *vt_x11_atoms(void);

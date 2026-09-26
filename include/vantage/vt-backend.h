@@ -112,6 +112,10 @@ typedef struct vt_backend {
      *       "release b=<1..3>" | "axis d=<-n|+n>".
      * Returns 0 when the event was delivered. */
     int      (*test_input)(struct vt_backend *self, const char *spec);
+    /* Optional: switch the backend's own workspace (the Wayland
+     * compositor paints per-workspace; without this the WM model and
+     * the visible desktop could disagree). */
+    int      (*set_workspace)(struct vt_backend *self, int ws);
 } vt_backend_t;
 
 /* Native event sink: receives backend-native events (XEvent* on X11,

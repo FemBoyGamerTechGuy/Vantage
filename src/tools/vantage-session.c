@@ -118,7 +118,15 @@ static int _preflight_backend(vt_backend_kind_t kind, const char **server_out) {
             if (probe) vt_backend_free(probe);
             return -1;
         }
-        if (server_out) *server_out = vt_backend_server_implementation(probe);
+        if (server_out) {
+            /* COPY: the probe backend (and its heap strings) is freed
+             * below — the old code returned a pointer into freed
+             * memory (heap-use-after-free, caught by ASan). */
+            static char srv_buf[64];
+            snprintf(srv_buf, sizeof(srv_buf), "%s",
+                     vt_backend_server_implementation(probe));
+            *server_out = srv_buf;
+        }
         vt_backend_free(probe);
         return 0;
     }

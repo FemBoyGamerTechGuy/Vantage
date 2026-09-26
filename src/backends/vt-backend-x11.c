@@ -133,6 +133,8 @@ const vt_x11_atoms_t *vt_x11_atoms(void) {
     _atoms.string                 = _a("STRING");
     _atoms.pixmap_atom            = _a("PIXMAP");
     _atoms.wm_class_atom          = _a("WM_CLASS");
+    _atoms.motif_wm_hints         = _a("_MOTIF_WM_HINTS");
+    _atoms.gtk_hide_titlebar      = _a("_GTK_HIDE_TITLEBAR_WHEN_MAXIMIZED");
     _atoms_done = true;
     return &_atoms;
 }

@@ -17,6 +17,7 @@
 #include "vt-panel-internal.h"
 #include <vantage/vt-config.h>
 #include <vantage/vt-integrations.h>
+#include <vantage/vt-icons.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -38,24 +39,27 @@ typedef struct {
     int ws;
     bool focused, minimized, maximized, fullscreen, urgent;
     char cls[32];
-    uint32_t *icon;            /* 16x16 ARGB from _NET_WM_ICON */
+    int x, y, w, h;            /* real geometry (pager miniatures) */
+    uint32_t *icon;            /* 20x20 ARGB from _NET_WM_ICON */
 } _twin_t;
 
 typedef struct {
     vt_vec_t wins;
     int cur_ws;
     int ws_count;
-    vt_vec_t icons;        /* _iconent_t: xid → 16x16 ARGB */
+    vt_vec_t icons;        /* _iconent_t: xid → 20x20 ARGB */
 } _tasklist_t;
 
 typedef struct {
     uint32_t xid;
-    uint32_t *px;          /* 16x16 ARGB, NULL when none */
+    uint32_t *px;          /* 20x20 ARGB, NULL when none */
 } _iconent_t;
+
+#define _TASK_ICON_SZ 20
 
 /* Read _NET_WM_ICON (CARDINAL[]: w,h,ARGB… repeated) and return a
  * scaled 16x16 ARGB icon, or NULL. Uses the panel's own connection. */
-static uint32_t *_net_wm_icon_16(Display *dpy, Window win) {
+static uint32_t *_net_wm_icon_scaled(Display *dpy, Window win) {
     Atom prop = XInternAtom(dpy, "_NET_WM_ICON", False);
     Atom actual;
     int fmt;
@@ -81,14 +85,9 @@ static uint32_t *_net_wm_icon_16(Display *dpy, Window win) {
         uint32_t *src = vt_malloc(sizeof(uint32_t) * (size_t)w * h);
         for (int i = 0; i < w * h; i++)
             src[i] = (uint32_t)card[best + 2 + i];
-        out = vt_malloc(sizeof(uint32_t) * 16 * 16);
-        for (int y = 0; y < 16; y++) {
-            int sy = y * h / 16;
-            for (int x = 0; x < 16; x++) {
-                int sx = x * w / 16;
-                out[y * 16 + x] = src[sy * w + sx];
-            }
-        }
+        /* area-averaged downscale (shared resampler): the old
+         * nearest-neighbour crush made taskbar icons look low-res */
+        out = vt_icon_scale_argb(src, w, h, _TASK_ICON_SZ, _TASK_ICON_SZ);
         vt_free(src);
     }
     XFree(data);
@@ -101,18 +100,19 @@ static uint32_t *_task_icon(_tasklist_t *t, Display *dpy, uint32_t xid) {
         if (e->xid == xid) return e->px;
     }
     _iconent_t e = { .xid = xid, .px = NULL };
-    e.px = _net_wm_icon_16(dpy, (Window)xid);
+    e.px = _net_wm_icon_scaled(dpy, (Window)xid);
     vt_vec_push(&t->icons, &e);
     return e.px;
 }
 
 static void _task_parse_line(const char *line, _twin_t *w) {
-    /* format: id\ttitle\tws\tflags\tclass\tappid */
+    /* format: id\ttitle\tws\tflags\tclass\tappid[\tx\ty\tw\th]
+     * (geometry columns are optional — older WM builds omit them) */
     char *copy = vt_strdup(line);
-    char *fields[6] = {0};
+    char *fields[10] = {0};
     int nf = 0;
     char *save = NULL;
-    for (char *tok = strtok_r(copy, "\t", &save); tok && nf < 6;
+    for (char *tok = strtok_r(copy, "\t", &save); tok && nf < 10;
          tok = strtok_r(NULL, "\t", &save))
         fields[nf++] = tok;
     if (nf >= 4) {
@@ -127,6 +127,10 @@ static void _task_parse_line(const char *line, _twin_t *w) {
         w->fullscreen = strchr(fl, 'S') != NULL;
         w->urgent = strchr(fl, 'U') != NULL;
         snprintf(w->cls, sizeof(w->cls), "%s", fields[4] ? fields[4] : "");
+        w->x = nf > 6 ? atoi(fields[6]) : 0;
+        w->y = nf > 7 ? atoi(fields[7]) : 0;
+        w->w = nf > 8 ? atoi(fields[8]) : 0;
+        w->h = nf > 9 ? atoi(fields[9]) : 0;
     }
     vt_free(copy);
 }
@@ -214,10 +218,14 @@ static void _tasklist_render(vt_applet_env_t *env) {
         int tx_off = 10;
         uint32_t *icon = _task_icon(t, ctx->dpy, w->id);
         if (icon) {
-            int iy = env->area.y + (h - 16) / 2;
-            vt_pctx_draw_argb(ctx, x + 8, iy, 16, 16, icon, 16, 16);
-            tx_off = 30;
+            int iy = env->area.y + (h - _TASK_ICON_SZ) / 2;
+            vt_pctx_draw_argb(ctx, x + 8, iy, _TASK_ICON_SZ, _TASK_ICON_SZ,
+                              icon, _TASK_ICON_SZ, _TASK_ICON_SZ);
+            tx_off = 8 + _TASK_ICON_SZ + 6;
         }
+        if (w->minimized)
+            vt_pctx_rect(ctx, x + 8, env->area.y + h - 7, _TASK_ICON_SZ, 2,
+                         (vt_pcol_t){ 0x90, 0x93, 0x99, 0xb0 });
         char *label = vt_strdup(w->title ? w->title : "");
         int tw = vt_pctx_text_width(ctx, label, false);
         if (tw > bw - 16 - tx_off) {
@@ -282,72 +290,144 @@ const vt_applet_impl_t _applet_tasklist = {
 };
 
 /* ---------------------------------------------------------- workspaces */
+/* A real PAGER, not numbered buttons: every cell is a miniature of that
+ * desktop showing its windows at their true relative position and size
+ * (XFCE-style). Minimized windows are not drawn — the taskbar already
+ * represents them (user preference). Click a cell to switch; the wheel
+ * cycles desktops. */
 typedef struct {
     int count;
     int current;
+    vt_vec_t wins;               /* _twin_t snapshot (geometry included) */
 } _wsp_t;
 
 static void _wsp_refresh(vt_applet_env_t *env) {
     _wsp_t *w = env->state;
     char *resp = vt_panel_query_workspaces(env->panel);
-    if (!resp) return;
-    char *p = strstr(resp, "count=");
-    if (p) w->count = atoi(p + 6);
-    p = strstr(resp, "current=");
-    if (p) w->current = atoi(p + 8);
-    vt_free(resp);
+    if (resp) {
+        char *p = strstr(resp, "count=");
+        if (p) w->count = atoi(p + 6);
+        p = strstr(resp, "current=");
+        if (p) w->current = atoi(p + 8);
+        vt_free(resp);
+    }
+    /* window snapshot with geometry (shared parser + query with the
+     * panel's own line format) */
+    for (size_t i = 0; i < w->wins.size; i++) {
+        _twin_t *t = vt_vec_at(&w->wins, i);
+        vt_free(t->title);
+    }
+    vt_vec_clear(&w->wins);
+    char *wl = vt_panel_query_windows(env->panel);
+    if (wl) {
+        char *save = NULL;
+        for (char *line = strtok_r(wl, "\n", &save); line;
+             line = strtok_r(NULL, "\n", &save)) {
+            _twin_t t = {0};
+            _task_parse_line(line, &t);
+            if (t.id) vt_vec_push(&w->wins, &t);
+        }
+        vt_free(wl);
+    }
 }
 
 static void _wsp_init(vt_applet_env_t *env) {
     _wsp_t *w = vt_malloc0(sizeof(*w));
     w->count = 4;
     w->current = 0;
+    vt_vec_init(&w->wins, sizeof(_twin_t), 8);
     env->state = w;
     _wsp_refresh(env);
 }
-static void _wsp_fini(vt_applet_env_t *env) { vt_free(env->state); }
+static void _wsp_fini(vt_applet_env_t *env) {
+    _wsp_t *w = env->state;
+    if (!w) return;
+    for (size_t i = 0; i < w->wins.size; i++) {
+        _twin_t *t = vt_vec_at(&w->wins, i);
+        vt_free(t->title);
+    }
+    vt_vec_fini(&w->wins);
+    vt_free(w);
+}
 
-#define WSP_BTN 22
+#define WSP_CELL 64
+#define WSP_GAP  4
 static int _wsp_measure(vt_applet_env_t *env) {
     _wsp_t *w = env->state;
-    return w->count * (WSP_BTN + 4);
+    return w->count * (WSP_CELL + WSP_GAP);
 }
 static void _wsp_render(vt_applet_env_t *env) {
     _wsp_t *w = env->state;
     vt_pctx_t *ctx = env->ctx;
+    /* the miniature scale reference: the real screen size */
+    int sw = DisplayWidth(ctx->dpy, DefaultScreen(ctx->dpy));
+    int sh = DisplayHeight(ctx->dpy, DefaultScreen(ctx->dpy));
     for (int i = 0; i < w->count; i++) {
-        int x = env->area.x + i * (WSP_BTN + 4);
+        int x = env->area.x + i * (WSP_CELL + WSP_GAP);
         int y = env->area.y, h = env->area.h;
         bool active = (i == w->current);
-        /* glow: brighter fill + accent ring on the active workspace */
-        vt_pcol_t fill = active ? (vt_pcol_t){ 0x6f, 0xaa, 0xe8, 0xff }
+        vt_pcol_t fill = active ? (vt_pcol_t){ 0x39, 0x3e, 0x48, 0xff }
                                 : (vt_pcol_t){ 0x26, 0x28, 0x2e, 0xff };
-        vt_pctx_rounded_rect(ctx, x, y, WSP_BTN, h, 7, fill);
+        vt_pctx_rounded_rect(ctx, x, y, WSP_CELL, h, 6, fill);
         if (active) {
-            /* accent ring (1px inset outline) */
             vt_pcol_t ring = { 0xec, 0xee, 0xf0, 0xff };
             vt_pcol_t glow = { 0x4f, 0x9a, 0xdc, 0x60 };
-            vt_pctx_rect(ctx, x + 2, y + 1, WSP_BTN - 4, 1, glow);
-            vt_pctx_rect(ctx, x + 2, y + h - 2, WSP_BTN - 4, 1, ring);
+            vt_pctx_rect(ctx, x + 2, y + 1, WSP_CELL - 4, 1, glow);
+            vt_pctx_rect(ctx, x + 2, y + h - 2, WSP_CELL - 4, 1, ring);
             vt_pctx_rect(ctx, x + 1, y + 2, 1, h - 4, ring);
-            vt_pctx_rect(ctx, x + WSP_BTN - 2, y + 2, 1, h - 4, ring);
+            vt_pctx_rect(ctx, x + WSP_CELL - 2, y + 2, 1, h - 4, ring);
+        }
+        /* miniature desktop area */
+        int mx = x + 4, my = y + 4, mw = WSP_CELL - 8, mh = h - 8;
+        vt_pctx_rect(ctx, mx, my, mw, mh,
+                     (vt_pcol_t){ 0x10, 0x12, 0x16, 0xff });
+        for (size_t k = 0; k < w->wins.size; k++) {
+            _twin_t *t = vt_vec_at(&w->wins, k);
+            if (t->ws != i || t->minimized) continue;
+            if (t->w <= 0 || t->h <= 0) continue;
+            int wxm = mx + t->x * mw / sw;
+            int wym = my + t->y * mh / sh;
+            int wwm = t->w * mw / sw;
+            int whm = t->h * mh / sh;
+            if (wwm < 2) wwm = 2;
+            if (whm < 2) whm = 2;
+            if (wxm < mx) wxm = mx;
+            if (wym < my) wym = my;
+            if (wxm + wwm > mx + mw) wwm = mx + mw - wxm;
+            if (wym + whm > my + mh) whm = my + mh - wym;
+            bool foc = t->focused && active;
+            vt_pctx_rect(ctx, wxm, wym, wwm, whm,
+                         foc ? (vt_pcol_t){ 0x6f, 0xaa, 0xe8, 0xff }
+                             : (vt_pcol_t){ 0x4a, 0x51, 0x60, 0xff });
+            if (foc)
+                vt_pctx_rect(ctx, wxm, wym, wwm, 1,
+                             (vt_pcol_t){ 0xff, 0xff, 0xff, 0xff });
         }
         char n[16];
         snprintf(n, sizeof(n), "%d", i + 1);
         vt_pcol_t tc = active ? (vt_pcol_t){ 0xff, 0xff, 0xff, 0xff }
                               : (vt_pcol_t){ 0x90, 0x93, 0x99, 0xff };
         int tw = vt_pctx_text_width(ctx, n, active);
-        vt_pctx_text(ctx, x + (WSP_BTN - tw) / 2, y + h / 2 +
+        vt_pctx_text(ctx, x + (WSP_CELL - tw) / 2, y + h / 2 +
                      vt_pctx_text_height(ctx) / 2 - 2, n, active, tc);
     }
 }
 static void _wsp_on_click(vt_applet_env_t *env, int x, int y, int button) {
     (void)y; (void)button;
     _wsp_t *w = env->state;
-    int idx = x / (WSP_BTN + 4);
+    int idx = x / (WSP_CELL + WSP_GAP);
     if (idx < 0 || idx >= w->count) return;
     char payload[32];
     snprintf(payload, sizeof(payload), "ws=%d", idx);
+    vt_panel_send_wm(env->panel, VT_IPC_MSG_WM_WS_SWITCH, payload);
+}
+static void _wsp_on_wheel(vt_applet_env_t *env, int dir) {
+    _wsp_t *w = env->state;
+    int next = w->current + (dir > 0 ? 1 : -1);
+    if (next < 0) next = w->count - 1;
+    if (next >= w->count) next = 0;
+    char payload[32];
+    snprintf(payload, sizeof(payload), "ws=%d", next);
     vt_panel_send_wm(env->panel, VT_IPC_MSG_WM_WS_SWITCH, payload);
 }
 static void _wsp_on_ipc(vt_applet_env_t *env, uint32_t msg,
@@ -356,13 +436,18 @@ static void _wsp_on_ipc(vt_applet_env_t *env, uint32_t msg,
         vt_strstartswith(payload, "workspace-changed")) {
         _wsp_t *w = env->state;
         w->current = atoi(payload + strlen("workspace-changed"));
+        _wsp_refresh(env);
+        vt_panel_invalidate(env->panel);
+    } else if (msg == VT_IPC_MSG_WM_EVENT) {
+        _wsp_refresh(env);
         vt_panel_invalidate(env->panel);
     }
 }
 const vt_applet_impl_t _applet_workspaces = {
     .name = "workspaces", .init = _wsp_init, .fini = _wsp_fini,
     .measure = _wsp_measure, .render = _wsp_render,
-    .on_click = _wsp_on_click, .on_ipc_event = _wsp_on_ipc,
+    .on_click = _wsp_on_click, .on_wheel = _wsp_on_wheel,
+    .on_ipc_event = _wsp_on_ipc,
 };
 
 /* --------------------------------------------------------------- clock */

@@ -210,20 +210,27 @@ The native Wayland session draws a REAL panel with the compositor itself
 (vt-wl-panel.c) — not XWayland, not X11 clients, and not placeholder
 blocks:
 
-* LEFT: **Programs** button → categorized application menu built from
-  XDG `.desktop` entries via the SHARED vt-apps database (identical
-  parser, locale handling and category table as the X11 panel — there
-  is no second app list) with a **search bar** (type to filter by name
-  and keywords, BackSpace edits, Escape closes), **scrolling** (wheel
-  over the list, scrollbar indicator), **icon-theme icons** (the user's
-  configured theme via vt-icons) and a Quit Session entry; window list
-  of xdg toplevels (click to focus, right-click to close)
-* RIGHT: workspace buttons (with glow on the active one), network
-  indicator (real `/sys/class/net` state, wired + wireless quality),
-  volume (native ALSA mixer — real values, wheel adjusts, popup slider),
-  clock with a calendar popup (previous/next month), username menu with
-  Lock Screen / Suspend / Switch User / Log Out / Reboot / Shutdown /
-  Exit Session
+* LEFT: **Programs** button (themed `start-here` icon from the active
+  icon theme — XFCE-style start button; `VANTAGE_START_ICON` overrides,
+  drawn grid glyph as the honest fallback) → categorized application
+  menu built from XDG `.desktop` entries via the SHARED vt-apps database
+  (identical parser, locale handling and category table as the X11
+  panel — there is no second app list) with a **search bar** (type to
+  filter by name and keywords, BackSpace edits, Escape closes),
+  **scrolling** (wheel over the list, scrollbar indicator), **icon-theme
+  icons at 24px** (SVG themes rasterize at the exact display size via
+  librsvg; raster icons are area-averaged — no more low-res smears) and
+  a Quit Session entry; **taskbar** of xdg toplevels (app icons from the
+  icon theme via `app_id`, adaptive button widths, focused/minimized
+  states, click focuses/restores, right-click closes)
+* RIGHT: **workspace PAGER** — each cell is a miniature of that desktop
+  showing its windows at their true relative position and size (click a
+  cell to switch, wheel cycles; switching focuses the top window on the
+  desktop you land on), network indicator (real `/sys/class/net` state,
+  wired + wireless quality), volume (native ALSA mixer — real values,
+  wheel adjusts, popup slider), clock with a calendar popup
+  (previous/next month), username menu with Lock Screen / Suspend /
+  Switch User / Log Out / Reboot / Shutdown / Exit Session
 
 Text is rasterized with FreeType + fontconfig **with per-codepoint font
 fallback** (a second face is matched lazily when the primary sans lacks
@@ -246,12 +253,32 @@ spawn `loginctl` detached — the compositor event loop never blocks on
 `system()`. Failures are reported honestly in the menu status line.
 
 Real-client protocol surface: `wl_compositor`, `wl_shm`, `wl_seat`
-(pointer + keyboard, xkb keymaps), `wl_output`, `xdg_wm_base`
-(toplevels with move/resize/maximize/fullscreen, popups),
+(pointer + keyboard, xkb keymaps, `wl_pointer` frame events),
+`wl_output`, `xdg_wm_base` (toplevels with move/resize/maximize/
+fullscreen/minimize, popups with a REAL positioner — anchor/gravity/
+constraint adjustments, `xdg_popup.grab`, `popup_done` dismissal),
 **`wl_subcompositor`/`wl_subsurface`** (GTK/Qt overlays paint relative
-to their parent) and **`wl_data_device_manager`** (in-session clipboard:
+to their parent), **`wl_data_device_manager`** (in-session clipboard:
 selection tracking, per-client offers, `data_offer.receive` pipe
-through to the source).
+through to the source) and **`xdg-decoration-unstable-v1`** (CSD apps
+are never double-decorated: client mode is the default; a toplevel that
+explicitly requests server mode gets a compositor-drawn titlebar with
+move/resize/close buttons).
+
+Client buffers are COPIED at commit time and released immediately
+(`wl_buffer.release`), so double-buffered toolkits never stall and the
+compositor never touches client-owned memory after the pool is
+destroyed. `xdg_surface.set_window_geometry` SETS the window rectangle
+(GTK calls it constantly — accumulating it made windows drift across
+the screen on every resize).
+
+The desktop background is the SAME wallpaper engine the X11 desktop
+uses (`[wallpaper]` in vantage.conf: gradient/color/image, smooth
+per-pixel interpolation, cover-scaled images) — both sessions show the
+same wallpaper.
+
+Super+drag moves any window (left button) or resizes it (right button)
+even when the app has no titlebar of its own.
 
 ## Input requirements (no session manager)
 

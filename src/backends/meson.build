@@ -24,6 +24,8 @@ wl_protocols_dir = dep_wayland_protocols.get_variable(
   default_value: dep_wayland_protocols.get_variable(
     pkgconfig: 'wayland_protocols_path', default_value: '/usr/share/wayland-protocols'))
 xdg_shell_xml = join_paths(wl_protocols_dir, 'stable', 'xdg-shell', 'xdg-shell.xml')
+xdg_decoration_xml = join_paths(wl_protocols_dir, 'unstable',
+  'xdg-decoration', 'xdg-decoration-unstable-v1.xml')
 
 if dep_wayland_server.found() and dep_wayland_client.found() and \
    prog_wl_scanner.found() and run_command('test', '-f', xdg_shell_xml, check: false).returncode() == 0
@@ -36,9 +38,23 @@ if dep_wayland_server.found() and dep_wayland_client.found() and \
     output: 'xdg-shell-protocol.c',
     command: [prog_wl_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
 
+  # xdg-decoration-unstable-v1: CSD apps tell us whether they draw
+  # their own frame — without it a decorating compositor would
+  # double-decorate every GTK/Chromium window
+  xdg_decoration_proto_h = custom_target('xdg-decoration-protocol.h',
+    input: xdg_decoration_xml,
+    output: 'xdg-decoration-protocol.h',
+    command: [prog_wl_scanner, 'server-header', '@INPUT@', '@OUTPUT@'])
+  xdg_decoration_proto_c = custom_target('xdg-decoration-protocol.c',
+    input: xdg_decoration_xml,
+    output: 'xdg-decoration-protocol.c',
+    command: [prog_wl_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
   backend_deps += [dep_wayland_client, dep_wayland_server, dep_xkbcommon]
   backend_cargs += ['-DVT_HAVE_WAYLAND']
-  lib_vantage_backends_extra_sources = [xdg_shell_proto_c, xdg_shell_proto_h]
+  lib_vantage_backends_extra_sources = [xdg_shell_proto_c, xdg_shell_proto_h,
+                                         xdg_decoration_proto_c,
+                                         xdg_decoration_proto_h]
 else
   lib_vantage_backends_extra_sources = []
   if dep_wayland_client.found()

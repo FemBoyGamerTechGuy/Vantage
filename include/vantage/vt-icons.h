@@ -44,11 +44,33 @@ const char *vt_icon_theme_name(const vt_icon_theme_t *t);
 int vt_icon_theme_lookup(const vt_icon_theme_t *t, const char *icon,
                          int size, char *out, size_t out_n);
 
-/* Load any image (png via the built-in decoder, everything gdk-pixbuf
- * understands — svg/xpm/jpeg — when it was compiled in) into
- * ARGB-8888 pixels. Caller frees *out_pixels. Returns 0 on success. */
+/* Load any image (png via the built-in decoder, svg via librsvg when
+ * compiled in, everything gdk-pixbuf understands — xpm/jpeg — when it
+ * was compiled in) into ARGB-8888 pixels. Caller frees *out_pixels.
+ * Returns 0 on success. */
 int vt_icon_load_argb(const char *path, uint32_t **out_pixels,
                       int *out_w, int *out_h);
+
+/* Load an icon and rasterize SVG sources at the TARGET size (SVGs are
+ * resolution-independent: rendering them at exactly the display size
+ * is what keeps icons crisp instead of upscaled 16px rasters).
+ * Returns 0 on success. */
+int vt_icon_load_argb_sized(const char *path, int target,
+                            uint32_t **out_pixels, int *out_w, int *out_h);
+
+/* High-quality resampler: box-filter when downscaling (area-average,
+ * no aliasing), bilinear when upscaling. Straight nearest-neighbour
+ * scaling is what made panel icons look "low resolution": 48px icons
+ * crushed to 18px lost 3 of every 4 pixel columns and aliased badly. */
+uint32_t *vt_icon_scale_argb(const uint32_t *src, int sw, int sh,
+                             int dw, int dh);
+
+/* One-call helper: resolve NAME in the theme and return ARGB pixels
+ * scaled to exactly size x size (freeing the original). Returns NULL
+ * when the icon cannot be resolved — callers draw their honest
+ * fallback glyph then. size <= 0 means "native size". */
+uint32_t *vt_icon_lookup_argb(const vt_icon_theme_t *t, const char *name,
+                              int size);
 
 #ifdef __cplusplus
 }

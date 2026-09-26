@@ -37,17 +37,22 @@ typedef struct {
     char search[64];
     bool search_focused;
 
-    /* icon cache: name → 18x18 ARGB */
+    /* icon cache: name → _LI_SZ x _LI_SZ ARGB (quality-scaled) */
     vt_vec_t icon_keys;      /* char* */
     vt_vec_t icon_px;        /* uint32_t* */
     vt_icon_theme_t *theme;
 } _launcher_t;
 
+/* 24px display size with area-averaged/bilinear resampling and SVG
+ * rasterization at the exact size — the old 18px nearest-neighbour
+ * icons looked small and low-resolution on both backends */
+#define _LI_SZ 24
+
 /* ---- menu geometry (mirrors the Wayland panel's menu) ---- */
 #define _AM_X        8
 #define _AM_CAT_W    150
 #define _AM_W        560
-#define _AM_ROW      26
+#define _AM_ROW      30
 #define _AM_ROWS     12
 #define _AM_SEARCH_H 34
 #define _AM_H        (_AM_SEARCH_H + _AM_ROWS * _AM_ROW + 8)
@@ -58,34 +63,14 @@ static void _launcher_menu_close(vt_applet_env_t *env);
 static void _launcher_menu_open(vt_applet_env_t *env);
 
 /* ------------------------------------------------------ icon cache */
-static uint32_t *_icon_18(_launcher_t *l, const char *name) {
+static uint32_t *_icon_get(_launcher_t *l, const char *name) {
     if (!name || !*name) return NULL;
     for (size_t i = 0; i < l->icon_keys.size; i++)
         if (vt_streq(*(const char *const *)vt_vec_at(&l->icon_keys, i), name))
             return *(uint32_t *const *)vt_vec_at(&l->icon_px, i);
     if (!l->theme) l->theme = vt_icon_theme_load();
-    uint32_t *px = NULL;
-    char path[1024];
-    if (vt_icon_theme_lookup(l->theme, name, 24, path, sizeof(path)) == 0) {
-        uint32_t *full = NULL;
-        int w = 0, h = 0;
-        if (vt_icon_load_argb(path, &full, &w, &h) == 0 && w > 0 && h > 0) {
-            if (w == 18 && h == 18) px = full;
-            else {
-                px = vt_malloc(sizeof(uint32_t) * 18 * 18);
-                for (int y = 0; y < 18; y++) {
-                    int sy = y * h / 18;
-                    if (sy >= h) sy = h - 1;
-                    for (int x = 0; x < 18; x++) {
-                        int sx = x * w / 18;
-                        if (sx >= w) sx = w - 1;
-                        px[y * 18 + x] = full[sy * w + sx];
-                    }
-                }
-                vt_free(full);
-            }
-        }
-    }
+    /* one call: theme lookup + SVG-at-size / box-filtered raster scaling */
+    uint32_t *px = vt_icon_lookup_argb(l->theme, name, _LI_SZ);
     /* negative results are cached too (avoid re-resolving on repaint) */
     char *key = vt_strdup(name);
     vt_vec_push(&l->icon_keys, &key);
@@ -166,22 +151,38 @@ static void _launcher_load(vt_applet_env_t *env) {
 
 static int _launcher_measure(vt_applet_env_t *env) {
     _launcher_load(env);
-    return 110;
+    return 132;
 }
 
 static void _launcher_render(vt_applet_env_t *env) {
     vt_pctx_t *ctx = env->ctx;
+    _launcher_t *l = env->state;
     int x = env->area.x, h = env->area.h;
     int y = env->area.y;
-    /* Programs button: accent rounded square + grid glyph + label */
+    /* Programs button: accent rounded square + a themed start icon
+     * (start-here from the active icon theme — like an XFCE start
+     * button uses the theme's logo), with the drawn grid glyph as the
+     * honest fallback when the theme has none */
     vt_pcol_t accent = { 0x4f, 0x9a, 0xdc, 0xff };
     vt_pcol_t fg = { 0xec, 0xee, 0xf0, 0xff };
-    vt_pctx_rounded_rect(ctx, x + 6, y + 3, 22, h - 6, 6, accent);
-    for (int gy = 0; gy < 3; gy++)
-        for (int gx = 0; gx < 3; gx++)
-            vt_pctx_rect(ctx, x + 6 + 5 + gx * 5, y + 3 + 5 + gy * 5, 2, 2,
-                         fg);
-    vt_pctx_text(ctx, x + 36, y + h / 2 + vt_pctx_text_height(ctx) / 2 - 2,
+    vt_pctx_rounded_rect(ctx, x + 4, y + 3, 30, h - 6, 7, accent);
+    uint32_t *icon = NULL;
+    {
+        const char *envn = getenv("VANTAGE_START_ICON");
+        if (envn && *envn) icon = _icon_get(l, envn);
+        if (!icon) icon = _icon_get(l, "start-here");
+        if (!icon) icon = _icon_get(l, "vantage-start");
+    }
+    if (icon) {
+        vt_pctx_draw_argb(ctx, x + 7, y + (h - _LI_SZ) / 2, _LI_SZ, _LI_SZ,
+                          icon, _LI_SZ, _LI_SZ);
+    } else {
+        for (int gy = 0; gy < 3; gy++)
+            for (int gx = 0; gx < 3; gx++)
+                vt_pctx_rect(ctx, x + 7 + 5 + gx * 5, y + 3 + 5 + gy * 5,
+                             2, 2, fg);
+    }
+    vt_pctx_text(ctx, x + 38, y + h / 2 + vt_pctx_text_height(ctx) / 2 - 2,
                  "Programs", true, fg);
 }
 
@@ -336,19 +337,22 @@ static void _launcher_menu_paint(vt_applet_env_t *env) {
                                   (short)ry, (unsigned)(w - _AM_CAT_W - 4),
                                   (unsigned)(_AM_ROW - 2));
         }
-        uint32_t *icon = _icon_18(l, a->icon);
+        uint32_t *icon = _icon_get(l, a->icon);
+        int iy = ry + (_AM_ROW - _LI_SZ) / 2;
         if (icon)
-            vt_pctx_draw_argb_pic(dpy, pic, _AM_CAT_W + 8, ry + 3, 18, 18,
-                                  icon, 18, 18);
+            vt_pctx_draw_argb_pic(dpy, pic, _AM_CAT_W + 8, iy, _LI_SZ,
+                                  _LI_SZ, icon, _LI_SZ, _LI_SZ);
         else {
             XRenderColor fb = { .red = 0x3939, .green = 0x3e3e,
                                 .blue = 0x4848, .alpha = 0xffff };
             XRenderFillRectangle(dpy, PictOpOver, pic, &fb, _AM_CAT_W + 8,
-                                  (short)(ry + 3), 18, 18);
+                                  (short)iy, (unsigned)_LI_SZ,
+                                  (unsigned)_LI_SZ);
         }
         vt_pcol_t name_col = fgc;
         if (sel) name_col = (vt_pcol_t){ 0xff, 0xff, 0xff, 0xff };
-        _MT(a->name, _AM_CAT_W + 34, ry + _AM_ROW - 7, name_col, false);
+        _MT(a->name, _AM_CAT_W + 8 + _LI_SZ + 8, ry + _AM_ROW - 7,
+            name_col, false);
     }
     if (total == 0) {
         _MT("(no applications)", _AM_CAT_W + 34, _AM_SEARCH_H + _AM_ROW - 7,

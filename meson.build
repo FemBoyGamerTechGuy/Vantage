@@ -45,9 +45,10 @@ add_project_arguments([
   '-DVT_PREFIX="' + vt_prefix + '"',
 ], language : 'c')
 
-# Common warning flags
+# Common warning flags (-Wall/-Wextra come from warning_level=2 in
+# project(); repeating them here made meson lint about redundancy)
 common_cflags = [
-  '-Wall', '-Wextra', '-Wpedantic',
+  '-Wpedantic',
   '-Wno-unused-parameter',
   '-Wno-missing-field-initializers',
   '-Wshadow',
@@ -58,6 +59,38 @@ common_cflags = [
   '-fvisibility=hidden',
 ]
 add_project_arguments(common_cflags, language : 'c')
+
+# Third-party headers (ALSA/FFmpeg/gdk-pixbuf/librsvg/...) are NOT our
+# code to fix, so their include directories are marked as SYSTEM
+# headers (-isystem — the same semantics /usr/include already has).
+# This is not silencing warnings for Vantage code: every line under
+# src/ and include/ keeps full -Wall -Wextra -Wpedantic -Wconversion
+# coverage; what changes is only that the compiler stops reporting
+# style violations INSIDE headers written by other projects.
+ext_isystem = []
+foreach mod : ['alsa', 'gdk-pixbuf-2.0', 'libpng', 'libjpeg', 'librsvg-2.0',
+               'cairo', 'freetype2', 'fontconfig', 'xft', 'xcursor',
+               'xkbcommon', 'xkbcommon-x11', 'libavcodec', 'libavformat',
+               'libavutil', 'libswscale', 'libswresample', 'dbus-1',
+               'libpulse', 'glib-2.0', 'wayland-client', 'wayland-server',
+               'libdrm', 'gbm', 'egl', 'glesv2', 'libseat', 'libinput',
+               'libudev', 'json-c', 'xtst', 'x11', 'xrandr', 'xi',
+               'xrender', 'xcomposite', 'xdamage', 'xfixes', 'xinerama',
+               'xres', 'x11-xcb', 'xcb', 'xcb-randr', 'xcb-xkb',
+               'xcb-util', 'xcb-ewmh', 'xcb-icccm', 'xcb-xinput']
+  r = run_command('pkg-config', '--cflags-only-I', mod,
+                  check : false, capture : true)
+  if r.returncode() == 0
+    foreach fl : r.stdout().strip().split(' ')
+      if fl.startswith('-I/')
+        ext_isystem += ['-isystem', fl.substring(2)]
+      endif
+    endforeach
+  endif
+endforeach
+if ext_isystem.length() > 0
+  add_project_arguments(ext_isystem, language : 'c')
+endif
 
 # Dependency detection -- everything optional is optional
 dep_libm     = cc.find_library('m', required : false)
@@ -120,6 +153,10 @@ dep_libswresample   = dependency('libswresample', required : false)
 dep_gdkpixbuf       = dependency('gdk-pixbuf-2.0', required : false)
 dep_libpng          = dependency('libpng',         required : false)
 dep_libjpeg         = dependency('libjpeg',         required : false)
+# SVG icons: librsvg + cairo rasterize theme SVGs at the exact panel
+# display size (crisp icons on Adwaita/Papirus/Breeze-style themes)
+dep_cairo           = dependency('cairo',          required : false)
+dep_librsvg         = dependency('librsvg-2.0',   required : false)
 
 # Audio
 dep_alsa            = dependency('alsa',           required : false)

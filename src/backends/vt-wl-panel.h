@@ -24,7 +24,11 @@ typedef struct vt_wl_panel vt_wl_panel_t;
 typedef struct {
     uint64_t id;
     const char *title;
+    const char *app_id;    /* icon-theme lookup key for the taskbar */
     bool focused;
+    bool minimized;        /* hidden; only the taskbar represents it */
+    int ws;                /* workspace */
+    int x, y, w, h;        /* real geometry (pager miniatures) */
 } vt_wl_panel_win_t;
 
 typedef struct {
@@ -39,6 +43,8 @@ typedef struct {
 vt_wl_panel_t *vt_wl_panel_create(int width, int bar_height);
 void vt_wl_panel_destroy(vt_wl_panel_t *p);
 void vt_wl_panel_resize(vt_wl_panel_t *p, int width);
+/* full screen size — the pager scales window miniatures with it */
+void vt_wl_panel_set_screen(vt_wl_panel_t *p, int w, int h);
 int  vt_wl_panel_height(const vt_wl_panel_t *p);
 void vt_wl_panel_set_callbacks(vt_wl_panel_t *p,
                                const vt_wl_panel_cbs_t *cbs, void *ud);
@@ -48,6 +54,12 @@ void vt_wl_panel_set_windows(vt_wl_panel_t *p,
 
 /* paint the bar + any open menu into the framebuffer */
 void vt_wl_panel_paint(vt_wl_panel_t *p, uint32_t *fb, int fbw, int fbh);
+
+/* draw one line of SSD title text (used by the compositor backend's
+ * server-side decorations; shares the panel's glyph rasterizer) */
+int vt_wl_panel_ssd_title(vt_wl_panel_t *p, uint32_t *fb, int fbw, int fbh,
+                          int x, int y, int max_w, const char *utf8,
+                          uint32_t argb);
 
 /* input: returns true when the event was consumed (was inside the bar
  * or a menu). kind: 0=motion, 1=press, 2=release. */

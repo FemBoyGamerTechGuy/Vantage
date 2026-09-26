@@ -337,18 +337,79 @@ panel_bg = top.count(bytes((0x23, 0x26, 0x2b)))
 accent = pix.count(bytes((0x4f, 0x9a, 0xdc)))
 placeholder_red = pix.count(bytes((0xe0, 0x5a, 0x5a)))
 placeholder_green = pix.count(bytes((0x7a, 0xc8, 0x60)))
+# BACKGROUND: the desktop now renders the [wallpaper] config — the
+# default vertical navy gradient. The old bug painted a flat hardcoded
+# gray everywhere. Sample far from windows/panel: left edge, below the
+# panel (y=40) and near the bottom (y=h-8): gradient colors differ and
+# match the engine's interpolation between (18,23,36) and (38,48,79).
+def px(x, y):
+    i = (y*w+x)*3
+    return (pix[i], pix[i+1], pix[i+2])
+c_top = px(4, 40)
+c_bot = px(4, h - 8)
+def near(c, t, tol=8):
+    return all(abs(a-b) <= tol for a, b in zip(c, t))
+grad_top_ok = near(c_top, (18, 23, 36))
+grad_bot_ok = near(c_bot, (38, 48, 79))
+grad_diff = c_bot[2] - c_top[2] >= 12
 print(f"frame: {w}x{h}, client-color pixels={hits}, panel-bg(top)={panel_bg}, "
       f"accent={accent}, placeholder-red={placeholder_red}, "
       f"placeholder-green={placeholder_green}")
+print(f"background: top={c_top} bottom={c_bot} "
+      f"(gradient {'OK' if grad_top_ok and grad_bot_ok and grad_diff else 'BAD'})")
 panel_ok = panel_bg > w * 8 and accent > 50
 placeholders_gone = placeholder_red == 0 and placeholder_green == 0
-sys.exit(0 if (hits > 1000 and panel_ok and placeholders_gone) else 1)
+sys.exit(0 if (hits > 1000 and panel_ok and placeholders_gone and
+               grad_top_ok and grad_bot_ok and grad_diff) else 1)
 PYEOF
   [ $? -eq 0 ] && ok "client pixels + REAL compositor panel in frame dump" \
-    || bad "frame dump check failed (pixels/panel/placeholders)"
+    || bad "frame dump check failed (pixels/panel/placeholders/background)"
 else
   bad "no frame dump at /tmp/vantage-wayland.ppm"
 fi
+
+# --- wl_buffer.release: the compositor must release client buffers,
+# --- or double-buffered apps stall after two frames
+if grep -q "^buffer released" "$CLIENT_LOG"; then
+  ok "wl_buffer.release received by the client (no double-buffer stall)"
+else
+  bad "no wl_buffer.release — real apps would stall after 2 frames"
+fi
+
+# ------------------------------------------------ popup + multipool clients
+# The two historical "apps just crash on Wayland" classes, as
+# deterministic regression clients:
+#   --popup      xdg_popup lifecycle (GTK menus): positioner size honored,
+#                configure/ack flow, destroy does not kill the connection
+#   --multipool alternating shm pools: the never-ended begin_access used
+#                to abort the COMPOSITOR (libwayland assertion) — every
+#                real app died with "Broken pipe"
+echo "== harness-wayland: xdg_popup lifecycle (menu class) =="
+POPUP_LOG="$WORK/popup.log"
+timeout 12 "$(tc vt-wayland-testclient)" --popup > "$POPUP_LOG" 2>&1
+POPUP_RC=$?
+if [ $POPUP_RC -eq 0 ] && grep -q "^popup configured 180x160" "$POPUP_LOG" \
+   && grep -q "^popup destroyed without dying" "$POPUP_LOG"; then
+  ok "xdg popup: positioner size honored + destroy is survivable"
+else
+  bad "xdg popup lifecycle failed (rc=$POPUP_RC): $(tail -3 "$POPUP_LOG")"
+fi
+kill -0 "$WM_PID" 2>/dev/null \
+  && ok "compositor alive after popup client" \
+  || bad "compositor died on the popup client"
+
+echo "== harness-wayland: multi-pool shm client (crash class) =="
+MP_LOG="$WORK/multipool.log"
+timeout 15 "$(tc vt-wayland-testclient)" --multipool > "$MP_LOG" 2>&1
+MP_RC=$?
+if [ $MP_RC -eq 0 ] && grep -q "^multipool ok, releases=" "$MP_LOG"; then
+  ok "multi-pool shm commits + wl_buffer.release flow (compositor never aborted)"
+else
+  bad "multi-pool client failed (rc=$MP_RC): $(tail -3 "$MP_LOG")"
+fi
+kill -0 "$WM_PID" 2>/dev/null \
+  && ok "compositor alive after multi-pool client" \
+  || bad "compositor died on the multi-pool client"
 
 
 # ------------------------------------------------- interactive UI checks
@@ -507,6 +568,67 @@ sys.exit(0 if search_bg < 500 else 1)
 PYEOF4
   [ $? -eq 0 ] && ok "menu closed after launching the application"     || bad "menu stayed open after launching"
 fi
+
+# ------------------------------------------------------ workspace PAGER
+# The panel's workspace switcher is a real PAGER: each cell shows that
+# desktop's windows as miniatures at their true relative geometry.
+# Map a window on ws1, switch to ws2, map another, switch back — the
+# frame must then show BOTH: a focused miniature (accent) in the active
+# cell and an unfocused one (slate) in the ws2 cell, inside the bar.
+echo "== harness-wayland: workspace pager miniatures =="
+"$(vb vantage-remote)" ws 1 >/dev/null 2>&1
+PG_A_LOG="$WORK/pager-a.log"
+timeout 8 "$(tc vt-wayland-testclient)" 0xffaa7a3a 260 160 > "$PG_A_LOG" 2>&1 &
+PG_A_PID=$!
+for i in $(seq 1 60); do
+  grep -q "^committed" "$PG_A_LOG" 2>/dev/null && break
+  kill -0 "$PG_A_PID" 2>/dev/null || break
+  sleep 0.05
+done
+"$(vb vantage-remote)" ws 2 >/dev/null 2>&1
+PG_B_LOG="$WORK/pager-b.log"
+timeout 8 "$(tc vt-wayland-testclient)" 0xff3a7aaa 260 160 > "$PG_B_LOG" 2>&1 &
+PG_B_PID=$!
+for i in $(seq 1 60); do
+  grep -q "^committed" "$PG_B_LOG" 2>/dev/null && break
+  kill -0 "$PG_B_PID" 2>/dev/null || break
+  sleep 0.05
+done
+"$(vb vantage-remote)" ws 1 >/dev/null 2>&1
+sleep 0.4
+rm -f /tmp/vantage-wayland.ppm
+kill -USR1 "$WM_PID" 2>/dev/null
+wait_ppm
+if [ -s /tmp/vantage-wayland.ppm ]; then
+  python3 - <<'PYEOF5'
+import sys
+with open('/tmp/vantage-wayland.ppm','rb') as f:
+    data = f.read()
+vals, pos = [], data.find(b'P6') + 2
+while len(vals) < 3:
+    while data[pos:pos+1].isspace(): pos += 1
+    j = pos
+    while not data[j:j+1].isspace(): j += 1
+    vals.append(int(data[pos:j])); pos = j
+pos += 1
+w, h, _ = vals
+pix = data[pos:pos + w*h*3]
+# the pager strip lives in the bar, right of the taskbar: scan the bar
+# rows (4..30) in the right HALF of the screen for miniature fills
+bar = pix[4*w*3 : 30*w*3]
+half = bar[(w//2)*3:]
+foc = half.count(bytes((0x6f, 0xaa, 0xe8)))   # focused miniature (accent)
+unf = half.count(bytes((0x4a, 0x51, 0x60)))   # unfocused miniature (slate)
+print(f"pager: focused-mini px={foc} unfocused-mini px={unf}")
+sys.exit(0 if foc >= 6 and unf >= 6 else 1)
+PYEOF5
+  [ $? -eq 0 ] && ok "pager draws real window miniatures per workspace" \
+    || bad "pager miniatures missing (focused/unfocused cells)"
+else
+  bad "no frame dump for the pager check"
+fi
+wait "$PG_A_PID" 2>/dev/null
+wait "$PG_B_PID" 2>/dev/null
 
 # ------------------------------------------------------------- shutdown
 # Ctrl+C (SIGINT) takes the same clean-unwind path as SIGTERM: restore,
