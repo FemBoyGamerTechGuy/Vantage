@@ -1205,8 +1205,23 @@ static void _kbd_send_keymap(_wl_state_t *st, struct wl_resource *kres) {
         }
     }
 #endif
-    /* degenerate empty keymap — clients must cope */
-    wl_keyboard_send_keymap(kres, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, -1, 0);
+    /* No usable xkb keymap — STILL never pass fd -1. libwayland dups
+     * the fd argument at marshal time; an invalid fd is an EBADF
+     * marshal error that KILLS the whole client connection (real apps
+     * die the moment they bind wl_keyboard). A valid empty memfd keeps
+     * the connection alive; the client sees a size-0 keymap it cannot
+     * compile and can cope with that. */
+    vt_logw("wayland: sending an EMPTY keymap to a client — keyboard "
+            "input will not work (xkb keymap was not compiled)");
+    int fd = memfd_create("vantage-keymap-empty", MFD_CLOEXEC);
+    if (fd < 0) fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        wl_keyboard_send_keymap(kres, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1,
+                                 fd, 0);
+        close(fd);
+    }
+    /* if even /dev/null is unavailable the keymap event is skipped —
+     * still better than poisoning the connection with an invalid fd */
 }
 
 /* ----------------------------------------------------------- wl_seat */
@@ -1238,8 +1253,15 @@ static void _seat_get_keyboard(struct wl_client *cli,
         _kbd_res_t *kr = vt_malloc0(sizeof(*kr));
         kr->res = k;
         wl_list_insert(st->kbd_reses.prev, &kr->link);
-        /* if a surface is already focused, enter immediately */
-        if (st->kbd_focus && st->kbd_focus->res) {
+        /* if a surface of THIS client is already focused, enter
+         * immediately. The surface resource belongs to the client
+         * that created it — sending it on another client's keyboard
+         * is a cross-client object violation that libwayland flags as
+         * a fatal compositor bug and kills the connection (any app
+         * connecting while another app's window is focused would die
+         * on the spot). */
+        if (st->kbd_focus && st->kbd_focus->res &&
+            wl_resource_get_client(st->kbd_focus->res) == cli) {
             struct wl_array keys;
             wl_array_init(&keys);
             wl_keyboard_send_enter(k, ++st->serial, st->kbd_focus->res,
@@ -2507,9 +2529,13 @@ static int _wl_init(vt_backend_t *self) {
 
     /* ---- stage 12/15: input ----------------------------------------- */
     _stage_begin(11, "libinput (udev) + xkbcommon");
+    /* The keymap is compiled ALWAYS — xkbcommon needs no devices. Even
+     * headless (CI) clients bind wl_keyboard and require a REAL
+     * wl_keyboard.keymap event; without it every launched app gets a
+     * marshal error and its connection killed. */
+    bool xkb_ok = _xkb_init(st);
     if (!st->headless && st->seat) {
         bool li_ok = _input_init(st);
-        bool xkb_ok = _xkb_init(st);
         if (li_ok && xkb_ok) {
             _stage_ok(11, "%zu device(s), xkb keymap ready",
                       self->inputs.size);
@@ -2523,6 +2549,9 @@ static int _wl_init(vt_backend_t *self) {
     } else {
         _stage_skip(11, "headless — no seat to open input devices "
                         "through");
+        if (xkb_ok)
+            vt_logi("wayland: headless input — xkb keymap compiled "
+                    "without devices (clients still get a real keymap)");
         vt_input_dev_t k = { .name = vt_strdup("wl-keyboard"), .id = 0,
                              .type = 0, .active = true };
         vt_input_dev_t p = { .name = vt_strdup("wl-pointer"), .id = 1,

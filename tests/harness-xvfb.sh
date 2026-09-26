@@ -53,10 +53,41 @@ command -v Xvfb >/dev/null 2>&1 || { echo "Xvfb not found"; exit 77; }
 
 # --------------------------------------------------------- isolated env
 WORK=$(mktemp -d /tmp/vantage-xvfb.XXXXXX)
-mkdir -p "$WORK/run" "$WORK/config/vantage" "$WORK/share"
+mkdir -p "$WORK/run" "$WORK/config/vantage" "$WORK/share/applications" \
+         "$WORK/data-dirs"
 export XDG_RUNTIME_DIR="$WORK/run"
 export XDG_CONFIG_HOME="$WORK/config"
 export XDG_DATA_HOME="$WORK/share"        # isolate XDG autostart
+# XDG_DATA_DIRS isolation: vt-apps falls back to /usr/local/share:/usr/share
+# when it is unset, so host-installed applications would leak into the
+# Programs menu and make the pixel checks machine-dependent. An empty
+# dir keeps the menu DB deterministic on every machine.
+export XDG_DATA_DIRS="$WORK/data-dirs"
+# deterministic menu CONTENT: probe applications in the isolated
+# XDG_DATA_HOME — the Programs menu renders REAL rows on every machine
+# (before, host-installed apps leaked in via the /usr/share fallback
+# and provided the text the pixel checks looked for). The probe sorts
+# alone in Utility → "app row 0" is exactly this application.
+cat > "$XDG_DATA_HOME/applications/vt-harness-probe.desktop" <<'DESK'
+[Desktop Entry]
+Type=Application
+Name=Zz Harness Probe
+Exec=/bin/sh -c 'echo launched > $WORK/x11-launch-marker'
+Categories=Utility;
+DESK
+sed -i "s|\$WORK|$WORK|g" "$XDG_DATA_HOME/applications/vt-harness-probe.desktop"
+cat > "$XDG_DATA_HOME/applications/vt-harness-term.desktop" <<'DESK'
+[Desktop Entry]
+Type=Application
+Name=Zz Harness Terminal
+Exec=/bin/true
+Terminal=true
+Categories=System;
+DESK
+rm -f "$WORK/x11-launch-marker"
+# never execute host autostart entries (/etc/xdg/autostart — e.g. the
+# machine's real PipeWire/wireplumber) from inside a test session
+export VANTAGE_SESSION_NO_SYSTEM_AUTOSTART=1
 export XDG_CONFIG_DIRS=""
 chmod 700 "$XDG_RUNTIME_DIR"
 
@@ -327,6 +358,25 @@ else
   bad "no menu screenshot"
 fi
 kill $MPID 2>/dev/null; wait $MPID 2>/dev/null
+
+# --- application LAUNCH from the menu: the menu is still open (no
+# --- FocusOut close in the launcher) — drive the REAL input path:
+# --- category row 0 (Accessories, where the probe sorts alone), then
+# --- application row 0 — the marker file proves the full X11 launch
+# --- chain (row hit-test → .desktop Exec → spawn) end to end
+echo "== harness-xvfb: application launch from the Programs menu =="
+"$(tc vt-x11-testclient)" --no-windows --seconds 0 \
+    --clicks "80,89;300,89" > "$WORK/clicks.log" 2>&1
+LAUNCHED=""
+for i in $(seq 1 30); do
+  [ -f "$WORK/x11-launch-marker" ] && { LAUNCHED=1; break; }
+  sleep 0.1
+done
+if [ -n "$LAUNCHED" ] && grep -q "launched" "$WORK/x11-launch-marker"; then
+  ok "application LAUNCHED from the Programs menu (marker file)"
+else
+  bad "application did not launch from the X11 menu"
+fi
 
 [ $? -eq 0 ] && ok "screenshot shows managed windows + painted desktop" \
   || bad "screenshot pixel check failed"

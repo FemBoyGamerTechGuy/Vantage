@@ -106,11 +106,30 @@ static Window make_window(Display *d, const char *title, int x, int y,
     return win;
 }
 
+/* read the EWMH _NET_ACTIVE_WINDOW property from the root window */
+static Window active_window_of(Display *d, Window root, Atom net_active) {
+    Atom actual;
+    int fmt;
+    unsigned long n, bytes;
+    unsigned char *data = NULL;
+    Window active = None;
+    if (XGetWindowProperty(d, root, net_active, 0, 1, False,
+                           AnyPropertyType, &actual, &fmt, &n,
+                           &bytes,
+                           &data) == Success && data && n >= 1) {
+        active = *(Window *)(void *)data;
+        XFree(data);
+    }
+    return active;
+}
+
 int main(int argc, char **argv) {
     int seconds = 4;
     const char *shot = NULL;
     const char *title = "Vantage Test";
     const char *click = NULL;         /* "x,y" before the screenshot */
+    const char *clicks = NULL;        /* "x,y;x,y;…" multi-step UI driving */
+    bool no_windows = false;          /* pure input driver: map nothing */
     bool ewmh_only = false;
     bool cursor_only = false;
     bool frame_only = false;
@@ -120,6 +139,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--screenshot") && i + 1 < argc) shot = argv[++i];
         else if (!strcmp(argv[i], "--title") && i + 1 < argc) title = argv[++i];
         else if (!strcmp(argv[i], "--click") && i + 1 < argc) click = argv[++i];
+        else if (!strcmp(argv[i], "--clicks") && i + 1 < argc) clicks = argv[++i];
+        else if (!strcmp(argv[i], "--no-windows")) no_windows = true;
         else if (!strcmp(argv[i], "--ewmh-probe")) ewmh_only = true;
         else if (!strcmp(argv[i], "--cursor-probe")) cursor_only = true;
         else if (!strcmp(argv[i], "--frame-probe")) frame_only = true;
@@ -261,29 +282,13 @@ int main(int argc, char **argv) {
         XFlush(d);
         msleep(400);
 
-        Window active_of(void) {
-            Atom actual;
-            int fmt;
-            unsigned long n, bytes;
-            unsigned char *data = NULL;
-            Window active = None;
-            if (XGetWindowProperty(d, root, net_active, 0, 1, False,
-                                   AnyPropertyType, &actual, &fmt, &n,
-                                   &bytes,
-                                   &data) == Success && data && n >= 1) {
-                active = *(Window *)(void *)data;
-                XFree(data);
-            }
-            return active;
-        }
-
-        Window act_a = active_of();
+        Window act_a = active_window_of(d, root, net_active);
 
         /* HOVER window B: warp the pointer there WITHOUT clicking */
         XWarpPointer(d, None, b, 0, 0, 0, 0, 40, 40);
         XFlush(d);
         msleep(500);
-        Window act_hover = active_of();
+        Window act_hover = active_window_of(d, root, net_active);
         bool hover_ok = (act_hover == act_a);
         printf("active-a=0x%lx active-hover=0x%lx hover-steals=%s\n",
                (unsigned long)act_a, (unsigned long)act_hover,
@@ -298,7 +303,7 @@ int main(int argc, char **argv) {
             XTestFakeButtonEvent(d, 1, False, CurrentTime);
             XFlush(d);
             msleep(400);
-            Window act_click = active_of();
+            Window act_click = active_window_of(d, root, net_active);
             click_ok = (act_click == b);
         }
 #endif
@@ -310,13 +315,16 @@ int main(int argc, char **argv) {
         return (hover_ok && click_ok) ? 0 : 1;
     }
 
-    Window w1 = make_window(d, title, 100, 100, 400, 300, 0x3a5f9a);
-    Window w2 = make_window(d, "Second Window", 500, 300, 300, 220, 0x9a3a5f);
-    XMapWindow(d, w1);
-    XMapWindow(d, w2);
-    XFlush(d);
-    printf("mapped 0x%lx 0x%lx\n", (unsigned long)w1, (unsigned long)w2);
-    fflush(stdout);   /* harness polls this line while we are alive */
+    Window w1 = None, w2 = None;
+    if (!no_windows) {
+        w1 = make_window(d, title, 100, 100, 400, 300, 0x3a5f9a);
+        w2 = make_window(d, "Second Window", 500, 300, 300, 220, 0x9a3a5f);
+        XMapWindow(d, w1);
+        XMapWindow(d, w2);
+        XFlush(d);
+        printf("mapped 0x%lx 0x%lx\n", (unsigned long)w1, (unsigned long)w2);
+        fflush(stdout);   /* harness polls this line while we are alive */
+    }
 
     for (int t = 0; t < seconds * 10; t++) {
         while (XPending(d)) {
@@ -352,6 +360,35 @@ int main(int argc, char **argv) {
             /* the panel reacts asynchronously (separate process):
              * give it time to open the menu before the screenshot */
             msleep(500);
+        }
+    }
+
+    if (clicks) {
+        /* multiple XTest clicks "x,y;x,y;…" — drives multi-step UI
+         * (menu → category row → application row) through the REAL
+         * input path. Usually combined with --no-windows so this
+         * client maps nothing of its own and disturbs no focus. */
+        int evb = 0, errb = 0, vmaj = 0, vmin = 0;
+        if (XTestQueryExtension(d, &evb, &errb, &vmaj, &vmin)) {
+            char *dup = strdup(clicks);
+            char *save = NULL;
+            for (char *tok = strtok_r(dup, ";", &save); tok;
+                 tok = strtok_r(NULL, ";", &save)) {
+                int cx = 0, cy = 0;
+                if (sscanf(tok, "%d,%d", &cx, &cy) == 2) {
+                    XTestFakeMotionEvent(d, -1, cx, cy, CurrentTime);
+                    XSync(d, False);
+                    XTestFakeButtonEvent(d, 1, True, CurrentTime);
+                    XTestFakeButtonEvent(d, 1, False, CurrentTime);
+                    XSync(d, False);
+                    printf("clicked %d,%d\n", cx, cy);
+                    fflush(stdout);
+                    msleep(400);   /* the panel reacts between steps */
+                }
+            }
+            free(dup);
+        } else {
+            fprintf(stderr, "XTest extension unavailable\n");
         }
     }
 

@@ -137,12 +137,21 @@ const char *vt_session_get_env(vt_session_t *s, const char *k) {
 /* Parse XDG autostart .desktop files for Exec= lines */
 int vt_session_autostart_load(vt_session_t *s) {
     if (!s) return VT_ERR_INVAL;
-    /* Standard autostart locations */
+    /* VANTAGE_SESSION_NO_SYSTEM_AUTOSTART=1 (test/CI isolation): load
+     * ONLY the user's config autostart; the resource default and
+     * /etc/xdg/autostart are skipped so a test session can never spawn
+     * host daemons (e.g. the machine's real PipeWire) or depend on what
+     * the host has installed. */
+    bool no_system = getenv("VANTAGE_SESSION_NO_SYSTEM_AUTOSTART") != NULL;
+    if (no_system)
+        vt_logi("session: system autostart skipped "
+                "(VANTAGE_SESSION_NO_SYSTEM_AUTOSTART)");
     char *res_autostart = vt_paths_resource_find("autostart");
     const char *dirs[] = {
         vt_strprintf("%s/autostart", vt_config_dir()),
-        res_autostart ? res_autostart : VT_DATADIR "/autostart",
-        "/etc/xdg/autostart",
+        no_system ? NULL : (res_autostart ? res_autostart
+                                          : VT_DATADIR "/autostart"),
+        no_system ? NULL : "/etc/xdg/autostart",
         NULL,
     };
     for (int d = 0; dirs[d]; d++) {

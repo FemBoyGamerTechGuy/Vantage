@@ -88,7 +88,36 @@ Terminal=true
 Categories=System;
 DESK
 export XDG_DATA_HOME="$WORK/data"
-rm -f "$WORK/wl-launch-marker"
+# XDG_DATA_DIRS must be ISOLATED as well: when unset, vt-apps falls
+# back to /usr/local/share:/usr/share, so host-installed applications
+# (LibreOffice, xfce4-screenshooter, …) leak into the Programs menu and
+# "app row 0" depends on the machine — the launch click below then hits
+# a REAL app instead of the probe (observed on a real-hardware box:
+# the click launched the host's screenshot tool and the marker never
+# appeared). An empty XDG_DATA_DIRS dir keeps the DB deterministic:
+# the probe is the only Utility entry on every machine.
+mkdir -p "$WORK/data-dirs"
+export XDG_DATA_DIRS="$WORK/data-dirs"
+# Same isolation for the full-session phase below: the session manager
+# reads XDG autostart from XDG_CONFIG_HOME (user) + resource dir +
+# /etc/xdg/autostart (host). A controlled probe entry keeps REAL
+# coverage of the autostart path, while VANTAGE_SESSION_NO_SYSTEM_AUTOSTART
+# guarantees the test can never spawn host daemons (the machine's real
+# PipeWire/wireplumber fought the harness on the reporting machine) nor
+# read the host's real vantage.conf / gtk settings.
+export XDG_CONFIG_HOME="$WORK/config"
+# XDG autostart spec: user entries live in $XDG_CONFIG_HOME/autostart
+# (no application-name subdir — that is only for vantage.conf)
+mkdir -p "$XDG_CONFIG_HOME/autostart"
+cat > "$XDG_CONFIG_HOME/autostart/vt-harness-autostart.desktop" <<'DESK'
+[Desktop Entry]
+Type=Application
+Name=Vantage Harness Autostart
+Exec=/bin/sh -c 'echo autostarted > $WORK/wl-autostart-marker'
+DESK
+sed -i "s|\$WORK|$WORK|g" "$XDG_CONFIG_HOME/autostart/vt-harness-autostart.desktop"
+export VANTAGE_SESSION_NO_SYSTEM_AUTOSTART=1
+rm -f "$WORK/wl-launch-marker" "$WORK/wl-autostart-marker"
 
 # (XDG_DATA_HOME must be exported BEFORE the compositor starts: the
 # process environment is fixed at exec time, and the panel reads it
@@ -176,10 +205,44 @@ sleep 0.4     # allow a few compositor paint cycles
 
 grep -q "^connected" "$CLIENT_LOG" && ok "client connected to $SOCKET" \
   || bad "client failed to connect: $(cat "$CLIENT_LOG")"
+# wl_keyboard keymap: the test client binds wl_seat + wl_keyboard like
+# a REAL toolkit app and validates the keymap event (fd >= 0, size > 0,
+# mmap-able xkb text). A compositor that passes fd -1 here kills the
+# client connection with a libwayland marshal error — every launched
+# app would die on connect (the exact real-hardware failure).
+grep -q "^keymap ok" "$CLIENT_LOG" \
+  && ok "wl_keyboard keymap received and valid (fd/size/mmap/xkb)" \
+  || bad "wl_keyboard.keymap missing or invalid — real apps would die on connect"
 grep -q "^configured" "$CLIENT_LOG" && ok "xdg_surface configure received" \
   || bad "no xdg configure"
 grep -q "^committed" "$CLIENT_LOG" && ok "wl_shm buffer committed" \
   || bad "no buffer commit"
+
+# --- SEQUENTIAL keyboard clients: the full client above bound
+# --- wl_keyboard first; these keymap-only clients connect one after
+# --- another and every one of them must receive a VALID keymap. This
+# --- is the real-hardware failure class (second+ app died on connect
+# --- with "error marshalling arguments for keymap: dup failed").
+KM_FAIL=0
+for k in 1 2 3; do
+  KLOG="$WORK/keymap-$k.log"
+  timeout 8 "$(tc vt-wayland-testclient)" --keymap-only > "$KLOG" 2>&1
+  KRC=$?
+  if [ $KRC -eq 0 ] && grep -q "^keymap ok" "$KLOG"; then :; else
+    KM_FAIL=$((KM_FAIL+1))
+  fi
+done
+[ "$KM_FAIL" -eq 0 ] \
+  && ok "3 sequential keyboard clients each got a valid keymap" \
+  || bad "keyboard client #$KM_FAIL did not receive a valid keymap"
+# the compositor log must be free of libwayland marshal/connection
+# errors — a keymap fd bug shows up here verbatim
+if grep -q "error marshalling arguments\|error in client communication" \
+     "$WORK/wm.log"; then
+  bad "libwayland marshal/client errors in the compositor log"
+else
+  ok "no libwayland marshal/client errors in the log"
+fi
 
 # ------------------------------------------------- window-list mirror
 # The xdg window must appear in the WM model (vantage-remote list works
@@ -450,6 +513,24 @@ grep -q "display backend: Wayland" "$SESS_LOG" \
   && ok "session reported the Wayland backend" \
   || bad "session did not report the Wayland backend"
 
+# ------------------------------------------------- autostart (isolated)
+# The session must run the CONTROLLED user autostart entry (marker
+# file) — real coverage of the autostart path — while the system
+# autostart is provably isolated (skipped, host daemons untouched).
+ASTARTED=""
+for i in $(seq 1 30); do
+  [ -f "$WORK/wl-autostart-marker" ] && { ASTARTED=1; break; }
+  sleep 0.1
+done
+if [ -n "$ASTARTED" ] && grep -q "autostarted" "$WORK/wl-autostart-marker"; then
+  ok "session autostart entry ran (marker file)"
+else
+  bad "session autostart entry did not run"
+fi
+grep -qF "session: system autostart skipped" "$SESS_LOG" \
+  && ok "system autostart isolated (no /etc/xdg entries executed)" \
+  || bad "system autostart was not isolated"
+
 if [ -n "$SOCK2" ] && [ -S "$XDG_RUNTIME_DIR/$SOCK2" ]; then
   CLIENT_LOG2="$WORK/client-session.log"
   timeout 10 env WAYLAND_DISPLAY="$SOCK2" \
@@ -463,6 +544,9 @@ if [ -n "$SOCK2" ] && [ -S "$XDG_RUNTIME_DIR/$SOCK2" ]; then
   done
   [ -n "$COMMITTED2" ] && ok "xdg client committed under the full session" \
     || bad "client never committed under the session"
+  grep -q "^keymap ok" "$CLIENT_LOG2" \
+    && ok "wl_keyboard keymap valid under the full session" \
+    || bad "keymap missing/invalid under the session"
 
   # frame-dump check: SIGUSR1 goes to the WM child (it runs in its own
   # session after setsid, so signal it directly via its pid from the log)

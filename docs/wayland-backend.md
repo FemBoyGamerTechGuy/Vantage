@@ -138,9 +138,18 @@ scanout=auto        ; auto | gbm | dumb
 | `VANTAGE_WAYLAND_SCANOUT`  | `auto` (GBM, dumb fallback), `gbm`, `dumb`    |
 | `VANTAGE_WAYLAND_REQUIRE_KMS` | `1` = fail hard instead of the headless fallback |
 | `VANTAGE_WAYLAND_FORCE_HEADLESS` | `1` = skip seat/vt/drm outright — deterministic tests/CI that never touch the host GPU/VT (what `meson test` uses) |
+| `VANTAGE_SESSION_NO_SYSTEM_AUTOSTART` | `1` = the session runs only the user's XDG autostart entries (tests/CI: never spawn host daemons from `/etc/xdg/autostart`) |
 | `VT_SEAT_BACKEND`          | force the seat backend (see table above)       |
 | `XCURSOR_THEME` / `XCURSOR_SIZE` | cursor theme for the compositor's cursor |
 | `XKB_DEFAULT_*`            | keyboard layout (libxkbcommon defaults)        |
+
+The xkb keymap is compiled **always** — including forced-headless runs.
+`xkb_keymap_new_from_names` needs no input devices, and headless clients
+(bind `wl_keyboard` too) must still receive a real `wl_keyboard.keymap`
+event: a compositor that passes `fd -1` there produces a libwayland
+marshal error (`dup: EBADF`) that kills the client connection — every
+launched app would die on connect. The test client validates the keymap
+exactly like a toolkit does (fd ≥ 0, size > 0, mmap-able xkb text).
 
 ### `meson test` runs forced-headless (by design)
 
