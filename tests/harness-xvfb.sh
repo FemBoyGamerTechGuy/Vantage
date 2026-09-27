@@ -193,6 +193,16 @@ export VANTAGE_SESSION_NO_SYSTEM_AUTOSTART=1
 export XDG_CONFIG_DIRS=""
 chmod 700 "$XDG_RUNTIME_DIR"
 
+# --- GTK determinism on REAL machines ---------------------------------
+# Same isolation as harness-wayland: the developer desktop's session
+# environment must not leak into the GTK4 panel (theme/dark-mode via
+# GTK_THEME pin, GApplication registration + portal settings via the
+# session bus, HiDPI factors via GDK_SCALE).
+export GTK_THEME=Adwaita
+unset GDK_SCALE GDK_DPI_SCALE GTK_PATH GTK_MODULES GTK_USE_PORTAL \
+      DBUS_SESSION_BUS_ADDRESS DBUS_STARTER_BUS_TYPE \
+      DBUS_STARTER_ADDRESS GIO_MODULE_DIR
+
 # Isolated config; backend selection comes from the --x11 flag (the
 # config default, backend=auto, would resolve the same way here because
 # $DISPLAY is set).
@@ -260,7 +270,22 @@ grep -q "X server:" "$WORK/session.log" \
   && ok "session identified the X server implementation (informational)" \
   || bad "no X server identification in the log"
 
-sleep 1     # let the WM/panel/desktop settle and paint
+sleep 1     # let the WM/desktop settle and paint
+# the PANEL must be up too: its "ready" line lands in the session log
+# (children's stderr is merged there). A fixed sleep races GTK's
+# startup on fast machines — poll for the marker instead, so the
+# pixel checks below always photograph a painted panel.
+PANEL_READY_X=""
+for i in $(seq 1 100); do
+  grep -q "vantage-panel: ready" "$WORK/session.log" 2>/dev/null \
+    && { PANEL_READY_X=1; break; }
+  kill -0 "$SESS_PID" 2>/dev/null || break
+  sleep 0.1
+done
+[ -n "$PANEL_READY_X" ] \
+  && ok "GTK4 panel client started (EWMH dock, struts reserved)" \
+  || bad "panel never reached ready: $(tail -3 "$WORK/session.log")"
+sleep 0.5   # first frame + strut settle
 
 # ------------------------------------------------------ cursor checks
 echo "== harness-xvfb: visible root cursor =="

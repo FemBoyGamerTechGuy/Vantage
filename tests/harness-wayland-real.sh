@@ -22,7 +22,7 @@
 # What it verifies when it runs:
 #   seat acquired, VT activated, DRM master taken, CRTC mode-set, scanout
 #   chain live, input devices open, xdg-shell client + real pixels + the
-#   compositor panel, clean SIGINT unwind (CRTC restore, VT text, exit 0).
+#   docked GTK4 panel, clean SIGINT unwind (CRTC restore, VT text, exit 0).
 #
 # Usage: harness-wayland-real.sh [build-dir]
 
@@ -36,13 +36,23 @@ BUILD="${1:-${VT_BUILD_DIR:-}}"
 if [ -n "$BUILD" ] && [ -x "$BUILD/src/tools/vantage-wm" ]; then
   BIN="$BUILD/src/tools"
   TST="$BUILD/tests"
+  # the panel is an independent subproject — its binary lives under
+  # <builddir>/subprojects/panel (BIN is <builddir>/src/tools)
+  [ -x "$BUILD/subprojects/panel/vantage-panel" ] \
+    || { echo "vantage-panel not built (subprojects/panel)"; exit 77; }
 else
   BIN=""; TST=""
-  for b in vantage-wm vantage-diagnostics; do
+  for b in vantage-wm vantage-diagnostics vantage-panel; do
     command -v "$b" >/dev/null 2>&1 || { echo "missing $b in PATH"; exit 77; }
   done
 fi
-vb() { if [ -n "$BIN" ]; then echo "$BIN/$1"; else echo "$1"; fi; }
+vb() {
+  if [ -z "$BIN" ]; then echo "$1"; return; fi
+  if [ -x "$BIN/$1" ]; then echo "$BIN/$1"; return; fi
+  local pb="${BIN%/src/tools}/subprojects/panel/$1"
+  if [ -x "$pb" ]; then echo "$pb"; return; fi
+  echo "$1"
+}
 tc() { if [ -n "$TST" ]; then echo "$TST/$1"; else echo "$1"; fi; }
 [ -x "$(tc vt-wayland-testclient)" ] || { echo "vt-wayland-testclient not built"; exit 77; }
 
@@ -144,6 +154,23 @@ grep -E "\[wayland\] renderer: ok" "$WORK/wm.log" | head -1 | grep -qiE "llvmpip
 
 # --- socket + xdg client --------------------------------------------------
 SOCKET=$(grep -o 'WAYLAND_DISPLAY=[a-z0-9-]*' "$WORK/wm.log" | head -1 | cut -d= -f2)
+# --- the GTK4 panel client (the desktop shell's real panel) ----------------
+# The panel is a CLIENT now (subprojects/panel) — the compositor has
+# no built-in panel anymore. Dock it through layer-shell so the pixel
+# check below verifies the REAL docked panel on the REAL scanout. The
+# GTK environment is pinned for the same determinism reasons as
+# harness-wayland (a TTY shell can still carry a session bus or
+# HiDPI factors in its exported environment).
+export GTK_THEME=Adwaita
+unset GDK_SCALE GDK_DPI_SCALE GTK_PATH GTK_MODULES GTK_USE_PORTAL \
+      DBUS_SESSION_BUS_ADDRESS DBUS_STARTER_BUS_TYPE \
+      DBUS_STARTER_ADDRESS GIO_MODULE_DIR
+PANEL_LOG="$WORK/panel.log"
+: > "$PANEL_LOG"
+if [ -n "$SOCKET" ] && [ -S "$XDG_RUNTIME_DIR/$SOCKET" ]; then
+  WAYLAND_DISPLAY="$SOCKET" "$(vb vantage-panel)" > "$PANEL_LOG" 2>&1 &
+  PANEL_PID=$!
+fi
 CLIENT_LOG="$WORK/client.log"
 if [ -n "$SOCKET" ] && [ -S "$XDG_RUNTIME_DIR/$SOCKET" ]; then
     ok "socket live ($SOCKET)"
@@ -163,6 +190,19 @@ else
 fi
 
 # --- pixels: the panel + client color on the REAL framebuffer ------------
+# wait for the panel's layer surface to actually MAP (its first frame)
+for i in $(seq 1 150); do
+  grep -q "layer surface 'vantage-panel' mapped" "$WORK/wm.log" 2>/dev/null && break
+  [ -n "${PANEL_PID:-}" ] && { kill -0 "$PANEL_PID" 2>/dev/null || break; }
+  kill -0 "$WM_PID" 2>/dev/null || break
+  sleep 0.1
+done
+if grep -q "layer surface 'vantage-panel' mapped" "$WORK/wm.log" 2>/dev/null; then
+  ok "panel docked on the REAL output (layer surface mapped)"
+else
+  bad "panel never docked: $(tail -3 "$PANEL_LOG" 2>/dev/null)"
+fi
+sleep 0.5
 kill -USR1 "$WM_PID" 2>/dev/null
 for i in $(seq 1 20); do [ -s /tmp/vantage-wayland.ppm ] && break; sleep 0.05; done
 if [ -s /tmp/vantage-wayland.ppm ]; then
@@ -186,12 +226,19 @@ pos += 1
 w, h, _ = vals
 pix = data[pos:pos + w*h*3]
 hits = pix.count(bytes((0x5a, 0x9a, 0x3a)))
-top = pix[:w*32*3]
-panel_bg = top.count(bytes((0x23, 0x26, 0x2b)))
+# the GTK panel's bar: dark shell background #16181c with the pager
+# cells' accent/slate fills — the compositor no longer draws any
+# panel of its own (the old 0x23262b flat bar was the deleted
+# compositor-side panel; this tier must verify the CLIENT panel)
+top = pix[:w*58*3]
+panel_bg = sum(1 for k in range(0, len(top), 3)
+               if top[k:k+3] in (bytes((0x16, 0x18, 0x1c)),
+                                 bytes((0x47, 0x75, 0xc7)),
+                                 bytes((0x2e, 0x30, 0x38))))
 print(f"frame: {w}x{h}, client-color={hits}, panel-bg={panel_bg}")
 sys.exit(0 if (hits > 1000 and panel_bg > w * 8) else 1)
 PYEOF
-    [ $? -eq 0 ] && ok "real pixels: client window + compositor panel present" \
+    [ $? -eq 0 ] && ok "real pixels: client window + docked panel present" \
         || bad "frame dump lacks client pixels/panel"
 else
     bad "no frame dump"
@@ -217,6 +264,17 @@ grep -q "KMS closed — original CRTC restored" "$WORK/wm.log" \
     && ok "original CRTC restored" || bad "CRTC not restored"
 grep -q "seat released — VT returned to text mode" "$WORK/wm.log" \
     && ok "VT returned to text mode" || bad "VT not returned to text"
+# the panel client must not outlive the compositor
+if [ -n "${PANEL_PID:-}" ]; then
+  kill -TERM "$PANEL_PID" 2>/dev/null
+  for i in $(seq 1 30); do
+    kill -0 "$PANEL_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -0 "$PANEL_PID" 2>/dev/null \
+    && bad "panel client survived the compositor shutdown" \
+    || ok "panel client exited with the compositor"
+fi
 
 echo
 echo "============================================"

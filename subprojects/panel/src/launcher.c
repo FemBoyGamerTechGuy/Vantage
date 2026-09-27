@@ -269,6 +269,10 @@ static void _on_search_changed(GtkEditable *e, gpointer user) {
 
 static void _build_menu(void) {
     L.menu = gtk_popover_new();
+    /* the shell's own identity: the vantage-menu CSS class pins the
+     * popover's palette and row geometry so the menu looks (and
+     * hit-tests) the same under every GTK theme — see main.c */
+    gtk_widget_add_css_class(L.menu, "vantage-menu");
     gtk_widget_set_size_request(L.menu, 560, 420);
 
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);

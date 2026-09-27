@@ -32,6 +32,19 @@ XFCE panel talks to xfwm4 through EWMH/X11 instead of linking it.
 * **X11**: `_NET_WM_WINDOW_TYPE_DOCK` + `_NET_WM_STATE_ABOVE` +
   `_NET_WM_STRUT_PARTIAL` — plain EWMH.
 
+## Visual identity
+
+The panel carries its OWN look (an application-priority CSS provider):
+the dark bar, the light text and — since 0.3.1 — the ENTIRE Programs
+menu (sheet, text, search entry, row geometry) are pinned in CSS. The
+user's GTK theme can still restyle every other app, but the desktop
+shell always looks like itself — the menu's row hit boxes are
+theme-independent too, which is what makes launcher automation (the
+integration harnesses) deterministic on every machine. Popovers open
+with no fade-in: a desktop shell wants instant menus, and
+frame-callback-driven animations are not reliable timing on software
+renderers.
+
 ## Building
 
 Standalone:

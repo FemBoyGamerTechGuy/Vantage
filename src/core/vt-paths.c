@@ -232,10 +232,14 @@ static void _resolve(void)
         vt_free(exerel.label);
     }
 
-    /* 3. XDG data dirs: $XDG_DATA_HOME, then $XDG_DATA_DIRS */
-    _roots_push(&roots, &n,
-                vt_strprintf("%s/vantage", vt_data_dir_user()),
-                false, "XDG data home");
+    /* 3. XDG data dirs: $XDG_DATA_HOME, then $XDG_DATA_DIRS.
+     * (the pushed strings are COPIED by _roots_push — the temporaries
+     * must be freed, or every process leaks them at exit) */
+    {
+        char *home = vt_strprintf("%s/vantage", vt_data_dir_user());
+        _roots_push(&roots, &n, home, false, "XDG data home");
+        vt_free(home);
+    }
     const char *dirs = getenv("XDG_DATA_DIRS");
     if (!dirs || !*dirs) dirs = "/usr/local/share:/usr/share";
     char *dcopy = vt_strdup(dirs);

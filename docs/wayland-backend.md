@@ -169,14 +169,20 @@ launch (method 1 above).
 
 1. **Headless protocol** — `harness-wayland.sh` (runs in `meson test`):
    socket, xdg-shell, pixels, panel, IPC, logout against the in-memory
-   framebuffer.
+   framebuffer. The harness is machine-independent by construction: it
+   pins `GTK_THEME`, drops the host's session bus / `GDK_SCALE` / other
+   desktop-session variables before starting the GTK4 panel, waits for
+   the panel's layer surface to MAP (a process being alive is not
+   pixels on screen), and re-dumps frames while polling content checks
+   — a fast or themed host desktop cannot change its verdicts.
 2. **Real DRM/VT session** — `harness-wayland-real.sh`
    (`meson test` runs it but it SKIPS unless `/dev/dri` exists and the
    run happens on a console): boots the compositor with
-   `VANTAGE_WAYLAND_REQUIRE_KMS=1` — no headless fallback allowed — and
-   asserts the real seat/VT/master/CRTC/scanout/input stages, xdg client
-   pixels on the real output, the compositor panel, and a clean SIGINT
-   unwind (CRTC restored, VT text, exit 0). On the target hardware:
+   `VANTAGE_WAYLAND_REQUIRE_KMS=1` — no headless fallback allowed —
+   docks the GTK4 panel client through layer-shell, and asserts the
+   real seat/VT/master/CRTC/scanout/input stages, xdg client pixels on
+   the real output, the docked panel, and a clean SIGINT unwind (CRTC
+   restored, VT text, exit 0). On the target hardware:
    `./build test` from a TTY, or
    `VANTAGE_WAYLAND_SELFTEST=1 tests/harness-wayland-real.sh`.
 3. **GPU/NVIDIA reporting** — `vantage-diagnostics --gpu`: vendor,

@@ -75,6 +75,21 @@ chmod 700 "$XDG_RUNTIME_DIR"
 
 # The Wayland backend refuses to nest: make sure neither variable is set
 unset DISPLAY WAYLAND_DISPLAY
+# --- GTK determinism on REAL machines ---------------------------------
+# The harness runs on developer desktops where a full session
+# environment exists. Left as-is, the host leaks into the GTK4 panel:
+#   * the user's GTK theme / dark-mode -> popover colors and row
+#     geometry follow the machine (the panel's own CSS pins its
+#     visual identity; GTK_THEME locks the base theme as well)
+#   * DBUS_SESSION_BUS_ADDRESS -> the panel registers on the USER's
+#     session bus (GApplication single-instance: a leftover panel
+#     from an earlier run would steal activation) and reads portal
+#     settings
+#   * GDK_SCALE / GDK_DPI_SCALE (HiDPI setups) -> 2x panel geometry
+export GTK_THEME=Adwaita
+unset GDK_SCALE GDK_DPI_SCALE GTK_PATH GTK_MODULES GTK_USE_PORTAL \
+      DBUS_SESSION_BUS_ADDRESS DBUS_STARTER_BUS_TYPE \
+      DBUS_STARTER_ADDRESS GIO_MODULE_DIR
 # Deterministic cursor: force the built-in 16x16 arrow so the sprite
 # pixel assertions below are exact on every machine (theme-independent)
 export VANTAGE_WL_CURSOR=builtin
@@ -268,8 +283,25 @@ for i in $(seq 1 150); do
 done
 [ -n "$PANEL_READY" ] && ok "GTK4 panel client started (layer-shell dock)" \
   || bad "panel client did not reach ready: $(tail -3 "$PANEL_LOG")"
-# let it map + draw its first frame (layer configure/ack/commit dance)
-sleep 2
+# The READY line only means the process is up — its layer surface must
+# actually MAP before any pixel is on screen. GTK's first frame takes
+# a variable amount of time (CSS + icon theme + Pango fonts + the
+# layer configure/ack/commit round-trips); on a fast machine a fixed
+# sleep can easily photograph an empty desktop instead of the panel
+# (observed on a real-hardware box: every panel pixel check failed
+# while the panel process was alive and healthy).
+PANEL_MAPPED=""
+for i in $(seq 1 150); do
+  grep -q "layer surface 'vantage-panel' mapped" "$WORK/wm.log" 2>/dev/null \
+    && { PANEL_MAPPED=1; break; }
+  kill -0 "$PANEL_PID" 2>/dev/null || break
+  kill -0 "$WM_PID" 2>/dev/null || break
+  sleep 0.1
+done
+[ -n "$PANEL_MAPPED" ] && ok "panel layer surface mapped (pixels on screen)" \
+  || bad "panel surface never mapped: $(tail -5 "$PANEL_LOG")"
+# first frame committed at map time; one paint cycle settles the bar
+sleep 0.5
 
 # the desktop stage (panel + first frame) completes AFTER the socket
 # appears — wait for its marker (bounded) before asserting the trace
@@ -423,9 +455,17 @@ hits = pix.count(target)
 def pnp(x, y):
     i = (y*w+x)*3
     return (pix[i], pix[i+1], pix[i+2])
-panel_cells = sum(1 for y in range(5, 39) for x in range(0, w, 2)
+# panel assertions: the GTK4 panel docks at the top — its dark bar +
+# light icon/text pixels must cover a real strip; old placeholder
+# squares must be GONE. Panel presence is asserted through its
+# STRUCTURAL signature: the pager cells (accent current-desktop cell
+# + slate other cells — colors used nowhere else) and the light bar
+# text. The band is deliberately TALL (rows 4..54): the bar's natural
+# height follows the machine's font metrics (44..52px measured), so a
+# fixed 45-row window can photograph past the cells on big fonts.
+panel_cells = sum(1 for y in range(4, 54) for x in range(0, w, 2)
                   if pnp(x, y) in ((0x47, 0x75, 0xc7), (0x2e, 0x30, 0x38)))
-top = pix[:w*46*3]
+top = pix[:w*58*3]
 light = sum(1 for i in range(0, len(top), 3)
             if top[i] >= 0x90 and top[i+1] >= 0x90 and top[i+2] >= 0x90)
 placeholder_red = pix.count(bytes((0xe0, 0x5a, 0x5a)))
@@ -457,7 +497,7 @@ placeholders_gone = placeholder_red == 0 and placeholder_green == 0
 sys.exit(0 if (hits > 1000 and panel_ok and placeholders_gone and
                grad_top_ok and grad_bot_ok and grad_diff) else 1)
 PYEOF
-  [ $? -eq 0 ] && ok "client pixels + REAL compositor panel in frame dump" \
+  [ $? -eq 0 ] && ok "client pixels + docked panel in frame dump" \
     || bad "frame dump check failed (pixels/panel/placeholders/background)"
 else
   bad "no frame dump at /tmp/vantage-wayland.ppm"
@@ -567,14 +607,19 @@ else
 fi
 
 # --- Programs menu: click the Programs button, verify the menu opens
-# --- (popover: dark translucent backdrop + light text/icons — font-
-# --- independent light-pixel counting below the bar)
+# --- (popover: the shell's own pinned dark sheet + light text/icons —
+# --- font-independent light-pixel counting below the bar). The menu's
+# --- content arrives over several composited frames (async icon
+# --- loads + text layout), so the check POLLS fresh frame dumps
+# --- instead of photographing one arbitrary instant.
 ti "click 60,22"
-sleep 1.2
-rm -f /tmp/vantage-wayland.ppm
-kill -USR1 "$WM_PID" 2>/dev/null
-wait_ppm
-if [ -s /tmp/vantage-wayland.ppm ]; then
+MENU_OK=""
+for try in 1 2 3 4 5 6; do
+  sleep 0.5
+  rm -f /tmp/vantage-wayland.ppm
+  kill -USR1 "$WM_PID" 2>/dev/null
+  wait_ppm || continue
+  [ -s /tmp/vantage-wayland.ppm ] || continue
   python3 - <<'PYEOF3'
 import sys
 with open('/tmp/vantage-wayland.ppm','rb') as f:
@@ -588,11 +633,14 @@ while len(vals) < 3:
 pos += 1
 w, h, _ = vals
 pix = data[pos:pos + w*h*3]
-# The GTK popover spans ~560px below the bar: dark translucent content.
-# Verify (a) the menu area differs from the bare gradient wallpaper,
-# (b) light text/icons are visibly rendered (font-independent: any
-# antialiased text produces mid-bright pixels), (c) the probe's icon
-# (solid 0xc04080 PNG from the isolated icon theme) is rendered.
+# The popover spans ~560px below the bar: the shell's pinned dark
+# sheet + light text. Verify (a) the menu area differs from the bare
+# gradient wallpaper, (b) light text/icons are visibly rendered
+# (font-independent: any antialiased text produces mid-bright pixels),
+# (c) the probe's icon (solid 0xc04080 PNG from the isolated icon
+# theme) is rendered — counted with per-channel tolerance, because
+# GTK resamples the 24px fixture down to the row's 22px with
+# filtering (exact-color counting finds only the interior).
 def wpdiff(x, y):
     i = (y*w+x)*3
     c = (pix[i], pix[i+1], pix[i+2])
@@ -608,21 +656,25 @@ for i in range(0, len(menu), 3):
         light += 1
 area_px = sum(1 for y in range(50, 415, 3) for x in range(8, 560, 6)
               if wpdiff(x, y) > 20)
-icon_px = pix.count(bytes((0xc0, 0x40, 0x80)))
+near = sum(1 for i in range(0, len(pix) - 2, 3)
+           if abs(pix[i] - 0xc0) <= 24 and abs(pix[i+1] - 0x40) <= 24
+           and abs(pix[i+2] - 0x80) <= 24)
+icon_px = near
 print(f"menu: area-diff={area_px} light-text={light} icon-px={icon_px}")
 sys.exit(0 if area_px > 4000 and light > 150 and icon_px > 100 else 1)
 PYEOF3
-  [ $? -eq 0 ] && ok "Programs menu opened (search bar + content visible)"     || bad "Programs menu did not render"
-else
-  bad "no frame dump for the menu check"
-fi
+  [ $? -eq 0 ] && { MENU_OK=1; break; }
+done
+[ -n "$MENU_OK" ] && ok "Programs menu opened (search bar + content visible)" \
+  || bad "Programs menu did not render"
 
 # --- application launch: the menu's DEFAULT category is Accessories,
 # --- where the probe sorts alone; its row sits at the top of the right
-# --- column. GTK margins vary per theme, so scan a few row heights
-# --- (clicks between rows land on empty list space and are harmless).
+# --- column. The rows' hit boxes are pinned by the panel's own CSS
+# --- (30px min-height); the scan still walks a few heights because a
+# --- miss only lands on empty list space (harmless).
 LAUNCHED=""
-for row_y in 120 140 160 180 200 220; do
+for row_y in 120 140 160 180 200 220 240 260; do
   [ -n "$LAUNCHED" ] && break
   ti "click 300,$row_y"
   for i in $(seq 1 8); do
@@ -637,11 +689,18 @@ else
 fi
 
 # --- menu must close after launching (click went through) ---
-sleep 0.5
-rm -f /tmp/vantage-wayland.ppm
-kill -USR1 "$WM_PID" 2>/dev/null
-wait_ppm
-if [ -s /tmp/vantage-wayland.ppm ]; then
+# The cursor is moved OUT of the scanned band first: it sits at the
+# last click position, dead inside the menu area, and a visible
+# cursor sprite (every real machine — the built-in arrow has 75 white
+# pixels) would read as "menu still open" even with the menu gone.
+ti "motion x=12 y=740"
+sleep 0.3
+MENU_CLOSED=""
+for try in 1 2 3 4; do
+  rm -f /tmp/vantage-wayland.ppm
+  kill -USR1 "$WM_PID" 2>/dev/null
+  wait_ppm || continue
+  [ -s /tmp/vantage-wayland.ppm ] || continue
   python3 - <<'PYEOF4'
 import sys
 with open('/tmp/vantage-wayland.ppm','rb') as f:
@@ -664,8 +723,11 @@ for i in range(0, len(menu), 3):
         light += 1
 sys.exit(0 if light < 40 else 1)
 PYEOF4
-  [ $? -eq 0 ] && ok "menu closed after launching the application"     || bad "menu stayed open after launching"
-fi
+  [ $? -eq 0 ] && { MENU_CLOSED=1; break; }
+  sleep 0.5
+done
+[ -n "$MENU_CLOSED" ] && ok "menu closed after launching the application" \
+  || bad "menu stayed open after launching"
 
 # ------------------------------------------------------ workspace PAGER
 # The panel's workspace switcher is a real PAGER: each cell shows that
@@ -693,13 +755,16 @@ for i in $(seq 1 60); do
   sleep 0.05
 done
 "$(vb vantage-remote)" ws 1 >/dev/null 2>&1
-# the panel polls the WM at 400 ms and re-renders on events; 0.9 s
-# guarantees the miniature state is committed before the dump
+# the panel polls the WM at 400 ms and re-renders on events; the dump
+# is retried because the miniature state must be committed to the
+# compositor framebuffer before it can be photographed
 sleep 0.9
-rm -f /tmp/vantage-wayland.ppm
-kill -USR1 "$WM_PID" 2>/dev/null
-wait_ppm
-if [ -s /tmp/vantage-wayland.ppm ]; then
+PAGER_OK=""
+for try in 1 2 3 4; do
+  rm -f /tmp/vantage-wayland.ppm
+  kill -USR1 "$WM_PID" 2>/dev/null
+  wait_ppm || continue
+  [ -s /tmp/vantage-wayland.ppm ] || continue
   python3 - <<'PYEOF5'
 import sys
 with open('/tmp/vantage-wayland.ppm','rb') as f:
@@ -713,28 +778,47 @@ while len(vals) < 3:
 pos += 1
 w, h, _ = vals
 pix = data[pos:pos + w*h*3]
-# the pager sits right of the Programs button: the cells occupy
-# rows 5..38 of the 45-row panel (measured), columns ~147..420.
-# Scan the CELL BAND as a real 2D region — the previous flat slice
-# bar[120*3:420*3] read exactly ONE row (row 4: pure background
-# between the bar margins and the cells), so every count came back
-# zero even with a perfect pager. Current cell background is the
-# accent (0.28,0.46,0.78 → ~#4775c7); the focused window miniature
-# is near-white, unfocused is mid-slate #9ea3ad.
-foc = unf = cell_bg = 0
-for y in range(5, 39):
-    for x in range(150, 431):
+# the pager sits right of the Programs button: the cells are 64x34
+# and vertically centered in the bar. The scan LOCATES the cells
+# first (their exact fill colors are used nowhere else) and then
+# counts the miniatures INSIDE that band only — the bar's height
+# and the pager's x-offset follow the machine's font metrics (the
+# Programs label width), and counting near-white pixels across the
+# whole bar would also add up the tasklist/applet glyphs, diluting
+# the focused/unfocused-miniature assertions. Current cell
+# background is the accent (0.28,0.46,0.78 → ~#4775c7), the other
+# cells are slate (#2e3038); the focused window miniature is
+# near-white, unfocused is mid-slate #9ea3ad.
+def is_cell_bg(r, g, b):
+    return (abs(r-0x47) <= 2 and abs(g-0x75) <= 2 and
+            abs(b-0xc7) <= 2) or (abs(r-0x2e) <= 2 and
+                                  abs(g-0x30) <= 2 and abs(b-0x38) <= 2)
+# column DENSITY filters the band: a real cell fills 30+ rows of its
+# columns, while stray antialiased text pixels elsewhere in the bar
+# match the slate tolerance for exactly one row
+from collections import Counter
+colcnt = Counter()
+for y in range(4, 54):
+    for x in range(0, w):
         i = (y*w + x)*3
-        r, g, b = pix[i], pix[i+1], pix[i+2]
-        if r >= 0xe0 and g >= 0xe0 and b >= 0xe0:
-            foc += 1
-        elif (abs(r-0x9e) <= 2 and abs(g-0xa3) <= 2 and
-              abs(b-0xad) <= 2):
-            unf += 1
-        elif (abs(r-0x47) <= 2 and abs(g-0x75) <= 2 and
-              abs(b-0xc7) <= 2):
-            cell_bg += 1
-print(f"pager: focused-mini px={foc} unfocused-mini px={unf} cell-bg={cell_bg}")
+        if is_cell_bg(pix[i], pix[i+1], pix[i+2]):
+            colcnt[x] += 1
+cols = sorted(x for x, c in colcnt.items() if c >= 20)
+cell_bg = sum(colcnt[x] for x in cols)
+foc = unf = 0
+if cols:
+    x0, x1 = cols[0], cols[-1]
+    for y in range(4, 54):
+        for x in range(x0, x1 + 1):
+            i = (y*w + x)*3
+            r, g, b = pix[i], pix[i+1], pix[i+2]
+            if r >= 0xe0 and g >= 0xe0 and b >= 0xe0:
+                foc += 1
+            elif (abs(r-0x9e) <= 2 and abs(g-0xa3) <= 2 and
+                  abs(b-0xad) <= 2):
+                unf += 1
+print(f"pager: cells at x={cols[0] if cols else '-'}..{cols[-1] if cols else '-'}"
+      f" focused-mini px={foc} unfocused-mini px={unf} cell-bg={cell_bg}")
 # all three must be present: the focused miniature on the current
 # desktop, the UNFOCUSED miniature on the other desktop's cell (pins
 # the WM_QUERY empty-flags parser: an empty flags column used to make
@@ -743,11 +827,11 @@ print(f"pager: focused-mini px={foc} unfocused-mini px={unf} cell-bg={cell_bg}")
 # cells used to freeze at their first snapshot)
 sys.exit(0 if (foc >= 6 and unf >= 4 and cell_bg >= 20) else 1)
 PYEOF5
-  [ $? -eq 0 ] && ok "pager draws real window miniatures per workspace" \
-    || bad "pager miniatures missing (focused/unfocused cells)"
-else
-  bad "no frame dump for the pager check"
-fi
+  [ $? -eq 0 ] && { PAGER_OK=1; break; }
+  sleep 0.5
+done
+[ -n "$PAGER_OK" ] && ok "pager draws real window miniatures per workspace" \
+  || bad "pager miniatures missing (focused/unfocused cells)"
 wait "$PG_A_PID" 2>/dev/null
 wait "$PG_B_PID" 2>/dev/null
 
@@ -896,6 +980,23 @@ else
   bad "Xwayland did not start under the session"
 fi
 
+# ------------------------------------------- session panel coverage
+# The session's panel must actually DOCK — not just spawn. On a fast
+# machine the harness used to log out before the panel's layer
+# surface ever mapped (observed: the whole session phase ran in
+# 0.4 s while the panel needs ~2 s to its first frame), so the
+# logout round-trip below never exercised a docked panel at all.
+SESS_PANEL_MAPPED=""
+for i in $(seq 1 100); do
+  grep -q "layer surface 'vantage-panel' mapped" "$SESS_LOG" 2>/dev/null \
+    && { SESS_PANEL_MAPPED=1; break; }
+  kill -0 "$SESS_PID" 2>/dev/null || break
+  sleep 0.1
+done
+[ -n "$SESS_PANEL_MAPPED" ] \
+  && ok "session panel docked through the compositor (layer surface mapped)" \
+  || bad "session panel never docked its layer surface"
+
 # ------------------------------------------------- logout round-trip
 # The panel's session menu sends WM_LOGOUT to the session IPC socket
 # (vp_session_action); vantage-remote logout drives the SAME socket.
@@ -931,12 +1032,12 @@ grep -q "policy: SIGTERM" "$SESS_LOG" \
 grep -q "session: exited" "$SESS_LOG" \
   && ok "session logged clean exit" || bad "no clean session-exit log line"
 sleep 0.3
-STRAGGLERS=$(pgrep -f "$(vb vantage-wm)|$(vb vantage-session)" 2>/dev/null | wc -l)
+STRAGGLERS=$(pgrep -f "$(vb vantage-wm)|$(vb vantage-session)|$(vb vantage-panel)" 2>/dev/null | wc -l)
 if [ "${STRAGGLERS:-0}" -eq 0 ]; then
   ok "no session/WM stragglers left"
 else
   bad "$STRAGGLERS process(es) survived session shutdown"
-  pgrep -af "$(vb vantage-wm)|$(vb vantage-session)" 2>/dev/null | head -5
+  pgrep -af "$(vb vantage-wm)|$(vb vantage-session)|$(vb vantage-panel)" 2>/dev/null | head -5
 fi
 
 rm -f /tmp/vantage-wayland.ppm
@@ -945,7 +1046,10 @@ echo "============================================"
 echo "harness-wayland: $PASS passed, $FAIL failed"
 echo "artifacts: $WORK"
 echo "============================================"
-[ "$FAIL" -eq 0 ] || { echo "---- wm.log ----"; cat "$WORK/wm.log"; \
+[ "$FAIL" -eq 0 ] || {
+  echo "---- panel.log ----"; tail -30 "$PANEL_LOG" 2>/dev/null
+  echo "---- ui.log (test-input) ----"; tail -10 "$WORK/ui.log" 2>/dev/null
+  echo "---- wm.log ----"; cat "$WORK/wm.log"; \
                         echo "---- session.log ----"; cat "$SESS_LOG"; \
                         echo "---- failed checks ----"; cat "$FAILS"; }
 [ "$FAIL" -eq 0 ]

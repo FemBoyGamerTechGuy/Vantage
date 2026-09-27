@@ -2662,6 +2662,10 @@ static bool _xkb_init(_wl_state_t *st) {
     st->keymap_size = len;
     vt_logi("wayland: xkb keymap ready (%zu bytes, layout '%s')",
             len, xkb_keymap_layout_get_name(st->xkb_km, 0));
+    /* the string is owned by the caller (xkbcommon allocates it fresh
+     * per call) — keeping it would leak the whole keymap text (64 KB
+     * per compositor start, per LeakSanitizer) */
+    free(str);
     return true;
 }
 
@@ -3749,6 +3753,13 @@ static void _wl_fini(vt_backend_t *self) {
         vt_logi("wayland: seat released — VT returned to text mode");
     }
     if (st->src) wl_event_source_remove(st->src);
+    /* Destroy the CLIENTS first: wl_display_destroy alone frees the
+     * display's own bookkeeping but NOT the connected clients — every
+     * remaining surface (with its copied pixel buffer), popup, layer
+     * surface, xdg resource and pointer/keyboard resource would leak
+     * (their destructors never run). destroy_clients runs the normal
+     * resource teardown exactly as a client disconnect does. */
+    wl_display_destroy_clients(st->display);
     wl_display_destroy(st->display);
     if (st->wall) vt_wallpaper_free(st->wall);
     vt_free(st->bg_pix);

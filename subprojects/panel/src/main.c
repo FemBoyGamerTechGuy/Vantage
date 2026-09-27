@@ -55,9 +55,7 @@ static const char _css[] =
 /* the bar itself — with its LIGHT foreground: the default theme's
  * label color is near-black, which rendered the tasklist/clock/net
  * text as dark-on-dark (measured: 0 readable text pixels on the
- * bar). Everything inside the bar inherits this color; the Programs
- * menu is a separate popover surface and keeps the theme's own
- * (light) styling. */
+ * bar). Everything inside the bar inherits this color. */
 ".vantage-panel { background-color: alpha(#16181c, 0.96); "
 "                 color: #e8eaed; }\n"
 /* taskbar buttons */
@@ -71,7 +69,47 @@ static const char _css[] =
 "                 color: #dfe3e8; }\n"
 ".vantage-start:hover { background-color: alpha(#ffffff, 0.09); }\n"
 /* a touch of brand color on the bar edge */
-".vantage-accent { color: #4f9adc; }\n";
+".vantage-accent { color: #4f9adc; }\n"
+/* The PROGRAMS MENU carries the shell's OWN identity, not the GTK
+ * theme's: a desktop panel must look like itself on every machine.
+ * Under a light theme the stock popover rendered as a bright sheet
+ * (and a dark theme flipped it the other way), so the menu's look
+ * followed the user's GTK settings instead of the desktop's brand.
+ * Pinning the popover's palette, text, entry and row geometry also
+ * makes the row hit boxes — and therefore launcher clicks —
+ * identical on every theme. NOTE the "> contents"/"> arrow" nodes:
+ * GTK4 popovers paint the visible sheet on CHILD nodes of the
+ * popover node (Adwaita keeps the parent itself transparent), so
+ * styling only "popover" would be covered by the theme's sheet. */
+"popover.vantage-menu,\n"
+"popover.vantage-menu > contents,\n"
+"popover.vantage-menu > arrow {\n"
+"  background-color: #1f2126;\n"
+"  color: #e8eaed;\n"
+"}\n"
+"popover.vantage-menu label { color: #e8eaed; }\n"
+"popover.vantage-menu entry { background-color: #2a2d33; "
+"                             color: #e8eaed; "
+"                             caret-color: #e8eaed; }\n"
+/* the category/app GtkListBoxes: Adwaita paints `list` white (light) /
+ * dark (dark) — the sheet must keep the shell's palette instead */
+"popover.vantage-menu list { background-color: transparent; }\n"
+"popover.vantage-menu list row { background-color: transparent; "
+"                                min-height: 30px; "
+"                                color: #e8eaed; }\n"
+"popover.vantage-menu row:hover { background-color: #2e3238; }\n";
+
+/* Popovers open INSTANTLY. GTK's stock fade-in is driven by frame
+ * callbacks; on a software renderer (headless runs, slow boxes) the
+ * animation can still be mid-flight long after a real user — or an
+ * automated check — expects the menu to be fully there. A desktop
+ * shell wants snappy menus anyway (XFCE opens its launchers with no
+ * transition), so animations are off for the whole panel process. */
+static void _disable_animations(void) {
+    GtkSettings *s = gtk_settings_get_default();
+    if (s)
+        g_object_set(s, "gtk-enable-animations", FALSE, NULL);
+}
 
 static void _on_activate(GtkApplication *app, gpointer user) {
     (void)user;
@@ -80,6 +118,7 @@ static void _on_activate(GtkApplication *app, gpointer user) {
      * recurses without bound when image-missing is absent from the
      * active theme — a real stack-overflow crash on minimal themes) */
     vp_icon_safety_net();
+    _disable_animations();
 
     win = gtk_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(win), "Vantage Panel");

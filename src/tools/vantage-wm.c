@@ -225,14 +225,16 @@ static void _wl_event_sink(void *ud, void *event) {
         break;
     }
     case VT_BACKEND_WL_EVENT_WORKSPACE: {
-        /* compositor panel switched workspaces: sync the WM model and
-         * tell subscribers exactly like an X11 desktop switch does */
+        /* the compositor switched workspaces (IPC remote, panel pager
+         * click or hotkey — the backend event carries no source):
+         * sync the WM model and tell subscribers exactly like an X11
+         * desktop switch does */
         int d = (int)ev->window_id;
         if (d >= 0 && d < (int)wm->workspaces.size) {
             wm->cur_ws = d;
             if (wm->on_desktop_changed)
                 wm->on_desktop_changed(wm, d);
-            vt_logi("wm: wayland desktop -> %d (compositor panel)", d + 1);
+            vt_logi("wm: wayland desktop -> %d", d + 1);
         }
         break;
     }

@@ -412,8 +412,12 @@ int main(int argc, char **argv) {
     vt_session_autostart_run(s);
 
     /* 5. session IPC server */
-    ctx.ipc = vt_ipc_new_server(vt_strprintf("%s/vantage-session.sock",
-                                             vt_runtime_dir()));
+    {
+        char *sock = vt_strprintf("%s/vantage-session.sock",
+                                  vt_runtime_dir());
+        ctx.ipc = vt_ipc_new_server(sock);
+        vt_free(sock);   /* new_server copies the path */
+    }
     vt_ipc_register(ctx.ipc, VT_IPC_MSG_PING,   _h_ping, &ctx);
     vt_ipc_register(ctx.ipc, VT_IPC_MSG_RELOAD, _h_reload, &ctx);
     vt_ipc_register(ctx.ipc, VT_IPC_MSG_QUIT,   _h_end, &ctx);

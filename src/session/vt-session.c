@@ -147,8 +147,9 @@ int vt_session_autostart_load(vt_session_t *s) {
         vt_logi("session: system autostart skipped "
                 "(VANTAGE_SESSION_NO_SYSTEM_AUTOSTART)");
     char *res_autostart = vt_paths_resource_find("autostart");
+    char *user_autostart = vt_strprintf("%s/autostart", vt_config_dir());
     const char *dirs[] = {
-        vt_strprintf("%s/autostart", vt_config_dir()),
+        user_autostart,
         no_system ? NULL : (res_autostart ? res_autostart
                                           : VT_DATADIR "/autostart"),
         no_system ? NULL : "/etc/xdg/autostart",

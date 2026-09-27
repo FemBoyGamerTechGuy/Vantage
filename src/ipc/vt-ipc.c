@@ -78,8 +78,14 @@ vt_ipc_t *vt_ipc_new_server(const char *path) {
 
 vt_ipc_t *vt_ipc_new_client(const char *path) {
     vt_ipc_t *ipc = vt_malloc0(sizeof(*ipc));
-    ipc->path = vt_strdup(path ? path :
-        vt_strprintf("%s/%s", vt_runtime_dir(), VT_IPC_DEFAULT_SOCKET));
+    /* no vt_strdup(vt_strprintf(...)): the intermediate string would
+     * leak (LeakSanitizer: 34 bytes on every CLI invocation) */
+    if (path) {
+        ipc->path = vt_strdup(path);
+    } else {
+        ipc->path = vt_strprintf("%s/%s", vt_runtime_dir(),
+                                 VT_IPC_DEFAULT_SOCKET);
+    }
     ipc->is_server = false;
     ipc->fd = -1;
     pthread_mutex_init(&ipc->lock, NULL);
