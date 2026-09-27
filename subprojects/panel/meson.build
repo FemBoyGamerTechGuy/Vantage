@@ -12,7 +12,7 @@
 # consumes the `vantage_panel_dep` dependency below).
 
 project('vantage-panel', 'c',
-  version : '0.3.1',
+  version : '0.3.2',
   default_options : [
     'c_std=c17',
     'warning_level=2',
@@ -27,7 +27,15 @@ cc = meson.get_compiler('c')
 # ---- dependencies ---------------------------------------------------
 dep_gtk = dependency('gtk4', version : '>= 4.10')
 dep_gio_unix = dependency('gio-unix-2.0', required : false)
-dep_layer_shell = dependency('gtk4-layer-shell-0', required : false)
+# wlr-layer-shell docking (Wayland). REQUIRED by default (feature
+# option, -Dpanel:layer-shell=disabled opts out for X11-only builds):
+# without it the panel cannot dock on Wayland at all — it REFUSES to
+# float and exits non-zero — so letting the configure silently pass
+# (the old `required : false`) only ever shipped a broken shell: a
+# missing library produced a floating panel and a desktop whose every
+# panel feature failed downstream of the real cause.
+dep_layer_shell = dependency('gtk4-layer-shell-0',
+                             required : get_option('layer-shell'))
 dep_alsa = dependency('alsa', required : false)
 
 panel_cargs = []
@@ -36,8 +44,10 @@ if dep_gio_unix.found()
   panel_deps += [dep_gio_unix]
 endif
 
-# wlr-layer-shell docking (Wayland); without it the panel still runs —
-# as a plain window on Wayland and as an EWMH dock on X11
+# wlr-layer-shell docking (Wayland): required-by-default feature —
+# see meson_options.txt. With -Dlayer-shell=disabled the panel builds
+# without it, runs on X11 via the EWMH dock, and on Wayland it refuses
+# to dock and exits with the actionable diagnostic (dock.c).
 if dep_layer_shell.found()
   panel_deps += [dep_layer_shell]
   panel_cargs += ['-DHAVE_LAYER_SHELL']
@@ -87,6 +97,11 @@ exe_vantage_panel = executable('vantage-panel',
 install_subdir('data/icons',
   install_dir : pkgdatadir,
 )
+
+summary({'gtk4-layer-shell docking (Wayland)' : dep_layer_shell.found(),
+         'EWMH X11 dock' : dep_x11.found(),
+         'ALSA mixer applet' : dep_alsa.found()},
+        bool_yn : true)
 
 # The parent project consumes this subproject's executables/variables
 # (see the root meson.build); nothing is linked INTO the parent, which

@@ -50,6 +50,40 @@ tc() { if [ -n "$TST" ]; then echo "$TST/$1"; else echo "$1"; fi; }
 [ -x "$(tc vt-wayland-testclient)" ] || { echo "vt-wayland-testclient not built"; exit 77; }
 [ -x "$(vb vantage-panel)" ] || { echo "vantage-panel not built (subprojects/panel)"; exit 77; }
 
+# The panel must be able to DOCK. A build configured while
+# gtk4-layer-shell was missing compiled the panel WITHOUT layer-shell
+# support (HAVE_LAYER_SHELL undefined); it then maps as a plain
+# floating window and EVERY pixel/interaction check below fails for
+# the wrong reason — observed on a real machine as seven cascading
+# failures (panel never mapped / frame dump / menu / launch / pager)
+# with nothing pointing at the build. Fail HERE instead, with the fix
+# spelled out. (Since 0.3.2 the meson build makes the library required
+# by default, so fresh configurations cannot fall into this hole;
+# this check catches stale build dirs and hand-swapped binaries.)
+PANEL_BIN="$(vb vantage-panel)"
+PANEL_LINKS=$(ldd "$PANEL_BIN" 2>/dev/null)
+if printf '%s\n' "$PANEL_LINKS" | grep -q 'libgtk4-layer-shell'; then
+  if printf '%s\n' "$PANEL_LINKS" | grep 'libgtk4-layer-shell' \
+       | grep -q 'not found'; then
+    echo "FATAL: $PANEL_BIN links libgtk4-layer-shell but the library"
+    echo "       cannot be loaded at runtime (broken install / wrong"
+    echo "       LD_LIBRARY_PATH). Fix the library resolution and retry."
+    exit 1
+  fi
+  ok "panel links gtk4-layer-shell (dockable on Wayland)"
+else
+  echo "FATAL: $PANEL_BIN was built WITHOUT gtk4-layer-shell — it cannot"
+  echo "       dock on Wayland and every panel check would fail misleadingly."
+  echo "       The dependency 'gtk4-layer-shell-0' was not found when this"
+  echo "       build directory was configured. Fix:"
+  echo "         Debian/Ubuntu: sudo apt install libgtk4-layer-shell-dev"
+  echo "         Arch:          sudo pacman -S gtk4-layer-shell"
+  echo "         Fedora:        sudo dnf install gtk4-layer-shell-devel"
+  echo "       then: meson setup --reconfigure $BUILD   (or wipe the build dir)"
+  echo "       X11-only builds: meson setup -Dpanel:layer-shell=disabled"
+  exit 1
+fi
+
 # Wait for a COMPLETE frame dump: SIGUSR1 writes ~2.3MB; polling for
 # "non-empty" races the writer. Wait until the size is stable.
 wait_ppm() {

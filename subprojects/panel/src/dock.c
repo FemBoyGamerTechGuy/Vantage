@@ -15,6 +15,17 @@
  *            _NET_WM_STATE_ABOVE and _NET_WM_STRUT_PARTIAL — the
  *            EWMH way every real panel docks, honored by the Vantage
  *            X11 WM and any other conforming WM.
+ *
+ *   Neither: the panel REFUSES to run. A desktop panel that cannot
+ *            dock is not a panel — before 0.3.2 it silently fell back
+ *            to a plain floating window (natural size, centered by the
+ *            WM) whenever the build lacked gtk4-layer-shell or the
+ *            compositor lacked zwlr_layer_shell_v1, and every
+ *            downstream consumer (taskbar, pager, menus, harnesses)
+ *            failed far away from the actual cause. dock_prepare()
+ *            now returns FALSE and main() exits non-zero with a
+ *            hint that names the exact fix — the same contract as
+ *            waybar ("layer-shell or nothing").
  */
 #include "dock.h"
 
@@ -38,6 +49,8 @@
 
 #define DOCK_H 40
 
+static vp_dock_mode_t s_mode = VP_DOCK_NONE;
+
 int dock_height(void) {
     return DOCK_H;
 }
@@ -49,6 +62,61 @@ gboolean dock_is_wayland(void) {
 #else
     return FALSE;
 #endif
+}
+
+vp_dock_mode_t dock_mode(void) {
+    return s_mode;
+}
+
+const char *dock_mode_name(void) {
+    switch (s_mode) {
+    case VP_DOCK_LAYER_SHELL: return "wayland/layer-shell";
+    case VP_DOCK_X11_EWMH:    return "x11/ewmh";
+    default:                  return "undocked";
+    }
+}
+
+const char *dock_support_hint(void) {
+#if defined(GDK_WINDOWING_WAYLAND) && defined(HAVE_LAYER_SHELL)
+    return "this Wayland compositor does not advertise "
+           "zwlr_layer_shell_v1 (wlr-layer-shell), and a desktop panel "
+           "cannot dock without it — the panel refuses to run as a "
+           "floating window (the same contract as waybar). Run it under "
+           "the Vantage Wayland compositor or any layer-shell compositor, "
+           "or use the X11 backend where it docks via EWMH.";
+#else
+    return "this vantage-panel binary was built WITHOUT wlr-layer-shell "
+           "support — gtk4-layer-shell was not found when the project was "
+           "configured, so the panel cannot dock on Wayland (it refuses to "
+           "float). Install the library and reconfigure the build: "
+           "Debian/Ubuntu: apt install libgtk4-layer-shell-dev · "
+           "Arch: pacman -S gtk4-layer-shell · "
+           "Fedora: dnf install gtk4-layer-shell-devel — then "
+           "'meson setup --reconfigure <builddir>' (or wipe the build "
+           "directory). X11-only builds may instead configure "
+           "-Dpanel:layer-shell=disabled.";
+#endif
+}
+
+/* ------------------------------------------------------------ X11 ---- */
+
+/* Pure GDK (no raw Xlib): usable on every backend so the fallback
+ * sizing never depends on the optional X11 dock code being compiled
+ * in (GDK_WINDOWING_X11 without HAVE_X11_DOCK used to be a latent
+ * compile error here). */
+static int _monitor_width(void) {
+    GdkDisplay *disp = gdk_display_get_default();
+    GListModel *mons = disp ? gdk_display_get_monitors(disp) : NULL;
+    if (mons && g_list_model_get_n_items(mons) > 0) {
+        GdkMonitor *mon = g_list_model_get_item(mons, 0);
+        if (mon) {
+            GdkRectangle geom;
+            gdk_monitor_get_geometry(mon, &geom);
+            g_object_unref(mon);
+            if (geom.width > 0) return geom.width;
+        }
+    }
+    return 1024;
 }
 
 #if _X11_DOCK
@@ -73,21 +141,6 @@ static Window _xid(GtkWindow *win) {
     return surf ? gdk_x11_surface_get_xid(surf) : 0;
 }
 #pragma GCC diagnostic pop
-
-static int _monitor_width(void) {
-    GdkDisplay *disp = gdk_display_get_default();
-    GListModel *mons = disp ? gdk_display_get_monitors(disp) : NULL;
-    if (mons && g_list_model_get_n_items(mons) > 0) {
-        GdkMonitor *mon = g_list_model_get_item(mons, 0);
-        if (mon) {
-            GdkRectangle geom;
-            gdk_monitor_get_geometry(mon, &geom);
-            g_object_unref(mon);
-            if (geom.width > 0) return geom.width;
-        }
-    }
-    return 1024;
-}
 
 static void _x11_set_strut(GtkWindow *win, int h);
 
@@ -160,8 +213,8 @@ static void _x11_on_monitors_changed(GListModel *model, guint pos,
 
 /* the bar's natural height can change (font metrics, applets) — keep
  * the reserved strut in sync with what is actually on screen. Only
- * height CHANGES rewrite the property: no PropertyNotify storm in
- * the WM, no workarea churn. (There is no "size-allocate" signal in
+ * height CHANGES rewrite the property: no PropertyNotify storm in the
+ * WM, no workarea churn. (There is no "size-allocate" signal in
  * GTK4 — the toplevel allocation is watched with a cheap timeout.) */
 static gboolean _x11_watch_height(gpointer user) {
     GtkWidget *w = user;
@@ -173,43 +226,36 @@ static gboolean _x11_watch_height(gpointer user) {
     }
     return G_SOURCE_CONTINUE;
 }
-#endif
 
-#if !_X11_DOCK
-static void _x11_dock_props(GtkWidget *w) { (void)w; }
+#else /* no raw-X11 dock in this build */
+
 static void _x11_pin_position(GtkWindow *win) { (void)win; }
-static void _x11_on_monitor_changed(GdkDisplay *d, GdkMonitor *m, gpointer u)
-{ (void)d; (void)m; (void)u; }
-#endif
 
-void dock_prepare(GtkWindow *win) {
+#endif /* _X11_DOCK */
+
+/* ----------------------------------------------------------- public -- */
+
+gboolean dock_can_dock(void) {
+    if (!dock_is_wayland())
+        return TRUE;            /* X11 (or non-Wayland backend): EWMH */
+#if defined(GDK_WINDOWING_WAYLAND) && defined(HAVE_LAYER_SHELL)
+    return gtk_layer_is_supported();
+#else
+    return FALSE;               /* no gtk4-layer-shell in this build */
+#endif
+}
+
+gboolean dock_prepare(GtkWindow *win) {
     gtk_window_set_decorated(win, FALSE);
-    gboolean wl = dock_is_wayland();
-    if (!wl) {
-#ifdef GDK_WINDOWING_X11
+    s_mode = VP_DOCK_NONE;
+
+    if (!dock_is_wayland()) {
+        /* ---- X11 (or non-Wayland backend): EWMH dock ------------- */
+        s_mode = VP_DOCK_X11_EWMH;
         int sw = _monitor_width();
         gtk_window_set_default_size(win, sw, DOCK_H);
         gtk_window_set_resizable(win, FALSE);
-#endif
-    } else {
-        gtk_window_set_default_size(win, 0, DOCK_H);
-#if defined(GDK_WINDOWING_WAYLAND) && defined(HAVE_LAYER_SHELL)
-        if (gtk_layer_is_supported()) {
-            gtk_layer_init_for_window(win);
-            gtk_layer_set_namespace(win, "vantage-panel");
-            gtk_layer_set_layer(win, GTK_LAYER_SHELL_LAYER_TOP);
-            gtk_layer_set_anchor(win, GTK_LAYER_SHELL_EDGE_TOP, TRUE);
-            gtk_layer_set_anchor(win, GTK_LAYER_SHELL_EDGE_LEFT, TRUE);
-            gtk_layer_set_anchor(win, GTK_LAYER_SHELL_EDGE_RIGHT, TRUE);
-            gtk_layer_auto_exclusive_zone_enable(win);
-            gtk_layer_set_keyboard_mode(
-                win, GTK_LAYER_SHELL_KEYBOARD_MODE_ON_DEMAND);
-            return;
-        }
-#endif
-    }
 #if _X11_DOCK
-    if (!wl) {
         /* REALIZE is the last moment before the X server sees the map
          * request: the dock/type/strut atoms must be on the window by
          * then, or the WM frames the panel, cascade-places it (the
@@ -223,11 +269,35 @@ void dock_prepare(GtkWindow *win) {
                 g_signal_connect(mons, "items-changed",
                                  G_CALLBACK(_x11_on_monitors_changed), win);
         }
+#endif
+        return TRUE;
+    }
+
+    /* ---- Wayland: layer-shell, or REFUSE ------------------------- */
+#if defined(GDK_WINDOWING_WAYLAND) && defined(HAVE_LAYER_SHELL)
+    if (gtk_layer_is_supported()) {
+        gtk_window_set_default_size(win, 0, DOCK_H);
+        gtk_layer_init_for_window(win);
+        gtk_layer_set_namespace(win, "vantage-panel");
+        gtk_layer_set_layer(win, GTK_LAYER_SHELL_LAYER_TOP);
+        gtk_layer_set_anchor(win, GTK_LAYER_SHELL_EDGE_TOP, TRUE);
+        gtk_layer_set_anchor(win, GTK_LAYER_SHELL_EDGE_LEFT, TRUE);
+        gtk_layer_set_anchor(win, GTK_LAYER_SHELL_EDGE_RIGHT, TRUE);
+        gtk_layer_auto_exclusive_zone_enable(win);
+        gtk_layer_set_keyboard_mode(
+            win, GTK_LAYER_SHELL_KEYBOARD_MODE_ON_DEMAND);
+        s_mode = VP_DOCK_LAYER_SHELL;
+        return TRUE;
     }
 #endif
+    /* No layer-shell on this Wayland compositor — or this panel was
+     * built without gtk4-layer-shell. Docking is the panel's whole
+     * job: report the undockable state and let the caller exit with
+     * the actionable hint instead of floating (see dock.h). */
+    return FALSE;
 }
 
 void dock_finish(GtkWindow *win) {
-    if (!dock_is_wayland())
+    if (s_mode == VP_DOCK_X11_EWMH)
         _x11_pin_position(win);
 }

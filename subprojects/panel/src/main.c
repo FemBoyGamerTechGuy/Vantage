@@ -30,6 +30,7 @@
 
 static GtkWidget *win;
 static vp_wm_t *wm;
+static int g_exit_code = 0;
 
 static gboolean _on_refresh(gpointer user) {
     (void)user;
@@ -113,6 +114,23 @@ static void _disable_animations(void) {
 
 static void _on_activate(GtkApplication *app, gpointer user) {
     (void)user;
+    /* EARLY dockability probe — before any widget, CSS or icon-theme
+     * work. A panel that cannot dock (Wayland without wlr-layer-shell,
+     * or a build without gtk4-layer-shell) exits NOW: the diagnostic is
+     * the first and only thing on stderr (no applet probing noise
+     * drowning it — observed on real machines, where ALSA/EGL chatter
+     * buried the actual fault line in every failure dump), and the
+     * early exit allocates nothing of its own (the only residual at
+     * process exit under LSan is fontconfig's ~320-byte config cache,
+     * initialized by gtk_init and owned by the library — not panel
+     * memory, and not safely freeable under a live Pango font map).
+     * dock_prepare() below remains the enforcement point. */
+    if (!dock_can_dock()) {
+        g_printerr("vantage-panel: cannot dock: %s\n",
+                   dock_support_hint());
+        g_exit_code = 1;
+        return;   /* no window exists: the application exits now */
+    }
     /* BEFORE any widget exists: the shipped safety-net icons make
      * every icon lookup resolvable (GTK 4.18's missing-icon fallback
      * recurses without bound when image-missing is absent from the
@@ -169,7 +187,28 @@ static void _on_activate(GtkApplication *app, gpointer user) {
 
     gtk_window_set_child(GTK_WINDOW(win), bar);
 
-    dock_prepare(GTK_WINDOW(win));
+    /* A panel MUST dock. When the compositor offers no docking
+     * protocol — a Wayland compositor without wlr-layer-shell, or a
+     * build without gtk4-layer-shell — showing the window would just
+     * float it in the middle of the screen: a silently broken
+     * desktop whose every downstream consumer (tasklist, pager,
+     * menus) fails far from the real cause. Refuse loudly instead:
+     * one actionable line on stderr, non-zero exit (the waybar
+     * contract). The exit travels through the normal GTK shutdown
+     * path: destroying the application's only window releases the
+     * GtkApplication hold and the main loop ends cleanly. */
+    if (!dock_prepare(GTK_WINDOW(win))) {
+        g_printerr("vantage-panel: cannot dock: %s\n",
+                   dock_support_hint());
+        /* clean teardown: the WM client and its IPC/poll sources are
+         * released (LSan-clean early exit), the window is destroyed,
+         * which releases the application hold and ends the loop */
+        vp_wm_free(wm);
+        wm = NULL;
+        gtk_window_destroy(GTK_WINDOW(win));
+        g_exit_code = 1;
+        return;
+    }
     gtk_window_present(GTK_WINDOW(win));
     dock_finish(GTK_WINDOW(win));
 
@@ -177,8 +216,10 @@ static void _on_activate(GtkApplication *app, gpointer user) {
      * dragging, xwayland windows, workspace state) */
     g_timeout_add(400, _on_refresh, NULL);
 
-    g_print("vantage-panel: ready (%s backend)\n",
-            dock_is_wayland() ? "wayland/layer-shell" : "x11/ewmh");
+    /* the backend string is the REAL dock mode (dock_mode_name), not
+     * a display-type guess: the old line printed "layer-shell" even
+     * while the panel floated without it, misleading failure dumps */
+    g_print("vantage-panel: ready (%s backend)\n", dock_mode_name());
 }
 
 int main(int argc, char **argv) {
@@ -186,6 +227,8 @@ int main(int argc, char **argv) {
         "org.vantage.Panel", G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(app, "activate", G_CALLBACK(_on_activate), NULL);
     int rc = g_application_run(G_APPLICATION(app), argc, argv);
+    if (g_exit_code != 0)
+        rc = g_exit_code;   /* refusal-to-dock is a hard error */
     g_object_unref(app);
     return rc;
 }

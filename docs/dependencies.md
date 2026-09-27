@@ -13,12 +13,19 @@ Every dependency must have a reason.
 | pkg-config    | yes       | Dependency detection   |
 | wayland-scanner | yes (when Wayland enabled) | Wayland protocol codegen |
 | GTK 4 ≥ 4.10  | yes       | `vantage-panel` (subprojects/panel — the desktop panel is core, not optional) |
-| gtk4-layer-shell | recommended | panel docking on the native Wayland compositor (falls back to a plain window when absent; the X11 EWMH dock needs nothing extra) |
+| gtk4-layer-shell | yes (default) | panel docking on the native Wayland compositor — REQUIRED for the Wayland desktop shell: the panel refuses to run as a floating window (0.3.2), and a build configured without the library fails at `meson setup` by default. X11-only builds may opt out with `-Dpanel:layer-shell=disabled` (the X11 EWMH dock needs nothing extra). |
 | libxcb-icccm  | optional  | Xwayland window management on the Wayland backend |
 
 Debian/Ubuntu: `apt install meson ninja-build gcc pkg-config libgtk-4-dev
 libgtk4-layer-shell-dev` · Arch: `pacman -S meson ninja gcc pkgconf gtk4
-gtk4-layer-shell`.
+gtk4-layer-shell` · Fedora: `dnf install meson ninja gcc pkgconf gtk4-devel
+gtk4-layer-shell-devel`.
+
+A note for builds configured before the library was installed: `meson setup
+--reconfigure <builddir>` (or wiping the build dir) is required after
+installing it — the dependency set is frozen at configure time, and the
+integration harnesses fail fast with these instructions if the panel binary
+turns out not to link `libgtk4-layer-shell`.
 
 ## Runtime — mandatory
 

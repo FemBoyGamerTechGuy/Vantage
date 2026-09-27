@@ -32,6 +32,15 @@ XFCE panel talks to xfwm4 through EWMH/X11 instead of linking it.
 * **X11**: `_NET_WM_WINDOW_TYPE_DOCK` + `_NET_WM_STATE_ABOVE` +
   `_NET_WM_STRUT_PARTIAL` — plain EWMH.
 
+A panel **must** dock. When neither is possible — a Wayland compositor
+without `zwlr_layer_shell_v1`, or a binary built without gtk4-layer-shell
+(the dependency is required by default at configure time since 0.3.2;
+X11-only builds opt out with `-Dlayer-shell=disabled`) — the panel
+**refuses to run**: it prints one actionable line (naming the missing
+library or protocol and the fix) and exits non-zero, the same contract
+as waybar. Before 0.3.2 it silently fell back to a plain floating
+window, which broke every panel feature far downstream of the cause.
+
 ## Visual identity
 
 The panel carries its OWN look (an application-priority CSS provider):
@@ -52,5 +61,8 @@ Standalone:
     meson setup build
     ninja -C build
 
-As part of the Vantage desktop environment: it is pulled in
-automatically by the parent build as `subprojects/panel`.
+gtk4-layer-shell is required by default (`-Dlayer-shell=disabled`
+opts out for X11-only use). As part of the Vantage desktop
+environment it is pulled in automatically by the parent build as
+`subprojects/panel` (`-Dpanel:layer-shell=disabled` reaches the same
+option from the parent configure).

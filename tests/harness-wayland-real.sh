@@ -56,6 +56,36 @@ vb() {
 tc() { if [ -n "$TST" ]; then echo "$TST/$1"; else echo "$1"; fi; }
 [ -x "$(tc vt-wayland-testclient)" ] || { echo "vt-wayland-testclient not built"; exit 77; }
 
+# The panel must be able to DOCK on the real output too: a build
+# configured while gtk4-layer-shell was missing compiles the panel
+# without layer-shell support — it refuses to dock and exits (0.3.2
+# behavior; before that it floated, and every panel pixel check here
+# failed far from the cause). Fail fast with the fix spelled out.
+PANEL_BIN="$(vb vantage-panel)"
+PANEL_LINKS=$(ldd "$PANEL_BIN" 2>/dev/null)
+if printf '%s\n' "$PANEL_LINKS" | grep -q 'libgtk4-layer-shell'; then
+  if printf '%s\n' "$PANEL_LINKS" | grep 'libgtk4-layer-shell' \
+       | grep -q 'not found'; then
+    echo "FATAL: $PANEL_BIN links libgtk4-layer-shell but the library"
+    echo "       cannot be loaded at runtime (broken install / wrong"
+    echo "       LD_LIBRARY_PATH). Fix the library resolution and retry."
+    exit 1
+  fi
+  ok "panel links gtk4-layer-shell (dockable on Wayland)"
+else
+  echo "FATAL: $PANEL_BIN was built WITHOUT gtk4-layer-shell — it cannot"
+  echo "       dock on Wayland (it refuses to float), so the real tier"
+  echo "       cannot exercise the docked panel. The dependency"
+  echo "       'gtk4-layer-shell-0' was not found when this build dir was"
+  echo "       configured. Fix:"
+  echo "         Debian/Ubuntu: sudo apt install libgtk4-layer-shell-dev"
+  echo "         Arch:          sudo pacman -S gtk4-layer-shell"
+  echo "         Fedora:        sudo dnf install gtk4-layer-shell-devel"
+  echo "       then: meson setup --reconfigure $BUILD   (or wipe the build dir)"
+  echo "       X11-only builds: meson setup -Dpanel:layer-shell=disabled"
+  exit 1
+fi
+
 echo "== harness-wayland-real: environment preconditions =="
 
 # --- precondition 1: real DRM hardware --------------------------------

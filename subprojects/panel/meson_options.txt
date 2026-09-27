@@ -1,0 +1,15 @@
+# subprojects/panel/meson_options.txt — vantage-panel options
+#
+# SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
+
+# wlr-layer-shell docking on Wayland (gtk4-layer-shell). REQUIRED by
+# default: without it the panel cannot dock on Wayland at all — it
+# refuses to float and exits non-zero (see src/dock.c) — so a silent
+# opt-out only ever produced a broken desktop shell: real machines
+# configured without the library installed built a panel that mapped
+# as a plain floating window while every harness check failed far
+# from the cause. Disable explicitly only for X11-only builds:
+#   standalone:  meson setup -Dlayer-shell=disabled build
+#   as subproject of Vantage: meson setup -Dpanel:layer-shell=disabled
+option('layer-shell', type : 'feature', value : 'enabled',
+       description : 'wlr-layer-shell docking on Wayland via gtk4-layer-shell (required for the panel to dock on Wayland; disable only for X11-only builds)')

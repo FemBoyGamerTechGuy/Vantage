@@ -1,6 +1,6 @@
 # Maintainer: Vantage Desktop Project
 pkgname=vantage
-pkgver=0.3.1
+pkgver=0.3.2
 pkgrel=1
 pkgdesc="Lightweight raw-C desktop environment — Wayland compositor + X11 backend, GTK4 panel with live pager, Xwayland support, cross-toolkit Qt6/GTK theming, live video wallpapers"
 arch=('x86_64' 'aarch64')
