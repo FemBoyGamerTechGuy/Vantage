@@ -1,5 +1,5 @@
 src_backends = ['vt-backend.c', 'vt-backend-x11.c', 'vt-backend-wayland.c',
-                'vt-seat.c', 'vt-kms.c', 'vt-wl-panel.c']
+                'vt-seat.c', 'vt-kms.c']
 
 backend_deps = [vantage_core_dep, vantage_ipc_dep,
                 vantage_integrations_dep, vantage_wallpaper_dep]
@@ -18,7 +18,7 @@ if dep_x11.found()
   endif
 endif
 
-# Wayland compositor backend + generated xdg-shell protocol code
+# Wayland compositor backend + generated protocol code
 wl_protocols_dir = dep_wayland_protocols.get_variable(
   pkgconfig: 'pkgdatadir',
   default_value: dep_wayland_protocols.get_variable(
@@ -26,6 +26,12 @@ wl_protocols_dir = dep_wayland_protocols.get_variable(
 xdg_shell_xml = join_paths(wl_protocols_dir, 'stable', 'xdg-shell', 'xdg-shell.xml')
 xdg_decoration_xml = join_paths(wl_protocols_dir, 'unstable',
   'xdg-decoration', 'xdg-decoration-unstable-v1.xml')
+# vendored protocol XMLs (repo-root protocols/):
+#   wlr-layer-shell (MIT, wlr-protocols — panels dock through it)
+#   xwayland-shell (wayland-protocols staging — X11 window association)
+protocols_dir = join_paths(meson.project_source_root(), 'protocols')
+layer_shell_xml = join_paths(protocols_dir, 'wlr-layer-shell-unstable-v1.xml')
+xwayland_shell_xml = join_paths(protocols_dir, 'xwayland-shell-v1.xml')
 
 if dep_wayland_server.found() and dep_wayland_client.found() and \
    prog_wl_scanner.found() and run_command('test', '-f', xdg_shell_xml, check: false).returncode() == 0
@@ -50,11 +56,40 @@ if dep_wayland_server.found() and dep_wayland_client.found() and \
     output: 'xdg-decoration-protocol.c',
     command: [prog_wl_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
 
+  # zwlr_layer_shell_v1 — docked shell surfaces (the panel)
+  layer_shell_proto_h = custom_target('wlr-layer-shell-protocol.h',
+    input: layer_shell_xml,
+    output: 'wlr-layer-shell-protocol.h',
+    command: [prog_wl_scanner, 'server-header', '@INPUT@', '@OUTPUT@'])
+  layer_shell_proto_c = custom_target('wlr-layer-shell-protocol.c',
+    input: layer_shell_xml,
+    output: 'wlr-layer-shell-protocol.c',
+    command: [prog_wl_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
+  # xwayland_shell_v1 — explicit X11 window ↔ wl_surface association
+  xwayland_shell_proto_h = custom_target('xwayland-shell-protocol.h',
+    input: xwayland_shell_xml,
+    output: 'xwayland-shell-protocol.h',
+    command: [prog_wl_scanner, 'server-header', '@INPUT@', '@OUTPUT@'])
+  xwayland_shell_proto_c = custom_target('xwayland-shell-protocol.c',
+    input: xwayland_shell_xml,
+    output: 'xwayland-shell-protocol.c',
+    command: [prog_wl_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
   backend_deps += [dep_wayland_client, dep_wayland_server, dep_xkbcommon]
   backend_cargs += ['-DVT_HAVE_WAYLAND']
-  lib_vantage_backends_extra_sources = [xdg_shell_proto_c, xdg_shell_proto_h,
-                                         xdg_decoration_proto_c,
-                                         xdg_decoration_proto_h]
+  lib_vantage_backends_extra_sources = [
+    xdg_shell_proto_c, xdg_shell_proto_h,
+    xdg_decoration_proto_c, xdg_decoration_proto_h,
+    layer_shell_proto_c, layer_shell_proto_h,
+    xwayland_shell_proto_c, xwayland_shell_proto_h,
+    'vt-wl-layer.c', 'vt-wl-xwayland.c']
+
+  # Xwayland window management needs xcb (+icccm for property types)
+  if dep_xcb.found() and dep_xcb_icccm.found()
+    backend_deps += [dep_xcb, dep_xcb_icccm]
+    backend_cargs += ['-DVT_HAVE_XCB_XWAYLAND']
+  endif
 else
   lib_vantage_backends_extra_sources = []
   if dep_wayland_client.found()
@@ -95,21 +130,10 @@ endif
 if dep_xkbcommon.found()
   backend_cargs += ['-DVT_HAVE_XKBCOMMON']
 endif
-# compositor-side panel text (real glyphs, not placeholder blocks)
+# SSD title text (real glyphs, not placeholder blocks)
 if dep_freetype.found() and dep_fontconfig.found()
   backend_deps += [dep_freetype, dep_fontconfig]
   backend_cargs += ['-DVT_HAVE_FREETYPE']
-endif
-# compositor-side panel ICONS: vt-wl-panel.c guards its icon loading
-# with VT_HAVE_PNG/VT_HAVE_GDKPIXBUF. These defines were previously
-# only set for the wallpaper library, so the Wayland panel silently
-# compiled its icon support OUT (menu icons never loaded — the
-# _argb_scale "unused" warning was the tell).
-if dep_libpng.found()
-  backend_cargs += ['-DVT_HAVE_PNG']
-endif
-if dep_gdkpixbuf.found()
-  backend_cargs += ['-DVT_HAVE_GDKPIXBUF']
 endif
 
 lib_vantage_backends = static_library('vantage-backends',

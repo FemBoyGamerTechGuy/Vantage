@@ -1172,26 +1172,34 @@ static void _manage(vt_wm_x11_t *e, Window w) {
     _set_frame_extents(e, c);
     _set_state_atoms(e, c);
 
-    /* grab alt-drag move/resize AND plain Button1 (click-to-focus) on
-     * the client, ignoring lock modifiers. The plain grab makes the WM
-     * see every click first; ReplayPointer then delivers it to the
-     * client — the classic click-to-focus mechanism. */
-    unsigned int mods[] = { 0, LockMask, Mod2Mask, Mod5Mask, LockMask | Mod2Mask,
-                            LockMask | Mod5Mask, Mod2Mask | Mod5Mask,
-                            LockMask | Mod2Mask | Mod5Mask };
-    for (size_t i = 0; i < VT_ARRAY_SIZE(mods); i++) {
-        XGrabButton(e->dpy, Button1, Mod1Mask | mods[i], c->win, False,
-                    ButtonPressMask | ButtonMotionMask | ButtonReleaseMask,
-                    GrabModeSync, GrabModeSync, None, None);
-        XGrabButton(e->dpy, Button3, Mod1Mask | mods[i], c->win, False,
-                    ButtonPressMask | ButtonMotionMask | ButtonReleaseMask,
-                    GrabModeSync, GrabModeSync, None, None);
-        XGrabButton(e->dpy, Button1, mods[i], c->win, False,
-                    ButtonPressMask | ButtonMotionMask | ButtonReleaseMask,
-                    GrabModeSync, GrabModeSync, None, None);
+    /* Passive grabs ONLY for Alt-drag move/resize (modifier-masked:
+     * they never fire on plain clicks). Plain click-to-focus OBSERVES
+     * ButtonPress via event selection instead of grabbing: a core
+     * XGrabButton + XAllowEvents(ReplayPointer) pair replays the press
+     * through the CORE delivery path, which Xorg does not translate to
+     * XInput2 — so XI2-only toolkits (GDK4: every GTK4 app, including
+     * vantage-panel) never received plain clicks at all. Observing
+     * delivers one copy to the WM (focus) while the client keeps
+     * receiving its own press/release untouched — for core clients AND
+     * XI2 clients alike. Docks/desktops get no grabs: moving the
+     * wallpaper by alt-drag was never a feature. */
+    if (!c->is_dock && !c->is_desktop) {
+        unsigned int mods[] = {
+            0, LockMask, Mod2Mask, Mod5Mask, LockMask | Mod2Mask,
+            LockMask | Mod5Mask, Mod2Mask | Mod5Mask,
+            LockMask | Mod2Mask | Mod5Mask };
+        for (size_t i = 0; i < VT_ARRAY_SIZE(mods); i++) {
+            XGrabButton(e->dpy, Button1, Mod1Mask | mods[i], c->win, False,
+                        ButtonPressMask | ButtonMotionMask | ButtonReleaseMask,
+                        GrabModeSync, GrabModeSync, None, None);
+            XGrabButton(e->dpy, Button3, Mod1Mask | mods[i], c->win, False,
+                        ButtonPressMask | ButtonMotionMask | ButtonReleaseMask,
+                        GrabModeSync, GrabModeSync, None, None);
+        }
     }
     XSelectInput(e->dpy, c->win, EnterWindowMask | FocusChangeMask |
-                 PropertyChangeMask | StructureNotifyMask);
+                 PropertyChangeMask | StructureNotifyMask |
+                 ButtonPressMask);
 
     vt_vec_push(&e->clients, &c);
     vt_vec_push(&e->stacking, &c);
@@ -1749,7 +1757,10 @@ static void _on_backend_event(void *ud, void *event) {
             _frame_button(e, c, be);
             break;
         }
-        if (c && (be->state & Mod1Mask) && !c->model.fullscreen) {
+        if (c && (be->state & Mod1Mask) && !c->model.fullscreen &&
+            !c->is_dock && !c->is_desktop) {
+            /* arrived through the Alt passive grab (pointer frozen):
+             * start the move/resize and release the grab's freeze */
             _raise(e, c);
             if (be->button == Button1)
                 _op_start(e, c, 0, 0, be->x_root, be->y_root);
@@ -1757,11 +1768,24 @@ static void _on_backend_event(void *ud, void *event) {
                 _op_start(e, c, 1, 1 | 2, be->x_root, be->y_root);
             XAllowEvents(e->dpy, AsyncPointer, CurrentTime);
         } else if (c && be->button == Button1) {
-            if (!c->model.focused) _focus(e, c);
-            else _raise(e, c);
-            XAllowEvents(e->dpy, ReplayPointer, CurrentTime);
-        } else {
-            XAllowEvents(e->dpy, AsyncPointer, CurrentTime);
+            /* OBSERVED press (event selection, no grab, pointer NOT
+             * frozen): the client is receiving this same press through
+             * its own protocol (core or XI2) — focus and raise only.
+             *
+             * Docks and desktops NEVER take keyboard focus (EWMH): a
+             * panel is not a focusable window. Focusing it rips the
+             * keyboard focus out of a popover the very same click just
+             * opened — GTK popovers close themselves on focus-out, so
+             * the start menu would flash shut whenever another window
+             * held focus. Raise only: the panel stays where it is and
+             * its popovers keep the grab they need. */
+            if (c->is_dock || c->is_desktop) {
+                _raise(e, c);
+            } else if (!c->model.focused) {
+                _focus(e, c);
+            } else {
+                _raise(e, c);
+            }
         }
         break;
     }

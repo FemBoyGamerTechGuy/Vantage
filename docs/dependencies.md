@@ -11,7 +11,14 @@ Every dependency must have a reason.
 | ninja         | yes       | Build execution        |
 | gcc ≥ 11      | yes       | C compiler             |
 | pkg-config    | yes       | Dependency detection   |
-| wayland-scanner | optional | Wayland protocol codegen |
+| wayland-scanner | yes (when Wayland enabled) | Wayland protocol codegen |
+| GTK 4 ≥ 4.10  | yes       | `vantage-panel` (subprojects/panel — the desktop panel is core, not optional) |
+| gtk4-layer-shell | recommended | panel docking on the native Wayland compositor (falls back to a plain window when absent; the X11 EWMH dock needs nothing extra) |
+| libxcb-icccm  | optional  | Xwayland window management on the Wayland backend |
+
+Debian/Ubuntu: `apt install meson ninja-build gcc pkg-config libgtk-4-dev
+libgtk4-layer-shell-dev` · Arch: `pacman -S meson ninja gcc pkgconf gtk4
+gtk4-layer-shell`.
 
 ## Runtime — mandatory
 

@@ -1,24 +1,30 @@
 # Maintainer: Vantage Desktop Project
 pkgname=vantage
-pkgver=0.2.0
+pkgver=0.3.0
 pkgrel=1
-pkgdesc="Lightweight raw-C desktop environment — Wayland compositor + X11 backend, cross-toolkit Qt6/GTK theming, live video wallpapers"
+pkgdesc="Lightweight raw-C desktop environment — Wayland compositor + X11 backend, GTK4 panel with live pager, Xwayland support, cross-toolkit Qt6/GTK theming, live video wallpapers"
 arch=('x86_64' 'aarch64')
 url="https://github.com/FemBoyGamerTechGuy/Vantage"
 license=('LicenseRef-Vantage-Proprietary')
 depends=(
   'glibc'
+  # the desktop panel (subprojects/panel): GTK4 + layer-shell docking
+  'gtk4' 'gtk4-layer-shell'
   # native Wayland compositor session (seat/VT/DRM/input)
   'wayland' 'libxkbcommon' 'seatd' 'libinput' 'libdrm' 'mesa'
-  # X11 backend
-  'libx11' 'libxcb' 'libxcomposite' 'libxdamage' 'libxext' 'libxft'
-  'libxi' 'libxrandr' 'libxrender' 'libxcursor'
-  # shared runtime bits (freetype2/fontconfig: WM titles + panel text;
-  # librsvg + cairo: SVG icon themes rasterized at panel display size)
+  # X11 backend + Xwayland window management (xcb-util-wm is a
+  # BUILD-time header dep for the Xwayland WM: the code only calls
+  # core xcb atom functions, so no runtime link happens)
+  'libx11' 'libxcb' 'libxcomposite' 'libxdamage' 'libxext'
+  'libxft' 'libxi' 'libxrandr' 'libxrender' 'libxcursor'
+  # shared runtime bits (freetype2/fontconfig: SSD title bars and the
+  # wallpaper engine's text; librsvg + cairo: SVG icon themes for the
+  # X11 desktop and wallpaper module)
   'json-c' 'systemd-libs' 'freetype2' 'fontconfig' 'librsvg' 'cairo'
 )
 makedepends=(
   'meson' 'ninja' 'gcc' 'pkg-config' 'wayland-protocols'
+  'gtk4' 'gtk4-layer-shell' 'xcb-util-wm'
 )
 optdepends=(
   'elogind: logind/elogind seat on systemd-free systems'

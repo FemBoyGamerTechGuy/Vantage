@@ -1,5 +1,5 @@
 Name:       vantage
-Version:    0.2.0
+Version:    0.3.0
 Release:    1%{?dist}
 Summary:    Lightweight raw-C Linux desktop environment
 License:    LicenseRef-Vantage-Proprietary
@@ -7,7 +7,7 @@ URL:        https://github.com/FemBoyGamerTechGuy/Vantage
 Source0:    %{url}/archive/v%{version}.tar.gz
 
 BuildRequires: meson, ninja-build, gcc, pkgconfig
-BuildRequires: pkgconfig(xcb), pkgconfig(xcb-randr)
+BuildRequires: pkgconfig(xcb), pkgconfig(xcb-randr), pkgconfig(xcb-icccm)
 BuildRequires: pkgconfig(xkbcommon), pkgconfig(xkbcommon-x11)
 BuildRequires: pkgconfig(wayland-client), pkgconfig(wayland-protocols)
 BuildRequires: pkgconfig(egl), pkgconfig(gl), pkgconfig(glesv2)
@@ -18,8 +18,11 @@ BuildRequires: pkgconfig(libavcodec), pkgconfig(libavformat), pkgconfig(libavuti
 BuildRequires: pkgconfig(libpipewire-0.3), pkgconfig(libpulse), pkgconfig(alsa)
 BuildRequires: pkgconfig(libnm), pkgconfig(upower-glib)
 BuildRequires: pkgconfig(dbus-1), pkgconfig(libsystemd)
+BuildRequires: pkgconfig(gtk4), pkgconfig(gtk4-layer-shell-0)
 
 Requires: %{name}-core%{?_isa} = %{version}-%{release}
+# the GTK4 desktop panel (subprojects/panel)
+Requires: gtk4%{?_isa}, gtk4-layer-shell%{?_isa}
 
 %description
 Vantage is a lightweight Linux desktop environment written primarily in C,

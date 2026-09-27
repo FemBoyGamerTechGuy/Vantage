@@ -574,6 +574,13 @@ int main(int argc, char **argv) {
     bool no_composite = false;
     vt_backend_kind_t cli_kind = VT_BACKEND_INVALID;
 
+    /* VANTAGE_WM_VERBOSE=1: debug logging without touching argv (the
+     * session spawns the WM with a fixed command line; an env hook is
+     * the only way to debug the compositor inside a real session) */
+    if (getenv("VANTAGE_WM_VERBOSE") &&
+        *getenv("VANTAGE_WM_VERBOSE") != '0')
+        vt_log_set_level(VT_LOG_DEBUG);
+
     for (int i = 1; i < argc; i++) {
         if (vt_streq(argv[i], "--no-composite")) no_composite = true;
         else if (vt_streq(argv[i], "--wayland")) cli_kind = VT_BACKEND_WAYLAND;

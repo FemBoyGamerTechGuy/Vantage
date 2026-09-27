@@ -400,7 +400,14 @@ int main(int argc, char **argv) {
     printf("committed %dx%d\n", width, height);
     fflush(stdout);   /* harness polls this line while we are alive */
 
-    sleep(2);   /* let the compositor paint + dump (SIGUSR1 from harness) */
+    /* Stay alive long enough for EVERY harness phase that needs this
+     * window mapped (frame dumps, the pager miniature check that maps
+     * windows on two workspaces and switches back — the old 2 s died
+     * before that check's dump). VT_TESTCLIENT_SECONDS overrides. */
+    long live_s = 6;
+    const char *live_env = getenv("VT_TESTCLIENT_SECONDS");
+    if (live_env && *live_env) live_s = atol(live_env);
+    for (long t = 0; t < live_s; t++) sleep(1);   /* SIGUSR1 windows */
     (void)have_globals;
     if (buffer_released)
         printf("buffer released %d\n", buffer_released);

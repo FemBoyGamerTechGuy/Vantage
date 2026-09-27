@@ -38,14 +38,25 @@ BUILD="${1:-${VT_BUILD_DIR:-}}"
 if [ -n "$BUILD" ] && [ -x "$BUILD/src/tools/vantage-session" ]; then
   BIN="$BUILD/src/tools"
   TST="$BUILD/tests"
-  export PATH="$BIN:$PATH"      # session spawns components via PATH
+  # the panel is an independent subproject — its binary lives there
+  PANELBIN="$BUILD/subprojects/panel"
+  export PATH="$BIN:$PANELBIN:$PATH"
+  [ -x "$PANELBIN/vantage-panel" ] \
+    || { echo "vantage-panel not built (subprojects/panel)"; exit 77; }
 else
   BIN=""; TST=""
   for b in vantage-session vantage-wm vantage-panel vantage-desktop vantage-remote; do
     command -v "$b" >/dev/null 2>&1 || { echo "missing $b in PATH"; exit 77; }
   done
 fi
-vb() { if [ -n "$BIN" ]; then echo "$BIN/$1"; else echo "$1"; fi; }
+vb() {
+  if [ -z "$BIN" ]; then echo "$1"; return; fi
+  if [ -x "$BIN/$1" ]; then echo "$BIN/$1"; return; fi
+  if [ -n "${PANELBIN:-}" ] && [ -x "$PANELBIN/$1" ]; then
+    echo "$PANELBIN/$1"; return
+  fi
+  echo "$1"
+}
 tc() { if [ -n "$TST" ]; then echo "$TST/$1"; else echo "$1"; fi; }
 
 command -v Xvfb >/dev/null 2>&1 || { echo "Xvfb not found"; exit 77; }
@@ -116,6 +127,46 @@ data = (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr) +
         chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
 open(sys.argv[1], 'wb').write(data)
 PYICON2
+# GTK's OWN fallback icon: gtk_icon_theme_lookup_icon() recurses into
+# itself WITHOUT BOUND when the icon it falls back to ("image-missing")
+# is also missing from every theme — GTK 4.18 has no recursion guard,
+# so any GTK-internal missing-icon lookup would overflow the stack.
+# Shipping it makes the fixture themes as complete as real ones.
+python3 - "$ICON_DIR/image-missing.png" <<'PYICON3'
+import struct, zlib, sys
+w = h = 24
+px = [[(28, 28, 30)] * w for _ in range(h)]
+for i in range(6, 18):                      # red X on a slate plate
+    px[i][i] = px[i][23 - i] = (192, 57, 43)
+    px[i][23 - i] = px[i][i] = (192, 57, 43)
+raw = b''.join(b'\x00' + b''.join(bytes(p) for p in row) for row in px)
+def chunk(t, d):
+    c = t + d
+    return struct.pack('>I', len(d)) + c + struct.pack(
+        '>I', zlib.crc32(c) & 0xffffffff)
+ihdr = struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)
+data = (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr) +
+        chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+open(sys.argv[1], 'wb').write(data)
+PYICON3
+# GTK4 panel resolves icons via GtkIconTheme (hicolor fallback):
+# duplicate both fixtures into hicolor so the lookup is deterministic
+HICOLOR_DIR="$XDG_DATA_HOME/icons/hicolor/24x24/apps"
+mkdir -p "$HICOLOR_DIR"
+cp "$ICON_DIR/start-here.png" "$HICOLOR_DIR/"
+cp "$ICON_DIR/vt-harness-probe.png" "$HICOLOR_DIR/"
+cp "$ICON_DIR/image-missing.png" "$HICOLOR_DIR/"
+cat > "$XDG_DATA_HOME/icons/hicolor/index.theme" <<'EOF'
+[Icon Theme]
+Name=hicolor
+Directories=24x24/apps
+
+[24x24/apps]
+Size=24
+Context=Applications
+Type=Fixed
+EOF
+
 cat > "$XDG_DATA_HOME/icons/vt-harness-theme/index.theme" <<'EOF'
 [Icon Theme]
 Name=vt-harness-theme
@@ -152,7 +203,6 @@ compositor=true
 focus-new=true
 [panel]
 enabled=true
-height=32
 EOF
 
 # ---------------------------------------------------------------- Xvfb
@@ -376,23 +426,49 @@ hits2 = pix.count(c2)
 distinct = len(set(pix[i:i+3] for i in range(0, min(len(pix), w*3*40), 3)))
 # the Programs button's THEMED start icon (solid gold PNG from the
 # fixture theme) — proves the button uses the icon theme, not a glyph
-start_icon = pix[:w*34*3].count(bytes((0xd4, 0xb1, 0x06)))
-# the workspace PAGER miniatures: the (focused) window on this desktop
-# renders as an accent block inside the bar; both test windows live on
-# ws 1, so its cell shows one focused miniature
-pager_foc = pix[:w*34*3].count(bytes((0x6f, 0xaa, 0xe8)))
+start_icon = pix[:w*46*3].count(bytes((0xd4, 0xb1, 0x06)))
+# the workspace PAGER miniatures: every test window lives on ws 1, so
+# the CURRENT (accent) cell carries their miniatures — the focused
+# one near-white, the others slate. Scan the CELL BAND as a real 2D
+# region (rows 3..36, cols 145..420 — measured on the X11 dock):
+# the previous flat slice bar[120*3:420*3] read exactly ONE row (row
+# 0: pure bar background), so every count came back zero even with
+# a perfect pager. ±2 tolerance: GTK's rgba→pixel conversion rounds
+# the slate fill to #9ea3ae (one LSB off the nominal #9ea3ad).
+def pnp(x, y):
+    i = (y*w + x)*3
+    return (pix[i], pix[i+1], pix[i+2])
+pager_foc = pager_unf = pager_bg = 0
+for y in range(3, 37):
+    for x in range(145, 421):
+        r, g, b = pnp(x, y)
+        if r >= 0xe0 and g >= 0xe0 and b >= 0xe0:
+            pager_foc += 1
+        elif abs(r-0x9e) <= 2 and abs(g-0xa3) <= 2 and abs(b-0xad) <= 2:
+            pager_unf += 1
+        elif abs(r-0x47) <= 2 and abs(g-0x75) <= 2 and abs(b-0xc7) <= 2:
+            pager_bg += 1
 print(f"pixels: {w}x{h}, window1={hits1}px, window2={hits2}px, distinct-colors(top40rows)={distinct}, "
-      f"start-icon-gold={start_icon}, pager-focused={pager_foc}")
+      f"start-icon-gold={start_icon}, pager-focused={pager_foc}, "
+      f"pager-unfocused={pager_unf}, pager-bg={pager_bg}")
 ok = hits1 > 500 and hits2 > 500 and distinct >= 3
-sys.exit(0 if (ok and start_icon > 100 and pager_foc > 6) else 1)
+sys.exit(0 if (ok and start_icon > 60 and pager_foc > 4 and
+               pager_unf > 4 and pager_bg > 20) else 1)
 PYEOF
+# capture the pixel verdict IMMEDIATELY: a later [ $? -eq 0 ] tested
+# the if/fi block above instead of this python — the check's failure
+# (pager miniatures missing, start icon gone, …) was silently
+# swallowed and the harness reported PASS
+PIXEL_RC=$?
+[ "$PIXEL_RC" -eq 0 ] && ok "screenshot shows managed windows + painted desktop" \
+    || bad "screenshot pixel check failed (windows/pager/start-icon)"
 
 echo "== harness-xvfb: Programs menu (shared app database) =="
 # deterministic application database — the panel process reads
 # XDG_DATA_HOME at .desktop scan time
-# click the Programs button (panel top-left, same geometry as the
-# Wayland panel), screenshot, verify the menu: search field + content
-"$(tc vt-x11-testclient)" --seconds 1 --click 63,17 \
+# click the Programs button (panel top-left; the GTK panel is 45 rows
+# tall), screenshot, verify the menu: dark popover + light text/icons
+"$(tc vt-x11-testclient)" --seconds 2 --click 60,22 \
     --screenshot "$WORK/menu.ppm" > "$WORK/menu.log" 2>&1 &
 MPID=$!
 for i in $(seq 1 40); do
@@ -415,25 +491,29 @@ while len(vals) < 3:
 pos += 1
 w, h, _ = vals
 pix = data[pos:pos + w*h*3]
-# the menu popup sits below the 34px panel: search field background
-# 0x2a2e35 is opaque → exactly matchable
-band = pix[(38*w)*3 : (72*w)*3]
-search_bg = band.count(bytes((0x2a, 0x2e, 0x35)))
-# text presence must be FONT-INDEPENDENT (Xft renders with the system
-# 'sans' font): count LIGHT pixels instead of exact text-color pixels —
-# thinner fonts (Carlito/Noto) antialias to fewer exact-color pixels
-# and broke the exact-count variant on real machines.
-menu_area = pix[(38*w)*3 : (250*w)*3]
+# the GTK popover spans ~560px below the 45-row panel: dark
+# translucent backdrop + rendered text. Light-pixel counting is
+# FONT-INDEPENDENT (any antialiased text produces bright pixels).
+menu_area = pix[(48*w)*3 : (420*w)*3]
 light = 0
 for i in range(0, len(menu_area), 3):
     if menu_area[i] >= 0x90 and menu_area[i+1] >= 0x90 and menu_area[i+2] >= 0x90:
         light += 1
-# the probe application's ICON (solid 0xc04080 PNG) must render in
-# the app row — icon-theme lookup + decode + XRender compositing
-icon_px = pix.count(bytes((0xc0, 0x40, 0x80)))
-print(f"menu: search-bg={search_bg} light-text={light} icon-px={icon_px}")
-# search field + rendered text + rendered icon = the REAL Programs menu
-sys.exit(0 if search_bg > 2000 and light > 120 and icon_px > 200 else 1)
+# the probe application's ICON (solid 0xc04080 PNG) renders through
+# GtkIconTheme — icon-theme lookup + decode + GDK compositing.
+# The GTK4 panel scales the 24px fixture to the 22px row height with
+# filtering — exact-color counting finds ZERO pixels. Count pixels
+# NEAR the fixture color (tolerance per channel) instead: the icon's
+# resampled body, not its antialiased edge.
+near = 0
+for i in range(0, len(pix) - 2, 3):
+    if abs(pix[i] - 0xc0) <= 24 and abs(pix[i+1] - 0x40) <= 24 and \
+       abs(pix[i+2] - 0x80) <= 24:
+        near += 1
+icon_px = near
+print(f"menu: light-text={light} icon-px={icon_px}")
+# rendered text + rendered icon = the REAL Programs menu
+sys.exit(0 if light > 150 and icon_px > 100 else 1)
 PYMENU
   [ $? -eq 0 ] && ok "Programs menu opened (search bar + text rendered)" \
     || bad "Programs menu did not open/render"
@@ -448,8 +528,15 @@ kill $MPID 2>/dev/null; wait $MPID 2>/dev/null
 # --- application row 0 — the marker file proves the full X11 launch
 # --- chain (row hit-test → .desktop Exec → spawn) end to end
 echo "== harness-xvfb: application launch from the Programs menu =="
+# the probe sorts alone in the DEFAULT category (Accessories): its row
+# is the first in the right column; GTK margins vary per theme, so try
+# a few row heights (misses land on empty list space, harmless)
+CLICKS=""
+for row_y in 120 140 160 180 200 220; do
+  CLICKS="${CLICKS:+$CLICKS;}300,$row_y"
+done
 "$(tc vt-x11-testclient)" --no-windows --seconds 0 \
-    --clicks "80,89;300,89" > "$WORK/clicks.log" 2>&1
+    --clicks "$CLICKS" > "$WORK/clicks.log" 2>&1
 LAUNCHED=""
 for i in $(seq 1 30); do
   [ -f "$WORK/x11-launch-marker" ] && { LAUNCHED=1; break; }
@@ -460,9 +547,6 @@ if [ -n "$LAUNCHED" ] && grep -q "launched" "$WORK/x11-launch-marker"; then
 else
   bad "application did not launch from the X11 menu"
 fi
-
-[ $? -eq 0 ] && ok "screenshot shows managed windows + painted desktop" \
-  || bad "screenshot pixel check failed"
 
 # ------------------------------------------------------------- shutdown
 echo "== harness-xvfb: logout round-trip (graceful) =="

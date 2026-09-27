@@ -89,28 +89,41 @@ focus-follows-mouse can set `[wm] focus=sloppy`.
 
 ## The panel
 
-* LEFT: **Programs** button → application menu from the SHARED vt-apps
-  database (the same `.desktop` parser, locale-aware name selection and
-  category table the Wayland panel uses — Russian `Name[ru]` lines are
-  resolved per locale instead of leaking into English sessions) with a
-  **search bar** (click the field, type to filter; BackSpace edits,
-  Escape clears/closes), **wheel scrolling**, icon-theme icons and a
-  Quit Session entry; window/task list for the CURRENT workspace
-  (titles with ellipsis, `_NET_WM_ICON` window icons, focused/minimized
-  states, click focuses, middle-click or click-on-focused minimizes,
-  right-click closes)
-* RIGHT: workspace buttons (glow follows `_NET_CURRENT_DESKTOP` via the
-  WM's workspace-changed broadcast), network indicator (real
-  `/sys/class/net` + `/proc/net/wireless` state), volume (native ALSA,
-  real mixer values, wheel + popup slider), clock (date AND time) with
-  the calendar popup, username + session menu
-* Icons come from the user's icon theme (`gtk-icon-theme-name` from
-  gtk-3.0/gtk-4.0 settings.ini, or `$VANTAGE_ICON_THEME`) via a real
-  icon-theme-spec lookup (index.theme Directories + Inherits chain +
-  hicolor + pixmaps fallback) — nothing is hard-coded to one theme.
+The panel is `vantage-panel` — a GTK4 client (subprojects/panel, an
+independent subproject) that docks as a REAL EWMH dock:
+`_NET_WM_WINDOW_TYPE_DOCK` + `_NET_WM_STATE_ABOVE` +
+`_NET_WM_STRUT_PARTIAL` sized to its actual rendered height. It is the
+SAME binary that docks through wlr-layer-shell on the native Wayland
+compositor — one panel, both backends, driven entirely by the WM IPC
+protocol (window list, geometry, workspaces, actions).
+
+* LEFT: **Programs** button → application menu built on GLib's
+  GDesktopAppInfo (locale-aware `.desktop` parsing — Russian
+  `Name[ru]` lines resolve per locale, categories, `NoDisplay` /
+  `NotShowIn` / `TryExec` filtering) with a **search bar** (click the
+  field, type to filter; BackSpace edits, Escape clears/closes),
+  themed icons via GtkIconTheme and a Quit Session entry; taskbar for
+  the CURRENT workspace (titles with ellipsis, `_NET_WM_ICON` window
+  icons, focused/minimized states, click focuses, click-on-focused
+  minimizes)
+* CENTER: workspace buttons (the active cell follows
+  `_NET_CURRENT_DESKTOP` via the WM's workspace-changed broadcast)
+* RIGHT: network indicator (real `/sys/class/net` +
+  `/proc/net/wireless` state), volume (native ALSA, real mixer values,
+  wheel + popup slider), clock (date AND time), username + session
+  menu
 * Window placement cascades within the workarea; when a panel docks
   (strut changes) existing windows that would end up hidden behind it
   are nudged back inside the new workarea.
+* Plain click-to-focus no longer grabs Button1: the WM OBSERVES
+  ButtonPress instead. A core XGrabButton+ReplayPointer pair replays
+  presses through the core protocol only, which Xorg does not
+  translate to XInput2 — XI2-only toolkits (GDK4 — every GTK4 app,
+  the panel itself) never saw plain clicks. Observed presses deliver
+  one copy to the WM (focus/raise) while the client keeps its own.
+* Docks never take keyboard focus (EWMH): focusing the panel would rip
+  the keyboard out of a popover the same click just opened — GTK
+  popovers close on focus-out, so the start menu would flash shut.
 
 ## Dependencies
 
@@ -173,9 +186,8 @@ an app toggling its CSD on/off is followed immediately. Partial
 decoration requests (border-only, etc.) still get the Vantage frame.
 
 The panel's Programs button uses the active icon theme's `start-here`
-icon (XFCE-style); menu and taskbar icons render at 24px/20px with
-area-averaged resampling, and SVG icon themes rasterize at the exact
-display size. The workspace switcher is a real PAGER: every cell shows
-that desktop's windows at their true relative position and size
-(minimized windows stay in the taskbar only, per the user's
-preference), click switches desktops, the wheel cycles them.
+icon (XFCE-style) resolved through GtkIconTheme. The workspace
+switcher is a real PAGER: every cell shows that desktop's windows at
+their true relative position and size (minimized windows stay in the
+taskbar only, per the user's preference), click switches desktops, the
+wheel cycles them.

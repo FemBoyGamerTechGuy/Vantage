@@ -40,29 +40,31 @@ New features, minimal overhead.
 - **Live video wallpapers** via ffmpeg — event-driven, pauses when a
   fullscreen window covers the desktop, plus PNG/JPEG still wallpapers
   loaded directly through libpng/libjpeg (no gdk-pixbuf).
-- **A real panel**: dock window with struts, XRender/Xft drawing, live
-  tasklist with per-window `_NET_WM_ICON` icons (area-averaged at 20px),
-  a **workspace PAGER** (every cell is a miniature of that desktop with
-  its windows at their true position and size — click to switch, wheel
-  to cycle), a **Programs menu** built from the shared `.desktop`
-  database (search bar, scrolling, **themed start-button icon and 24px
-  menu icons** — SVG themes rasterize at the exact display size,
-  locale-aware names — Russian and other non-English entries render
-  correctly via per-codepoint font fallback), calendar popup, ALSA
-  volume slider (real mixer values), a functional network indicator,
-  and a username/session menu (Lock, Suspend, Switch User, Log Out,
-  Reboot, Shutdown, Exit) — all on real system mechanisms
-  (logind/elogind, ACPI).
-- **A compositor-drawn panel on native Wayland** (no XWayland, no
-  placeholder blocks): Programs button with the SAME shared application
-  database and menu features (search, scrolling, themed start icon,
-  24px theme icons, categories), a real taskbar (app icons via `app_id`,
-  adaptive widths, focused/minimized states, click-to-focus,
-  click-again-to-minimize), the workspace PAGER with live miniatures,
-  network + volume (ALSA) controls, clock + calendar, and the full
-  session menu — rendered with FreeType text directly into the scanout
-  framebuffer. The desktop background is the SAME `[wallpaper]` config
-  the X11 desktop renders (gradient/color/image, cover-scaled).
+- **One GTK4 panel for both backends** (`subprojects/panel`, an
+  independent subproject — own build, no compositor code, talks to
+  the WM through the documented IPC protocol only): docks through
+  **wlr-layer-shell** on the native Wayland compositor (exclusive
+  zone = the workarea; maximized windows never cover it) and as an
+  **EWMH dock** (`_NET_WM_WINDOW_TYPE_DOCK` + struts) on X11 — the
+  same binary, the same look. It carries a live tasklist (window
+  icons via `_NET_WM_ICON`/`app_id`, focused/minimized states,
+  click-to-focus, click-again-to-minimize), a **workspace PAGER**
+  (every cell is a live miniature of that desktop — windows at their
+  true position and size, click to switch, wheel to cycle), a
+  **Programs menu** built from GDesktopAppInfo (search bar,
+  categories, themed icons — locale-aware names handled by GLib),
+  network + volume (real ALSA mixer) applets, a clock, and the
+  session menu (Lock, Suspend, Switch User, Log Out, Reboot,
+  Shutdown, Exit) — all on real system mechanisms (logind/elogind,
+  ACPI) routed through the session manager so a logout ends the
+  WHOLE session.
+- **XWayland built in**: X11 apps run on the native Wayland session
+  through the compositor's own Xwayland management (`xwayland_shell_v1`
+  window association, ICCCM/EWMH-aware) — legacy X11 applications
+  appear in the SAME taskbar, pager and alt-tab as native Wayland
+  windows, with no extra configuration. The desktop background on
+  Wayland is the SAME `[wallpaper]` config the X11 desktop renders
+  (gradient/color/image, cover-scaled).
 - **Real Wayland clients work — and stay alive**: xdg-shell toplevels
   AND popups (real positioner placement, grabs, popup_done dismissal),
   xdg-decoration (CSD apps are never double-decorated; server-mode

@@ -299,6 +299,24 @@ int main(int argc, char **argv) {
         if (vtnr && *vtnr)
             setenv("VANTAGE_VT", vtnr, 1);
     }
+    /* Deterministic Wayland socket: the compositor binds exactly this
+     * name (VANTAGE_WAYLAND_SOCKET) and the session exports the same
+     * value as WAYLAND_DISPLAY for every child (panel, autostart apps)
+     * — no runtime-dir polling, no races. */
+    if (kind == VT_BACKEND_WAYLAND && !getenv("VANTAGE_WAYLAND_SOCKET")) {
+        char sock[32];
+        for (int i = 0; i < 64; i++) {
+            snprintf(sock, sizeof(sock), "wayland-%d", i);
+            char full[512];
+            const char *rd = getenv("XDG_RUNTIME_DIR");
+            snprintf(full, sizeof(full), "%s/%s",
+                     rd && *rd ? rd : "/tmp", sock);
+            if (access(full, F_OK) != 0) {
+                setenv("VANTAGE_WAYLAND_SOCKET", sock, 1);
+                break;
+            }
+        }
+    }
 
     static const char *src_name[] = { "command line", "environment",
                                       "configuration", "auto-detection" };
@@ -338,36 +356,55 @@ int main(int argc, char **argv) {
     vt_session_spawn_managed(s, "wm", wm_cmd, true);
     vt_free(wm_cmd);
 
-    if (kind == VT_BACKEND_X11) {
-        /* The panel and desktop are X11 clients; they run under the X11
-         * backend on any conforming X server. */
-        if (vt_config_get_bool(cfg, "panel", "enabled", true)) {
-            char *bin = vt_paths_bin_find("vantage-panel");
-            if (bin) {
-                char *cmd = vt_strprintf("\"%s\"", bin);
-                vt_session_spawn_managed(s, "panel", cmd, false);
-                vt_free(cmd);
-                vt_free(bin);
+    /* ONE panel for both backends: the GTK4 panel (subprojects/panel)
+     * docks through layer-shell on Wayland and as an EWMH dock on X11.
+     * The desktop is X11-only (the Wayland compositor paints it). */
+    if (kind == VT_BACKEND_WAYLAND) {
+        /* the compositor binds the socket asynchronously after startup;
+         * children need it as WAYLAND_DISPLAY, so wait for it (the
+         * compositor logs its 15 stages; 15 s covers cold GPU init) */
+        const char *want = getenv("VANTAGE_WAYLAND_SOCKET");
+        if (want && *want) {
+            char full[512];
+            const char *rd = getenv("XDG_RUNTIME_DIR");
+            snprintf(full, sizeof(full), "%s/%s",
+                     rd && *rd ? rd : "/tmp", want);
+            for (int i = 0; i < 150; i++) {
+                if (access(full, F_OK) == 0) break;
+                vt_session_supervise(s);
+                vt_time_sleep_ms(100);
+            }
+            if (access(full, F_OK) == 0) {
+                setenv("WAYLAND_DISPLAY", want, 1);
+                vt_logi("session: compositor socket %s ready", want);
             } else {
-                vt_logw("session: vantage-panel not found; skipping");
+                vt_logw("session: compositor socket %s did not appear "
+                        "within 15 s; panel may fail to connect", want);
             }
         }
-        if (vt_config_get_bool(cfg, "desktop", "show", true)) {
-            char *bin = vt_paths_bin_find("vantage-desktop");
-            if (bin) {
-                char *cmd = vt_strprintf("\"%s\"", bin);
-                vt_session_spawn_managed(s, "desktop", cmd, false);
-                vt_free(cmd);
-                vt_free(bin);
-            } else {
-                vt_logw("session: vantage-desktop not found; skipping");
-            }
+    }
+    if (vt_config_get_bool(cfg, "panel", "enabled", true)) {
+        char *bin = vt_paths_bin_find("vantage-panel");
+        if (bin) {
+            char *cmd = vt_strprintf("\"%s\"", bin);
+            vt_session_spawn_managed(s, "panel", cmd, false);
+            vt_free(cmd);
+            vt_free(bin);
+        } else {
+            vt_logw("session: vantage-panel not found; skipping");
         }
-    } else {
-        vt_logi("session: the Wayland session draws its panel inside the "
-                "compositor (Vantage menu, window list, workspaces, clock, "
-                "session controls); the X11 panel/desktop clients are not "
-                "needed there");
+    }
+    if (kind == VT_BACKEND_X11 &&
+        vt_config_get_bool(cfg, "desktop", "show", true)) {
+        char *bin = vt_paths_bin_find("vantage-desktop");
+        if (bin) {
+            char *cmd = vt_strprintf("\"%s\"", bin);
+            vt_session_spawn_managed(s, "desktop", cmd, false);
+            vt_free(cmd);
+            vt_free(bin);
+        } else {
+            vt_logw("session: vantage-desktop not found; skipping");
+        }
     }
 
     /* 4. XDG autostart (system + user) */

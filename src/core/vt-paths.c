@@ -345,12 +345,43 @@ char *vt_paths_bin_find(const char *name)
 
     /* 2. next to the running executable: the build-tree output
      *    directory (all tools live in <builddir>/src/tools) or the
-     *    installed bindir */
+     *    installed bindir. The panel is an independent subproject and
+     *    lands in <builddir>/subprojects/panel — look there too. */
     _ensure();
     if (_S.bin_dir) {
         char *cand = vt_path_join(_S.bin_dir, name);
         if (access(cand, X_OK) == 0) return cand;
         vt_free(cand);
+        /* <builddir>/src/tools → <builddir>/subprojects/panel */
+        char *sub = vt_path_join(_S.bin_dir, "../../subprojects/panel");
+        char *cand2 = vt_path_join(sub, name);
+        vt_free(sub);
+        if (cand2 && access(cand2, X_OK) == 0) return cand2;
+        vt_free(cand2);
+        /* repo-root launch symlinks (./build creates them) — accepted
+         * only when they resolve into THIS build tree: a second build
+         * directory (e.g. an ASan build) must not have its children
+         * silently stolen from the release build's symlinks */
+        char *root = vt_path_join(_S.bin_dir, "../../../");
+        char *cand3 = vt_path_join(root, name);
+        vt_free(root);
+        if (cand3 && access(cand3, X_OK) == 0) {
+            char resolved[PATH_MAX];
+            if (realpath(cand3, resolved)) {
+                char buildroot[PATH_MAX];
+                if (realpath(_S.bin_dir, buildroot)) {
+                    /* strip /src/tools → the build directory itself */
+                    char *tail = strstr(buildroot, "/src/tools");
+                    if (tail) *tail = 0;
+                    if (strncmp(resolved, buildroot,
+                                strlen(buildroot)) == 0) {
+                        vt_free(cand3);
+                        return vt_strdup(resolved);
+                    }
+                }
+            }
+        }
+        vt_free(cand3);
     }
 
     /* 3. $PATH */

@@ -112,6 +112,7 @@ ensure_built() {      # $1: builddir, $2: prefix, $3: buildtype, $4..: extra arg
 #   ./vantage-session --x11
 link_tree_binaries() {
     local tools_dir="$BUILD/src/tools"
+    local panel_dir="$BUILD/subprojects/panel"
     local names="vantage-session vantage-wm vantage-panel vantage-desktop
                  vantage-settings vantage-config vantage-renderer
                  vantage-theme vantage-diagnostics vantage-remote"
@@ -119,6 +120,11 @@ link_tree_binaries() {
     for n in $names; do
         if [ -x "$tools_dir/$n" ]; then
             ln -sfn "$BUILD_DIR_NAME/src/tools/$n" "$ROOT/$n"
+            linked=$((linked+1))
+        elif [ "$n" = "vantage-panel" ] && [ -x "$panel_dir/$n" ]; then
+            # the panel is an independent subproject — same repo-root
+            # launch experience as the other binaries
+            ln -sfn "$BUILD_DIR_NAME/subprojects/panel/$n" "$ROOT/$n"
             linked=$((linked+1))
         else
             rm -f "$ROOT/$n"

@@ -1,5 +1,5 @@
 project('vantage', 'c',
-  version : '0.2.0',
+  version : '0.3.0',
   default_options : [
     'c_std=c17',
     'warning_level=2',
@@ -92,6 +92,14 @@ if ext_isystem.length() > 0
   add_project_arguments(ext_isystem, language : 'c')
 endif
 
+# The desktop panel: an INDEPENDENT subproject (own build + license,
+# pure GTK4, no compositor code — talks to the WM through the Vantage
+# IPC protocol only). Same binary on X11 and Wayland.
+sub_panel = subproject('panel', required : true)
+sub_dep_gtk4            = sub_panel.get_variable('dep_gtk')
+sub_dep_gtk4_layer_shell = sub_panel.get_variable('dep_layer_shell')
+sub_dep_alsa            = sub_panel.get_variable('dep_alsa')
+
 # Dependency detection -- everything optional is optional
 dep_libm     = cc.find_library('m', required : false)
 dep_librt    = cc.find_library('rt', required : false)
@@ -180,6 +188,9 @@ dep_jsonc          = dependency('json-c',         required : false)
 summary({
   'prefix'         : vt_prefix,
   'c_std'          : get_option('c_std'),
+  'panel (subprojects/panel, GTK4)' : sub_dep_gtk4.found(),
+  'panel layer-shell' : sub_dep_gtk4_layer_shell.found(),
+  'panel ALSA mixer'  : sub_dep_alsa.found(),
   'wayland-server' : dep_wayland_server.found(),
   'wayland-client' : dep_wayland_client.found(),
   'x11'            : dep_x11.found() or dep_xcb.found(),

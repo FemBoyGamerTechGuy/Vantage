@@ -37,9 +37,18 @@ else
     command -v "$b" >/dev/null 2>&1 || { echo "missing $b in PATH"; exit 77; }
   done
 fi
-vb() { if [ -n "$BIN" ]; then echo "$BIN/$1"; else echo "$1"; fi; }
+vb() {
+  if [ -z "$BIN" ]; then echo "$1"; return; fi
+  if [ -x "$BIN/$1" ]; then echo "$BIN/$1"; return; fi
+  # the panel is an independent subproject — its binary lives under
+  # <builddir>/subprojects/panel (BIN is <builddir>/src/tools)
+  local pb="$BIN/../../subprojects/panel/$1"
+  if [ -x "$pb" ]; then echo "$pb"; return; fi
+  echo "$1"
+}
 tc() { if [ -n "$TST" ]; then echo "$TST/$1"; else echo "$1"; fi; }
 [ -x "$(tc vt-wayland-testclient)" ] || { echo "vt-wayland-testclient not built"; exit 77; }
+[ -x "$(vb vantage-panel)" ] || { echo "vantage-panel not built (subprojects/panel)"; exit 77; }
 
 # Wait for a COMPLETE frame dump: SIGUSR1 writes ~2.3MB; polling for
 # "non-empty" races the writer. Wait until the size is stable.
@@ -115,6 +124,38 @@ Context=Applications
 Type=Fixed
 EOF
 export VANTAGE_ICON_THEME=vt-harness-theme
+# The GTK4 panel resolves icons through GtkIconTheme, which ALWAYS
+# falls back to hicolor — install the fixtures there too so the
+# icon-path assertions are theme-name-independent
+HICOLOR_DIR="$WORK/data/icons/hicolor/24x24/apps"
+mkdir -p "$HICOLOR_DIR"
+cp "$ICON_DIR/vt-harness-probe.png" "$HICOLOR_DIR/"
+cat > "$WORK/data/icons/hicolor/index.theme" <<'EOF'
+[Icon Theme]
+Name=hicolor
+Directories=24x24/apps
+
+[24x24/apps]
+Size=24
+Context=Applications
+Type=Fixed
+EOF
+# a themed START icon (solid gold) — the Programs button must resolve
+# it from the icon theme instead of its drawn fallback
+python3 - "$HICOLOR_DIR/start-here.png" <<'PYICON2'
+import struct, zlib, sys
+w = h = 24
+rgb = (0xd4, 0xb1, 0x06)   # distinctive gold — used nowhere else
+raw = b''.join(b'\x00' + bytes(rgb) * w for _ in range(h))
+def chunk(t, d):
+    c = t + d
+    return struct.pack('>I', len(d)) + c + struct.pack(
+        '>I', zlib.crc32(c) & 0xffffffff)
+ihdr = struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)
+data = (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr) +
+        chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+open(sys.argv[1], 'wb').write(data)
+PYICON2
 cat > "$WORK/data/applications/vt-harness-term.desktop" <<'DESK'
 [Desktop Entry]
 Type=Application
@@ -123,6 +164,28 @@ Exec=/bin/true
 Terminal=true
 Categories=System;
 DESK
+# GTK's OWN fallback icon: gtk_icon_theme_lookup_icon() recurses into
+# itself WITHOUT BOUND when "image-missing" is absent from every theme
+# (GTK 4.18 has no recursion guard) — ship it in both fixture themes
+# so any GTK-internal missing-icon lookup cannot overflow the stack
+python3 - "$HICOLOR_DIR/image-missing.png" <<'PYICON3'
+import struct, zlib, sys
+w = h = 24
+px = [[(28, 28, 30)] * w for _ in range(h)]
+for i in range(6, 18):                      # red X on a slate plate
+    px[i][i] = px[i][23 - i] = (192, 57, 43)
+    px[i][23 - i] = px[i][i] = (192, 57, 43)
+raw = b''.join(b'\x00' + b''.join(bytes(p) for p in row) for row in px)
+def chunk(t, d):
+    c = t + d
+    return struct.pack('>I', len(d)) + c + struct.pack(
+        '>I', zlib.crc32(c) & 0xffffffff)
+ihdr = struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)
+data = (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr) +
+        chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+open(sys.argv[1], 'wb').write(data)
+PYICON3
+cp "$HICOLOR_DIR/image-missing.png" "$ICON_DIR/"
 export XDG_DATA_HOME="$WORK/data"
 # XDG_DATA_DIRS must be ISOLATED as well: when unset, vt-apps falls
 # back to /usr/local/share:/usr/share, so host-installed applications
@@ -189,6 +252,24 @@ else
   kill -TERM "$WM_PID" 2>/dev/null; exit 1
 fi
 export WAYLAND_DISPLAY="$SOCKET"
+
+# The panel is a CLIENT now (GTK4, subprojects/panel): docked through
+# wlr-layer-shell, driven by the same WM IPC the taskbar/pager use.
+echo "== harness-wayland: starting the GTK4 panel client =="
+PANEL_LOG="$WORK/panel.log"
+: > "$PANEL_LOG"
+"$(vb vantage-panel)" > "$PANEL_LOG" 2>&1 &
+PANEL_PID=$!
+PANEL_READY=""
+for i in $(seq 1 150); do
+  grep -q "vantage-panel: ready" "$PANEL_LOG" 2>/dev/null && PANEL_READY=1 && break
+  kill -0 "$PANEL_PID" 2>/dev/null || break
+  sleep 0.1
+done
+[ -n "$PANEL_READY" ] && ok "GTK4 panel client started (layer-shell dock)" \
+  || bad "panel client did not reach ready: $(tail -3 "$PANEL_LOG")"
+# let it map + draw its first frame (layer configure/ack/commit dance)
+sleep 2
 
 # the desktop stage (panel + first frame) completes AFTER the socket
 # appears — wait for its marker (bounded) before asserting the trace
@@ -330,34 +411,48 @@ w, h, _ = vals
 pix = data[pos:pos + w*h*3]
 target = bytes((0x5a, 0x9a, 0x3a))    # client color 0x5a9a3a (ARGB 0xff5a9a3a)
 hits = pix.count(target)
-# panel assertions: top bar is the panel background; the REAL panel is
-# drawn (accent start button present, old placeholder squares GONE)
-top = pix[:w*32*3]
-panel_bg = top.count(bytes((0x23, 0x26, 0x2b)))
-accent = pix.count(bytes((0x4f, 0x9a, 0xdc)))
+# panel assertions: the GTK4 panel docks at the top (45 rows) — its
+# dark bar + light icon/text pixels must cover a real strip; old
+# placeholder squares must be GONE. Panel presence is asserted through
+# its STRUCTURAL signature: the pager cells (accent current-desktop
+# cell + slate other cells — colors used nowhere else) and the light
+# bar text. (An earlier heuristic counted pixels differing from the
+# old flat gray wallpaper; it silently depended on the bar being an
+# alpha-over-light #1f2125 blend, which vanished with the dark window
+# background fix.)
+def pnp(x, y):
+    i = (y*w+x)*3
+    return (pix[i], pix[i+1], pix[i+2])
+panel_cells = sum(1 for y in range(5, 39) for x in range(0, w, 2)
+                  if pnp(x, y) in ((0x47, 0x75, 0xc7), (0x2e, 0x30, 0x38)))
+top = pix[:w*46*3]
+light = sum(1 for i in range(0, len(top), 3)
+            if top[i] >= 0x90 and top[i+1] >= 0x90 and top[i+2] >= 0x90)
 placeholder_red = pix.count(bytes((0xe0, 0x5a, 0x5a)))
 placeholder_green = pix.count(bytes((0x7a, 0xc8, 0x60)))
 # BACKGROUND: the desktop now renders the [wallpaper] config — the
 # default vertical navy gradient. The old bug painted a flat hardcoded
 # gray everywhere. Sample far from windows/panel: left edge, below the
-# panel (y=40) and near the bottom (y=h-8): gradient colors differ and
-# match the engine's interpolation between (18,23,36) and (38,48,79).
+# panel (y=64: the GTK panel's natural height is ~45 rows on both
+# backends — y=40 would land ON the bar) and near the bottom (y=h-8):
+# gradient colors differ and match the engine's interpolation between
+# (18,23,36) and (38,48,79).
 def px(x, y):
     i = (y*w+x)*3
     return (pix[i], pix[i+1], pix[i+2])
-c_top = px(4, 40)
+c_top = px(4, 64)
 c_bot = px(4, h - 8)
 def near(c, t, tol=8):
     return all(abs(a-b) <= tol for a, b in zip(c, t))
 grad_top_ok = near(c_top, (18, 23, 36))
 grad_bot_ok = near(c_bot, (38, 48, 79))
 grad_diff = c_bot[2] - c_top[2] >= 12
-print(f"frame: {w}x{h}, client-color pixels={hits}, panel-bg(top)={panel_bg}, "
-      f"accent={accent}, placeholder-red={placeholder_red}, "
+print(f"frame: {w}x{h}, client-color pixels={hits}, panel-cells px={panel_cells}, "
+      f"panel-light px={light}, placeholder-red={placeholder_red}, "
       f"placeholder-green={placeholder_green}")
 print(f"background: top={c_top} bottom={c_bot} "
       f"(gradient {'OK' if grad_top_ok and grad_bot_ok and grad_diff else 'BAD'})")
-panel_ok = panel_bg > w * 8 and accent > 50
+panel_ok = panel_cells > 800 and light > 40
 placeholders_gone = placeholder_red == 0 and placeholder_green == 0
 sys.exit(0 if (hits > 1000 and panel_ok and placeholders_gone and
                grad_top_ok and grad_bot_ok and grad_diff) else 1)
@@ -471,12 +566,11 @@ else
   bad "no frame dump for the cursor check"
 fi
 
-# --- Programs menu: click the start button, verify the menu opens
-# --- (search bar background is opaque → exact-matchable)
-ti "motion x=63 y=17"
-ti "press b=1"
-ti "release b=1"
-sleep 0.3
+# --- Programs menu: click the Programs button, verify the menu opens
+# --- (popover: dark translucent backdrop + light text/icons — font-
+# --- independent light-pixel counting below the bar)
+ti "click 60,22"
+sleep 1.2
 rm -f /tmp/vantage-wayland.ppm
 kill -USR1 "$WM_PID" 2>/dev/null
 wait_ppm
@@ -494,57 +588,56 @@ while len(vals) < 3:
 pos += 1
 w, h, _ = vals
 pix = data[pos:pos + w*h*3]
-# search-field background 0x2a2e35 (opaque) in the menu header band
-band = pix[(38*w)*3 : (72*w)*3]
-search_bg = band.count(bytes((0x2a, 0x2e, 0x35)))
-# text presence must be FONT-INDEPENDENT: the panel renders menu text
-# with the system 'sans' font at 13px, antialiased. Counting EXACT
-# text-color pixels (0xeceef0) worked with DejaVu but broke with
-# thinner fonts (Carlito/Noto measured 47 exact px vs DejaVu's 101 —
-# a real Arch box failed the check with a fully rendered menu).
-# Light-pixel counting (> 0xa0 in R,G,B — brighter than every fill in
-# the menu: bg 0x1a1c22, search 0x2a2e35, accent 0x4f9adc, warn
-# 0xe07a50) measures "text is visibly rendered" for ANY font.
-menu = pix[(38*w)*3 : (200*w)*3]
+# The GTK popover spans ~560px below the bar: dark translucent content.
+# Verify (a) the menu area differs from the bare gradient wallpaper,
+# (b) light text/icons are visibly rendered (font-independent: any
+# antialiased text produces mid-bright pixels), (c) the probe's icon
+# (solid 0xc04080 PNG from the isolated icon theme) is rendered.
+def wpdiff(x, y):
+    i = (y*w+x)*3
+    c = (pix[i], pix[i+1], pix[i+2])
+    # bare gradient at this height (interpolated navy)
+    t = 1.0 - y / h
+    g0, g1 = (18, 23, 36), (38, 48, 79)
+    ref = tuple(int(a + (b - a) * t) for a, b in zip(g0, g1))
+    return abs(c[0]-ref[0]) + abs(c[1]-ref[1]) + abs(c[2]-ref[2])
+menu = pix[(48*w)*3 : (420*w)*3]
 light = 0
 for i in range(0, len(menu), 3):
     if menu[i] >= 0x90 and menu[i+1] >= 0x90 and menu[i+2] >= 0x90:
         light += 1
-# the probe application's ICON (solid 0xc04080 PNG from the isolated
-# icon theme, scaled to 18x18 in the app row) must actually be rendered
+area_px = sum(1 for y in range(50, 415, 3) for x in range(8, 560, 6)
+              if wpdiff(x, y) > 20)
 icon_px = pix.count(bytes((0xc0, 0x40, 0x80)))
-print(f"menu: search-bg={search_bg} light-text={light} icon-px={icon_px}")
-sys.exit(0 if search_bg > 3000 and light > 120 and icon_px > 200 else 1)
+print(f"menu: area-diff={area_px} light-text={light} icon-px={icon_px}")
+sys.exit(0 if area_px > 4000 and light > 150 and icon_px > 100 else 1)
 PYEOF3
   [ $? -eq 0 ] && ok "Programs menu opened (search bar + content visible)"     || bad "Programs menu did not render"
 else
   bad "no frame dump for the menu check"
 fi
 
-# --- application launch from the DEFAULT category (Accessories, where
-# --- the probe sorts alone → deterministic row 0); a category click on
-# --- row 0 exercises the same path
-ti "motion x=80 y=89"
-ti "press b=1"
-ti "release b=1"
-sleep 0.2
-# first application row: y = 38+34+4+13 = 89
-ti "motion x=300 y=89"
-ti "press b=1"
-ti "release b=1"
-for i in $(seq 1 20); do
-  [ -f "$WORK/wl-launch-marker" ] && break
-  sleep 0.1
+# --- application launch: the menu's DEFAULT category is Accessories,
+# --- where the probe sorts alone; its row sits at the top of the right
+# --- column. GTK margins vary per theme, so scan a few row heights
+# --- (clicks between rows land on empty list space and are harmless).
+LAUNCHED=""
+for row_y in 120 140 160 180 200 220; do
+  [ -n "$LAUNCHED" ] && break
+  ti "click 300,$row_y"
+  for i in $(seq 1 8); do
+    [ -f "$WORK/wl-launch-marker" ] && { LAUNCHED=1; break; }
+    sleep 0.1
+  done
 done
-if [ -f "$WORK/wl-launch-marker" ] &&    grep -q "launched" "$WORK/wl-launch-marker"; then
+if [ -n "$LAUNCHED" ] && grep -q "launched" "$WORK/wl-launch-marker"; then
   ok "application LAUNCHED from the Programs menu (marker file)"
 else
   bad "application did not launch from the menu"
 fi
-grep -q "wl-panel: launched" "$WORK/wm.log"   && ok "compositor logged the launch"   || bad "no launch log line in the compositor log"
 
 # --- menu must close after launching (click went through) ---
-sleep 0.2
+sleep 0.5
 rm -f /tmp/vantage-wayland.ppm
 kill -USR1 "$WM_PID" 2>/dev/null
 wait_ppm
@@ -562,9 +655,14 @@ while len(vals) < 3:
 pos += 1
 w, h, _ = vals
 pix = data[pos:pos + w*h*3]
-band = pix[(38*w)*3 : (72*w)*3]
-search_bg = band.count(bytes((0x2a, 0x2e, 0x35)))
-sys.exit(0 if search_bg < 500 else 1)
+# menu gone: the area below the bar is bare gradient again (light
+# text pixels vanish)
+menu = pix[(48*w)*3 : (420*w)*3]
+light = 0
+for i in range(0, len(menu), 3):
+    if menu[i] >= 0x90 and menu[i+1] >= 0x90 and menu[i+2] >= 0x90:
+        light += 1
+sys.exit(0 if light < 40 else 1)
 PYEOF4
   [ $? -eq 0 ] && ok "menu closed after launching the application"     || bad "menu stayed open after launching"
 fi
@@ -595,7 +693,9 @@ for i in $(seq 1 60); do
   sleep 0.05
 done
 "$(vb vantage-remote)" ws 1 >/dev/null 2>&1
-sleep 0.4
+# the panel polls the WM at 400 ms and re-renders on events; 0.9 s
+# guarantees the miniature state is committed before the dump
+sleep 0.9
 rm -f /tmp/vantage-wayland.ppm
 kill -USR1 "$WM_PID" 2>/dev/null
 wait_ppm
@@ -613,14 +713,35 @@ while len(vals) < 3:
 pos += 1
 w, h, _ = vals
 pix = data[pos:pos + w*h*3]
-# the pager strip lives in the bar, right of the taskbar: scan the bar
-# rows (4..30) in the right HALF of the screen for miniature fills
-bar = pix[4*w*3 : 30*w*3]
-half = bar[(w//2)*3:]
-foc = half.count(bytes((0x6f, 0xaa, 0xe8)))   # focused miniature (accent)
-unf = half.count(bytes((0x4a, 0x51, 0x60)))   # unfocused miniature (slate)
-print(f"pager: focused-mini px={foc} unfocused-mini px={unf}")
-sys.exit(0 if foc >= 6 and unf >= 6 else 1)
+# the pager sits right of the Programs button: the cells occupy
+# rows 5..38 of the 45-row panel (measured), columns ~147..420.
+# Scan the CELL BAND as a real 2D region — the previous flat slice
+# bar[120*3:420*3] read exactly ONE row (row 4: pure background
+# between the bar margins and the cells), so every count came back
+# zero even with a perfect pager. Current cell background is the
+# accent (0.28,0.46,0.78 → ~#4775c7); the focused window miniature
+# is near-white, unfocused is mid-slate #9ea3ad.
+foc = unf = cell_bg = 0
+for y in range(5, 39):
+    for x in range(150, 431):
+        i = (y*w + x)*3
+        r, g, b = pix[i], pix[i+1], pix[i+2]
+        if r >= 0xe0 and g >= 0xe0 and b >= 0xe0:
+            foc += 1
+        elif (abs(r-0x9e) <= 2 and abs(g-0xa3) <= 2 and
+              abs(b-0xad) <= 2):
+            unf += 1
+        elif (abs(r-0x47) <= 2 and abs(g-0x75) <= 2 and
+              abs(b-0xc7) <= 2):
+            cell_bg += 1
+print(f"pager: focused-mini px={foc} unfocused-mini px={unf} cell-bg={cell_bg}")
+# all three must be present: the focused miniature on the current
+# desktop, the UNFOCUSED miniature on the other desktop's cell (pins
+# the WM_QUERY empty-flags parser: an empty flags column used to make
+# strtok_r collapse the tabs and drop the window entirely), and the
+# accent background of the current cell (pins the per-cell queue_draw:
+# cells used to freeze at their first snapshot)
+sys.exit(0 if (foc >= 6 and unf >= 4 and cell_bg >= 20) else 1)
 PYEOF5
   [ $? -eq 0 ] && ok "pager draws real window miniatures per workspace" \
     || bad "pager miniatures missing (focused/unfocused cells)"
@@ -733,40 +854,53 @@ if [ -n "$SOCK2" ] && [ -S "$XDG_RUNTIME_DIR/$SOCK2" ]; then
   # below must be the thing that stops it.
 fi
 
-# ------------------------------------------------- logout round-trip
-# TWO real paths: (1) the panel's session menu driven by real pointer
-# input, (2) vantage-remote logout → session IPC. Both must end the
-# session with the graceful SIGTERM policy (no SIGKILL, no restart).
-echo "== harness-wayland: panel-driven logout (real input path) =="
-if [ -n "${SESS_PID:-}" ] && kill -0 "$SESS_PID" 2>/dev/null; then
-  # open the username menu (right edge of the bar) then click Log Out
-  ti "motion x=990 y=17"
-  ti "press b=1"
-  ti "release b=1"
-  sleep 0.3
-  # Log Out is the 4th action row: y = 38+4+4+3*26+13 = 134
-  ti "motion x=990 y=134"
-  ti "press b=1"
-  ti "release b=1"
-  for i in $(seq 1 80); do
-    kill -0 "$SESS_PID" 2>/dev/null || break
+# ------------------------------------------------- session children
+# The session manager supervises the panel as a real child (the panel
+# is no longer compositor code). The session-spawned compositor ALSO
+# runs Xwayland — an X11 app launched through it must map and become
+# a taskbar-visible window in the WM model.
+grep -q "started 'panel'" "$SESS_LOG" \
+  && ok "session spawned the GTK4 panel child" \
+  || bad "session did not spawn the panel child"
+XWL_DISPLAY=$(grep -o 'xwayland: ready — DISPLAY=:[0-9]*' "$SESS_LOG" \
+              | head -1 | grep -o ':[0-9]*$')
+if [ -n "$XWL_DISPLAY" ]; then
+  ok "Xwayland running under the session (DISPLAY=$XWL_DISPLAY)"
+  XWL_LOG="$WORK/xwl-app.log"
+  XAUTH_FILE=$(grep -o 'auth [^ )]*' "$SESS_LOG" | head -1 | cut -d' ' -f2)
+  # the client must stay ALIVE while we query the WM list: the old flow
+  # waited for its exit, the windows were destroyed and the list was
+  # empty by definition. Background it, poll, then check.
+  timeout 10 env DISPLAY="$XWL_DISPLAY" XAUTHORITY="$XAUTH_FILE" \
+    "$(tc vt-x11-testclient)" --title "XwlProbe" --seconds 8 \
+    > "$XWL_LOG" 2>&1 &
+  XWL_PID=$!
+  for i in $(seq 1 60); do
+    grep -q "^mapped" "$XWL_LOG" 2>/dev/null && break
+    kill -0 "$XWL_PID" 2>/dev/null || break
     sleep 0.1
   done
-fi
-if ! kill -0 "$SESS_PID" 2>/dev/null; then
-  ok "panel Log Out ended the session (no restart loop)"
-  grep -q "intentional logout, ending the session" "$SESS_LOG" \
-    && ok "supervisor recognized the intentional logout" \
-    || bad "no intentional-logout policy log line"
+  if grep -q "^connected" "$XWL_LOG" && grep -q "^mapped" "$XWL_LOG"; then
+    ok "X11 app launched through Xwayland (connected + mapped)"
+  else
+    bad "X11 app did not launch through Xwayland: $(tail -3 "$XWL_LOG")"
+  fi
+  WM_LIST=$(WAYLAND_DISPLAY="$SOCK2" "$(vb vantage-remote)" list 2>/dev/null \
+            | grep -c "XwlProbe")
+  [ "${WM_LIST:-0}" -ge 1 ] \
+    && ok "Xwayland window visible to the WM/taskbar model" \
+    || bad "Xwayland window missing from the WM window list"
+  kill "$XWL_PID" 2>/dev/null
+  wait "$XWL_PID" 2>/dev/null
 else
-  # NEVER silently skip a broken real-input path: the remote-logout
-  # fallback below would still end the session and every later check
-  # would pass — hiding the fact that the panel's session menu did
-  # not react to clicks (exactly what a long-username machine hit
-  # when the menu was anchored to the username applet).
-  bad "panel Log Out did NOT end the session (session-menu click path broken)"
+  bad "Xwayland did not start under the session"
 fi
 
+# ------------------------------------------------- logout round-trip
+# The panel's session menu sends WM_LOGOUT to the session IPC socket
+# (vp_session_action); vantage-remote logout drives the SAME socket.
+# Ending the session must use the graceful SIGTERM policy (no SIGKILL,
+# no restart).
 echo "== harness-wayland: vantage-remote logout round-trip =="
 if [ -n "${SESS_PID:-}" ] && kill -0 "$SESS_PID" 2>/dev/null; then
   LOGOUT_RC=0

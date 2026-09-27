@@ -310,8 +310,15 @@ static void _on_event(void *ud, void *event) {
         /* _cw_ensure: a newly mapped window must be tracked even when it
          * was never seen before (it is normally discovered during paint
          * via XQueryTree, but the damage/map event is what triggers the
-         * repaint in the first place). */
-        _cw_ensure(cm, ev->xmap.window);
+         * repaint in the first place). _cw_ensure only CREATES the entry
+         * — a repaint that ran while this window existed but was still
+         * UNMAPPED (GTK creates a popup surface, sets its properties,
+         * then maps it) would have cached viewable=0 with no picture,
+         * and _cw_ensure alone returns that stale entry forever: the
+         * mapped window would never be composited (invisible menus).
+         * A map means: refresh the attributes and bind the pixmap. */
+        _cwin_t *cw = _cw_ensure(cm, ev->xmap.window);
+        if (cw) _cw_sync_surface(cm, cw);
         cm->dirty = true;
         break;
     }

@@ -391,11 +391,22 @@ int main(int argc, char **argv) {
             XEvent ev;
             XNextEvent(d, &ev);
             if (ev.type == ClientMessage) {
-                /* WM_DELETE_WINDOW — honor it like a well-behaved client */
-                printf("delete received on 0x%lx — destroying window\n",
-                       (unsigned long)ev.xclient.window);
-                fflush(stdout);
-                XDestroyWindow(d, ev.xclient.window);
+                /* Only a REAL WM_DELETE_WINDOW closes the window. A WM
+                 * that follows ICCCM 4.1.7 also sends WM_TAKE_FOCUS
+                 * ClientMessages — treating those as delete made this
+                 * client destroy its own windows the moment the WM
+                 * focused them (the Xwayland windows vanished from the
+                 * taskbar seconds after mapping). */
+                Atom wm_protocols = XInternAtom(d, "WM_PROTOCOLS", False);
+                Atom wm_delete = XInternAtom(d, "WM_DELETE_WINDOW", False);
+                if (ev.xclient.message_type == wm_protocols &&
+                    ev.xclient.format == 32 &&
+                    (Atom)ev.xclient.data.l[0] == wm_delete) {
+                    printf("delete received on 0x%lx — destroying window\n",
+                           (unsigned long)ev.xclient.window);
+                    fflush(stdout);
+                    XDestroyWindow(d, ev.xclient.window);
+                }
             }
         }
         msleep(100);

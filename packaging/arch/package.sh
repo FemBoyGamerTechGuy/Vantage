@@ -123,6 +123,9 @@ declare -A SONAME_MAP=(
     [librsvg-2.so]=librsvg    [libcairo.so]=cairo
     [libgobject-2.0.so]=glib2 [libglib-2.0.so]=glib2 [libgio-2.0.so]=glib2
     [libgmodule-2.0.so]=glib2 [libgthread-2.0.so]=glib2
+    # GTK4 desktop panel (subprojects/panel — pango/harfbuzz/graphene
+    # arrive transitively through gtk4 itself)
+    [libgtk-4.so]=gtk4  [libgtk4-layer-shell.so]=gtk4-layer-shell
     # system services
     [libsystemd.so]=systemd-libs [libudev.so]=systemd-libs
     [libelogind.so]=elogind   [libdbus-1.so]=dbus

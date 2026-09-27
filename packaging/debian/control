@@ -12,14 +12,16 @@ Build-Depends: meson, ninja-build, gcc, pkg-config,
  libavcodec-dev, libavformat-dev, libavutil-dev, libswscale-dev,
  libpipewire-0.3-dev, libpulse-dev, libasound2-dev,
  libnm-dev, libupower-glib-dev,
- libdbus-1-dev, libsystemd-dev
+ libdbus-1-dev, libsystemd-dev,
+ libgtk-4-dev, libgtk4-layer-shell-dev
 Standards-Version: 4.6.0
 Homepage: https://github.com/FemBoyGamerTechGuy/Vantage
 
 Package: vantage
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends},
- vantage-core (= ${binary:Version})
+ vantage-core (= ${binary:Version}),
+ libgtk-4-1, libgtk4-layer-shell-0
 Description: Lightweight raw-C desktop environment
  Vantage is a lightweight Linux desktop environment written primarily in C,
  inspired by XFCE but implemented from scratch. It supports native Wayland,
@@ -27,7 +29,9 @@ Description: Lightweight raw-C desktop environment
  live video wallpapers, cross-toolkit Qt6/GTK theming, and runs without D-Bus
  or systemd if they are not available.
  .
- This package contains the desktop session binaries.
+ This package contains the desktop session binaries and the GTK4
+ desktop panel (vantage-panel), which docks through wlr-layer-shell
+ on Wayland and as an EWMH dock on X11.
 
 Package: vantage-core
 Architecture: any
@@ -35,7 +39,8 @@ Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: Core libraries for Vantage
  Internal libraries used by Vantage: vt-core, vt-config, vt-ipc, vt-renderer,
  vt-gpu, vt-backends, vt-compositor, vt-wm, vt-input, vt-session, vt-theme,
- vt-wallpaper, vt-desktop, vt-panel, vt-settings, vt-integrations.
+ vt-wallpaper, vt-desktop, vt-settings, vt-integrations. (The desktop
+ panel is an independent GTK4 subproject: the vantage-panel binary.)
 
 Package: vantage-dev
 Architecture: any

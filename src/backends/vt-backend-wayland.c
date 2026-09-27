@@ -38,12 +38,9 @@
 #include <vantage/vt-kms.h>
 #include <vantage/vt-ipc.h>
 #include <vantage/vt-wallpaper.h>
-#include "xdg-decoration-protocol.h"
 
 #if defined(VT_HAVE_WAYLAND)
 
-#include <wayland-server.h>
-#include "xdg-shell-protocol.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -70,7 +67,23 @@
 #include <xkbcommon/xkbcommon.h>
 #endif
 
-#include "vt-wl-panel.h"
+#if defined(VT_HAVE_FREETYPE)
+#include <ft2build.h>
+#include <freetype/freetype.h>
+#include <fontconfig/fontconfig.h>
+#endif
+
+/* shared types + protocol-module seams (layer-shell, Xwayland) */
+#include "vt-wl-internal.h"
+
+/* forward-declared MODULE seam: the per-surface xdg-shell data.
+ * Defined HERE (not in the xdg-shell section) because the surface
+ * destructor must orphan its back-pointer at surface death — at
+ * client teardown libwayland destroys resources in creation order,
+ * so the xdg_surface handler runs AFTER the surface is freed. */
+typedef struct _xdg_surf_data {
+    _wl_surf_t *surf;
+} _xdg_surf_data_t;
 
 /* ------------------------------------------------------------ logging */
 
@@ -118,198 +131,21 @@ static bool _env_flag(const char *name) {
            vt_strcaseeq(v, "yes") || vt_strcaseeq(v, "on");
 }
 
-/* ------------------------------------------------------------ surfaces */
-typedef struct _wl_surf {
-    struct wl_resource *res;
-    struct wl_resource *buf_res;      /* current wl_buffer */
-    uint32_t *pixels;                 /* OUR copy of the last commit */
-    uint32_t *own;                    /* backing store for pixels */
-    size_t   own_cap;                 /* capacity in uint32 units */
-    int32_t  w, h;
-    int32_t  stride;                  /* row stride in uint32 units */
-    int32_t  dx, dy;                  /* attach offset */
-    int      x, y;                    /* composited position */
-    int      ws;                      /* workspace (all if sticky-ish) */
-    bool     mapped;
-    bool     minimized;               /* set_minimized: hidden but alive */
-    bool     has_pending_xdg;         /* xdg toplevel exists */
-    struct _xdg_toplevel *toplevel;
-    struct _xdg_popup    *popup;      /* xdg_popup role */
-    struct wl_list link;              /* stacking (head = bottom) */
-    struct wl_list frame_cbs;         /* pending wl_callback */
-    /* xdg_surface.set_window_geometry: the window rect inside the
-     * buffer (CSD shadows live in the buffer but outside the geometry).
-     * SET, never accumulated — accumulating made windows drift across
-     * the screen on every resize. */
-    int32_t  win_gx, win_gy, win_gw, win_gh;
-    bool     have_win_geo;
-    int32_t  last_gx, last_gy;        /* previous geometry offset (anchor) */
-    /* wl_pointer.set_cursor duties */
-    bool     is_cursor;
-    int      hotspot_x, hotspot_y;
-    /* wl_subsurface duties: children are painted relative to this
-     * surface, in their own stacking order (place_above/below) */
-    struct _wl_surf *parent;
-    struct wl_list  subs;             /* child subsurfaces */
-    struct wl_list  sub_link;
-    /* server-side decoration requested via xdg-decoration (SSD):
-     * drawn by the compositor around this surface */
-    bool     ssd;
-    struct wl_resource *decor_res;   /* zxdg_toplevel_decoration_v1 */
-} _wl_surf_t;
+_wl_state_t *_wls = NULL;
 
-typedef struct _xdg_toplevel {
-    struct wl_resource *res;
-    _wl_surf_t *surf;
-    uint64_t    id;                   /* stable window id for the WM */
-    bool maximized, fullscreen, resizing, activated, minimized;
-    char *title;
-    char *app_id;
-} _xdg_toplevel_t;
-
-typedef struct _xdg_popup {
-    struct wl_resource *res;
-    _wl_surf_t *surf;
-    _wl_surf_t *parent;              /* anchor parent (surface coords) */
-    int32_t rel_x, rel_y;            /* position relative to the parent */
-    bool grabbed;                    /* popup grab active (menus) */
-} _xdg_popup_t;
-
-/* xdg_positioner state (popup placement) — parsed for real, so GTK
- * menus/combo boxes appear where the app asked instead of being
- * dumped centered on the screen at a fixed 320x200. */
-typedef struct {
-    int32_t  ax, ay, aw, ah;         /* anchor rect (parent coords) */
-    int32_t  size_w, size_h;
-    uint32_t anchor, gravity;
-    int32_t  off_x, off_y;
-    uint32_t constraint;
-    bool     has_size;
-} _xdg_pos_t;
-
-typedef struct _cb_node {
-    struct wl_list link;
-    struct wl_resource *cb;
-} _cb_node_t;
-
-/* per-client pointer/keyboard resources */
-typedef struct _ptr_res {
-    struct wl_list link;
-    struct wl_resource *res;          /* wl_pointer resource */
-} _ptr_res_t;
-
-typedef struct _kbd_res {
-    struct wl_list link;
-    struct wl_resource *res;          /* wl_keyboard resource */
-} _kbd_res_t;
-
-typedef struct {
-    struct wl_display *display;
-    struct wl_event_loop *loop;
-    struct wl_event_source *src;
-    struct wl_event_source *seat_src;   /* seat fd source */
-    struct wl_event_source *drm_src;   /* drm fd source */
-    struct wl_event_source *li_src;    /* libinput fd source */
-    char *socket_name;
-    struct wl_global *compositor_g;
-    struct wl_global *shm_g;
-    struct wl_global *seat_g;
-    struct wl_global *output_g;
-    struct wl_global *xdg_g;
-    struct wl_global *subcomp_g;
-    struct wl_global *ddm_g;
-    struct wl_listener client_created;
-    struct wl_list surfaces;          /* bottom→top */
-    vt_backend_t *backend_self;       /* for event emission */
-    void *user_data;                  /* wm host pointer */
-    /* output */
-    int out_w, out_h;
-    uint32_t *fb;                     /* output framebuffer (XRGB) */
-    bool dirty;
-    int clients;
-    uint64_t frame_count;
-    bool headless;                    /* honest marker: no KMS */
-
-    /* compositor-side panel + workspace state */
-    vt_wl_panel_t *panel;
-    int ws_count, ws_cur;
-    time_t panel_clock_sync;
-
-    /* real session path */
-    vt_seat_t *seat;
-    vt_kms_t  *kms;
-    struct wl_event_source *vt_switch_src;
-
-    /* input */
-#if defined(VT_HAVE_LIBINPUT)
-    struct libinput *li;
-    struct udev *udev;
-#endif
-    int cursor_x, cursor_y;
-    bool buttons[16];                  /* pressed buttons (0-indexed) */
-    uint32_t serial;                   /* wayland serial counter */
-    /* keyboard */
-#if defined(VT_HAVE_XKBCOMMON)
-    struct xkb_context *xkb_ctx;
-    struct xkb_keymap  *xkb_km;
-    struct xkb_state   *xkb_st;
-    int  keymap_fd;
-    size_t keymap_size;
-#endif
-    struct wl_list ptr_reses;          /* _ptr_res_t */
-    struct wl_list kbd_reses;          /* _kbd_res_t */
-    _wl_surf_t *ptr_focus;             /* surface under cursor */
-    _wl_surf_t *kbd_focus;             /* focused surface */
-    _xdg_toplevel_t *focused_toplevel;
-    uint64_t next_win_id;
-
-    /* clipboard */
-    struct wl_list data_devs;        /* _data_dev_t */
-    struct _data_src *selection;
-    /* desktop background: the SAME wallpaper engine the X11 desktop
-     * uses, rendered once into an ARGB buffer (config [wallpaper]) */
-    vt_wallpaper_t *wall;
-    uint32_t *bg_pix;
-    /* xdg-decoration protocol */
-    struct wl_global *decor_g;
-    /* cursor sprite */
-    uint32_t cursor_img[64 * 64];
-    int cur_img_w, cur_img_h, cur_img_hx, cur_img_hy;
-    bool cur_client_set;               /* client provided a cursor */
-    _wl_surf_t *cursor_surf;
-    uint32_t mods_depressed;           /* current keyboard modifiers */
-
-    /* interactive move/resize (xdg toplevel requests + Super+drag) */
-    bool op_active;                    /* interactive op in progress */
-    bool op_resize;
-    _wl_surf_t *op_surf;
-    int op_grab_x, op_grab_y;
-    int op_start_w, op_start_h;
-} _wl_state_t;
-
-static _wl_state_t *_wls = NULL;
-
-/* SSD frame metrics + geometry (xdg-decoration server mode) — the
- * drawing helpers live with the painting code; the geometry helper is
- * needed early by input hit-testing. */
-#define _WL_SSD_BORDER 2
-#define _WL_SSD_TITLE  26
-#define _WL_SSD_BTN    22
-static void _ssd_frame_geom(const _wl_surf_t *s, int *fx, int *fy,
-                            int *fw, int *fh);
 
 /* used by the WM host (vantage-wm) to route compositor hotkeys */
 static bool _hotkey_try(vt_backend_t *self, const char *combo);
-static void _kbd_enter_focus(_wl_state_t *st, _wl_surf_t *s);
+void _kbd_enter_focus(_wl_state_t *st, _wl_surf_t *s);
 static void _decor_notify(_wl_surf_t *s);
-static void _focus_top_on_ws(_wl_state_t *st);
+void _focus_top_on_ws(_wl_state_t *st);
 static bool _hotkey_try(vt_backend_t *self, const char *combo) {
     if (self && self->hotkey) return self->hotkey(self, combo);
     return false;
 }
 
 /* ------------------------------------------------- window event emission */
-static void _emit_win(_wl_state_t *st, vt_backend_wl_event_kind_t kind,
+void _emit_win(_wl_state_t *st, vt_backend_wl_event_kind_t kind,
                       _xdg_toplevel_t *t) {
     if (!st || !t) return;
     vt_backend_wl_event_t ev;
@@ -341,6 +177,7 @@ static void _surf_attach(struct wl_client *cli, struct wl_resource *res,
     (void)cli;
     _wl_surf_t *s = wl_resource_get_user_data(res);
     s->buf_res = buf_res;
+    s->attach_pending = true;
     s->dx = dx;
     s->dy = dy;
 }
@@ -421,7 +258,27 @@ static void _surf_commit(struct wl_client *cli, struct wl_resource *res) {
             }
         }
         s->buf_res = NULL;
+    } else if (s->attach_pending) {
+        /* attach(NULL) + commit: the surface enters the EMPTY state
+         * (this is how GTK hides a popover: xdg_popup.destroy, then a
+         * nil commit). The stale size must be cleared or the next
+         * commit logic would re-map the surface with its OLD pixels —
+         * closed menus would stay painted on screen forever.
+         * (A BARE commit with no attach request since the last one is
+         * a content-preserving sync commit — GDK frame cycles use it —
+         * and must NOT touch the surface state.) */
+        s->w = 0;
+        s->h = 0;
+        s->pixels = NULL;
+        if (s->mapped) {
+            s->mapped = false;
+            wl_list_remove(&s->link);
+            if (st) st->dirty = true;
+            if (st && st->ptr_focus == s) st->ptr_focus = NULL;
+            if (st && st->kbd_focus == s) st->kbd_focus = NULL;
+        }
     }
+    s->attach_pending = false;
 
     /* buffer/offset bookkeeping before mapping math */
     if (s->dx || s->dy) {
@@ -434,10 +291,32 @@ static void _surf_commit(struct wl_client *cli, struct wl_resource *res) {
     }
 
     if (!s->mapped && s->w > 0 && s->h > 0) {
+        /* layer-shell surfaces (docked panels) configure/place/map via
+         * their own handshake — never the generic toplevel path */
+        if (s->layer) {
+            if (_layer_commit(s))
+                return;
+        }
         s->mapped = true;
         s->minimized = false;
-        wl_list_insert(_wls->surfaces.prev, &s->link);
+        _stack_insert(s);
+        if (s->xwl) {
+            /* Xwayland window: the X-side WM (vt-wl-xwayland.c) owns
+             * geometry; the surface paints exactly where the X window
+             * is, no xdg configure handshake involved */
+            _xwl_win_geom(s);
+            return;
+        }
         if (s->popup) {
+            if (!s->popup->parent) {
+                /* a popup with no parent never got its layer-shell
+                 * attachment — it cannot be placed, so reject it */
+                if (s->res)
+                    wl_resource_post_error(
+                        s->res, XDG_WM_BASE_ERROR_ROLE,
+                        "popup committed without a parent surface");
+                return;
+            }
             /* popups map ON TOP (surfaces list head = bottom; inserting
              * at prev = top) — they are menus */
             if (s->popup->grabbed && s->res) {
@@ -476,21 +355,18 @@ static void _surf_commit(struct wl_client *cli, struct wl_resource *res) {
             /* place the first frame: maximized/fullscreen anchor below
              * the panel (or at the very top for fullscreen); everything
              * else centers inside the workarea */
+            int wx, wy, ww, wh;
+            _layer_workarea(_wls, &wx, &wy, &ww, &wh);
             if (s->toplevel->fullscreen) {
                 s->x = 0;
                 s->y = 0;
-            } else if (s->toplevel->maximized && st->panel) {
-                s->x = 0;
-                s->y = vt_wl_panel_height(st->panel);
+            } else if (s->toplevel->maximized) {
+                s->x = wx;
+                s->y = wy;
             } else if (s->x == 0 && s->y == 0) {
-                s->x = (_wls->out_w - s->w) / 2;
-                s->y = (_wls->out_h - s->h) / 2;
-                if (st->panel) {
-                    int bar = vt_wl_panel_height(st->panel);
-                    int wa_h = _wls->out_h - bar;
-                    s->y = bar + (wa_h - s->h) / 2;
-                    if (s->y < bar) s->y = bar;
-                }
+                s->x = wx + (ww - s->w) / 2;
+                s->y = wy + (wh - s->h) / 2;
+                if (s->y < wy) s->y = wy;
                 if (s->x < 0) s->x = 0;
                 if (s->y < 0) s->y = 0;
             }
@@ -512,6 +388,15 @@ static void _surf_commit(struct wl_client *cli, struct wl_resource *res) {
         _wls->dirty = true;
     } else if (s->mapped && s->w > 0) {
         _wls->dirty = true;
+        if (s->layer) {
+            /* resize of a docked surface: re-anchor, re-configure */
+            _layer_commit(s);
+            return;
+        }
+        if (s->xwl) {
+            /* Xwayland redraw: the X WM keeps the geometry current */
+            _xwl_win_geom(s);
+        }
         if (s->toplevel && s->toplevel->minimized) {
             s->toplevel->minimized = false;
             s->minimized = false;
@@ -597,6 +482,15 @@ static const struct wl_surface_interface _surf_impl = {
 static void _surf_resource_destroy(struct wl_resource *res) {
     _wl_surf_t *s = wl_resource_get_user_data(res);
     if (!s) return;
+    /* roles own back-pointers into this surface; detach them FIRST —
+     * their resource destroy handlers may run AFTER this one when a
+     * client dies (libwayland destroys resources in creation order),
+     * and they would dereference freed memory */
+    if (s->layer)
+        _layer_detach(s);
+    if (s->xwl) {
+        _xwl_surface_destroyed(s);   /* also clears s->xwl */
+    }
     if (s->parent) {
         wl_list_remove(&s->sub_link);
         s->parent = NULL;
@@ -607,6 +501,16 @@ static void _surf_resource_destroy(struct wl_resource *res) {
          * places was a double free / use-after-free */
         s->popup->surf = NULL;
         s->popup = NULL;
+    }
+    if (s->xdg_res) {
+        /* same class of bug, caught by ASan at client teardown: the
+         * xdg_surface resource is created AFTER the wl_surface, so at
+         * client death ITS destroy handler runs AFTER the surface is
+         * freed — orphan its back-pointer now so it never
+         * dereferences us */
+        struct _xdg_surf_data *d = wl_resource_get_user_data(s->xdg_res);
+        if (d) d->surf = NULL;
+        s->xdg_res = NULL;
     }
     if (s->mapped) {
         wl_list_remove(&s->link);
@@ -992,10 +896,8 @@ static void _bind_ddm(struct wl_client *cli, void *data,
 }
 
 /* ------------------------------------------------------------ xdg-shell */
-/* per-surface xdg data to route get_toplevel */
-typedef struct {
-    _wl_surf_t *surf;
-} _xdg_surf_data_t;
+/* per-surface xdg data (_xdg_surf_data_t) is defined near the top:
+ * the surface destructor needs it to orphan back-pointers */
 
 static void _xdg_wm_base_destroy(struct wl_client *cli,
                                  struct wl_resource *res) {
@@ -1121,7 +1023,7 @@ static void _toplevel_set_min(struct wl_client *cli,
                               int32_t w, int32_t h) {
     (void)cli; (void)res; (void)w; (void)h;
 }
-static void _toplevel_configure(struct wl_resource *res, int32_t w, int32_t h,
+void _toplevel_configure(struct wl_resource *res, int32_t w, int32_t h,
                                 uint32_t state) {
     struct wl_array states;
     wl_array_init(&states);
@@ -1136,14 +1038,15 @@ static void _toplevel_maximize(struct wl_client *cli,
     (void)cli;
     _xdg_toplevel_t *t = wl_resource_get_user_data(res);
     if (t) t->maximized = true;
-    if (t && t->surf && _wls && _wls->panel) {
-        /* workarea: the panel's strip is NOT part of a maximized window */
-        t->surf->x = 0;
-        t->surf->y = vt_wl_panel_height(_wls->panel);
+    int wx = 0, wy = 0, ww = _wls->out_w, wh = _wls->out_h;
+    _layer_workarea(_wls, &wx, &wy, &ww, &wh);
+    if (t && t->surf) {
+        /* workarea: docked panels' exclusive zone is NOT part of a
+         * maximized window */
+        t->surf->x = wx;
+        t->surf->y = wy;
     }
-    _toplevel_configure(res, _wls->out_w,
-                        _wls->out_h - (_wls->panel ? vt_wl_panel_height(_wls->panel) : 0),
-                        XDG_TOPLEVEL_STATE_MAXIMIZED);
+    _toplevel_configure(res, ww, wh, XDG_TOPLEVEL_STATE_MAXIMIZED);
     if (t) _emit_win(_wls, VT_BACKEND_WL_EVENT_WIN_STATE, t);
 }
 static void _toplevel_unmaximize(struct wl_client *cli,
@@ -1241,6 +1144,8 @@ static const struct xdg_surface_interface _xdg_surface_impl2 = {
 
 static void _xdg_surface_res_destroy(struct wl_resource *res) {
     _xdg_surf_data_t *d = wl_resource_get_user_data(res);
+    if (d && d->surf && d->surf->xdg_res == res)
+        d->surf->xdg_res = NULL;
     vt_free(d);
 }
 
@@ -1257,8 +1162,9 @@ static void _xdg_wm_base_get_xdg_surface(struct wl_client *cli,
     if (!xres) { vt_free(d); wl_client_post_no_memory(cli); return; }
     wl_resource_set_implementation(xres, &_xdg_surface_impl2, d,
                                    _xdg_surface_res_destroy);
+    if (s) s->xdg_res = xres;
     /* send initial configure */
-    xdg_surface_send_configure(xres, 1);
+    xdg_surface_send_configure(xres, _wls ? ++_wls->serial : 1);
 }
 
 static void _xdg_get_toplevel(struct wl_client *cli,
@@ -1357,8 +1263,52 @@ static void _xdg_create_positioner(struct wl_client *cli,
 }
 
 /* compute the popup rect (relative to the parent surface) from the
- * positioner state — the icon-theme-spec-style anchor/gravity dance */
-static void _popup_place(const _xdg_pos_t *pos, _wl_surf_t *parent,
+ * positioner state — the xdg-shell anchor/gravity/constraint dance */
+/* The anchor/gravity enums are NOT bitmasks: left=3 shares its bits
+ * with top=1|bottom=2, so `value & ANCHOR_LEFT` wrongly matches plain
+ * top/bottom values. Membership tests are the only correct form. */
+static bool _anc_top(uint32_t a) {
+    return a == XDG_POSITIONER_ANCHOR_TOP ||
+           a == XDG_POSITIONER_ANCHOR_TOP_LEFT ||
+           a == XDG_POSITIONER_ANCHOR_TOP_RIGHT;
+}
+static bool _anc_bottom(uint32_t a) {
+    return a == XDG_POSITIONER_ANCHOR_BOTTOM ||
+           a == XDG_POSITIONER_ANCHOR_BOTTOM_LEFT ||
+           a == XDG_POSITIONER_ANCHOR_BOTTOM_RIGHT;
+}
+static bool _anc_left(uint32_t a) {
+    return a == XDG_POSITIONER_ANCHOR_LEFT ||
+           a == XDG_POSITIONER_ANCHOR_TOP_LEFT ||
+           a == XDG_POSITIONER_ANCHOR_BOTTOM_LEFT;
+}
+static bool _anc_right(uint32_t a) {
+    return a == XDG_POSITIONER_ANCHOR_RIGHT ||
+           a == XDG_POSITIONER_ANCHOR_TOP_RIGHT ||
+           a == XDG_POSITIONER_ANCHOR_BOTTOM_RIGHT;
+}
+static bool _grav_top(uint32_t g) {
+    return g == XDG_POSITIONER_GRAVITY_TOP ||
+           g == XDG_POSITIONER_GRAVITY_TOP_LEFT ||
+           g == XDG_POSITIONER_GRAVITY_TOP_RIGHT;
+}
+static bool _grav_bottom(uint32_t g) {
+    return g == XDG_POSITIONER_GRAVITY_BOTTOM ||
+           g == XDG_POSITIONER_GRAVITY_BOTTOM_LEFT ||
+           g == XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT;
+}
+static bool _grav_left(uint32_t g) {
+    return g == XDG_POSITIONER_GRAVITY_LEFT ||
+           g == XDG_POSITIONER_GRAVITY_TOP_LEFT ||
+           g == XDG_POSITIONER_GRAVITY_BOTTOM_LEFT;
+}
+static bool _grav_right(uint32_t g) {
+    return g == XDG_POSITIONER_GRAVITY_RIGHT ||
+           g == XDG_POSITIONER_GRAVITY_TOP_RIGHT ||
+           g == XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT;
+}
+
+void _popup_place(const _xdg_pos_t *pos, _wl_surf_t *parent,
                          int out_w, int out_h, int32_t *rx, int32_t *ry,
                          int32_t *rw, int32_t *rh) {
     int32_t w = pos->has_size ? pos->size_w : 200;
@@ -1366,55 +1316,81 @@ static void _popup_place(const _xdg_pos_t *pos, _wl_surf_t *parent,
     if (w > out_w) w = out_w;
     if (h > out_h) h = out_h;
 
-    /* anchor point on the anchor rect */
+    /* anchor point on/inside the anchor rect (xdg-shell spec): corner
+     * anchors pick the corner; edge anchors pick the CENTER of that
+     * edge; none picks the center of the rect */
     double ax = parent->x + pos->ax;
     double ay = parent->y + pos->ay;
-    if (pos->anchor & XDG_POSITIONER_ANCHOR_LEFT)
-        { /* x stays */ }
-    if (pos->anchor & XDG_POSITIONER_ANCHOR_RIGHT)
-        ax += pos->aw;
-    if (pos->anchor & (XDG_POSITIONER_ANCHOR_TOP | XDG_POSITIONER_ANCHOR_BOTTOM))
+    if (_anc_right(pos->anchor))            ax += pos->aw;
+    else if (!_anc_left(pos->anchor) &&
+             (_anc_top(pos->anchor) || _anc_bottom(pos->anchor)))
+        ax += pos->aw / 2.0;                 /* edge anchor: centered */
+    else if (pos->anchor == XDG_POSITIONER_ANCHOR_NONE)
         ax += pos->aw / 2.0;
-    if (pos->anchor & XDG_POSITIONER_ANCHOR_TOP)
-        { /* y stays */ }
-    if (pos->anchor & XDG_POSITIONER_ANCHOR_BOTTOM)
-        ay += pos->ah;
-    if (pos->anchor & (XDG_POSITIONER_ANCHOR_LEFT | XDG_POSITIONER_ANCHOR_RIGHT))
+    if (_anc_bottom(pos->anchor))           ay += pos->ah;
+    else if (!_anc_top(pos->anchor) && !_anc_bottom(pos->anchor) &&
+             (_anc_left(pos->anchor) || _anc_right(pos->anchor)))
+        ay += pos->ah / 2.0;                 /* edge anchor: centered */
+    else if (pos->anchor == XDG_POSITIONER_ANCHOR_NONE)
         ay += pos->ah / 2.0;
 
-    /* gravity: which corner of the POPUP sits at the anchor point */
-    double x = ax, y = ay;
-    if (pos->gravity & XDG_POSITIONER_GRAVITY_LEFT)   x -= w;
-    if (pos->gravity & XDG_POSITIONER_GRAVITY_RIGHT)  { /* extends right */ }
-    if (pos->gravity & XDG_POSITIONER_GRAVITY_TOP)    { /* extends down */ }
-    if (pos->gravity & XDG_POSITIONER_GRAVITY_BOTTOM) y -= h;
+    /* gravity (spec): "in what direction the surface should be
+     * positioned, relative to the anchor point"; axes without a
+     * gravity are CENTERED over the anchor point. gravity bottom =
+     * the child sits BELOW the anchor (its top edge there); gravity
+     * top = ABOVE (its bottom edge there); left/right accordingly. */
+    double x, y;
+    if (_grav_left(pos->gravity))      x = ax - w;    /* child to the LEFT */
+    else if (_grav_right(pos->gravity)) x = ax;       /* child to the RIGHT */
+    else                                x = ax - w / 2.0;   /* centered */
+    if (_grav_top(pos->gravity))       y = ay - h;    /* child ABOVE */
+    else if (_grav_bottom(pos->gravity)) y = ay;      /* child BELOW */
+    else                                y = ay - h / 2.0;  /* centered */
 
     x += pos->off_x;
     y += pos->off_y;
 
-    /* constraint adjustment: slide into the output, flip when it does
-     * not fit and flipping helps (menus must never cover their anchor
-     * and vanish off-screen) */
-    bool flip_x = pos->constraint & XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_X;
-    bool flip_y = pos->constraint & XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y;
+    /* constraint adjustment: FLIP mirrors the popup across the anchor
+     * rect (inverting anchor+gravity on that axis) when it would not
+     * fit; SLIDE moves it flush inside the output; RESIZE shrinks it.
+     * Applied per axis, the spec order: flip → slide → resize. */
+    bool flip_x = pos->constraint &
+        XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_X;
+    bool flip_y = pos->constraint &
+        XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y;
     bool slide_x = pos->constraint &
         XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X;
     bool slide_y = pos->constraint &
         XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y;
+    bool resize_x = pos->constraint &
+        XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_RESIZE_X;
+    bool resize_y = pos->constraint &
+        XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_RESIZE_Y;
+
+    /* X axis */
     if (x + w > out_w) {
-        if (flip_x) x = ax - w;
-        if (slide_x || x + w > out_w) {
-            if (x + w > out_w) x = out_w - w;
-        }
+        if (flip_x) x = ax - w;             /* mirror across the anchor */
+        if (slide_x && x + w > out_w) x = out_w - w;
+        if (resize_x && x + w > out_w) w = out_w - (x < 0 ? 0 : (int)x);
+        if (x + w > out_w) x = out_w - w;   /* never hang off-screen */
     }
-    if (x < 0) x = 0;
+    if (x < 0) {
+        if (flip_x) x = ax;
+        if (slide_x && x < 0) x = 0;
+        if (x < 0) x = 0;
+    }
+    /* Y axis */
     if (y + h > out_h) {
-        if (flip_y) y = ay - pos->ah - h;
+        if (flip_y) y = ay - h;
+        if (slide_y && y + h > out_h) y = out_h - h;
+        if (resize_y && y + h > out_h) h = out_h - (y < 0 ? 0 : (int)y);
         if (y + h > out_h) y = out_h - h;
     }
-    if (y < 0) y = 0;
-    (void)slide_y;
-    (void)slide_x;
+    if (y < 0) {
+        if (flip_y) y = ay;
+        if (slide_y && y < 0) y = 0;
+        if (y < 0) y = 0;
+    }
 
     *rx = (int32_t)x - parent->x;
     *ry = (int32_t)y - parent->y;
@@ -1429,6 +1405,9 @@ static void _popup_destroy_req(struct wl_client *cli,
                                struct wl_resource *res) {
     (void)cli;
     _xdg_popup_t *p = wl_resource_get_user_data(res);
+    vt_logd("wayland: popup destroy req (p=%p surf=%p mapped=%d)",
+            (void *)p, p ? (void *)p->surf : NULL,
+            p && p->surf ? (int)p->surf->mapped : -1);
     if (p && p->surf) {
         p->surf->popup = NULL;
         if (p->surf->mapped) {
@@ -1483,7 +1462,7 @@ static void _popup_res_destroy(struct wl_resource *res) {
 }
 
 /* dismiss a grabbed popup: popup_done → the client unmaps/destroys it */
-static void _popup_done(_wl_state_t *st, _wl_surf_t *s) {
+void _popup_done(_wl_state_t *st, _wl_surf_t *s) {
     if (!st || !s || !s->popup || !s->popup->res) return;
     xdg_popup_send_popup_done(s->popup->res);
     s->popup->grabbed = false;
@@ -1511,31 +1490,60 @@ static void _xdg_get_popup(struct wl_client *cli,
                            uint32_t id, struct wl_resource *parent,
                            struct wl_resource *positioner) {
     _xdg_surf_data_t *d = wl_resource_get_user_data(res);
-    _wl_surf_t *psurf = parent ? wl_resource_get_user_data(parent) : NULL;
+    /* the parent argument is the parent's xdg_surface resource — OR an
+     * xdg_popup for nested menus (submenus, combobox stacks). Its user
+     * data is the _xdg_surf_data_t / _xdg_popup_t respectively, NEVER
+     * a _wl_surf_t: assigning the raw user_data to _wl_surf_t* was a
+     * TYPE CONFUSION that read "parent->x" far out of bounds (ASan:
+     * heap-buffer-overflow) — popups were placed at garbage offsets
+     * that happened to look harmless in release builds. Resolve to the
+     * actual parent SURFACE through the correct type. */
+    _wl_surf_t *psurf = NULL;
+    if (parent) {
+        if (wl_resource_instance_of(parent, &xdg_popup_interface, NULL)) {
+            _xdg_popup_t *pp = wl_resource_get_user_data(parent);
+            if (pp) psurf = pp->surf;
+        } else {
+            _xdg_surf_data_t *pd = wl_resource_get_user_data(parent);
+            if (pd) psurf = pd->surf;
+        }
+    }
     _xdg_pos_t *pos = positioner
         ? wl_resource_get_user_data(positioner) : NULL;
-    if (!d || !psurf || !pos || !pos->has_size) {
+    if (!d || !pos || !pos->has_size) {
         wl_resource_post_error(res, XDG_WM_BASE_ERROR_INVALID_POSITIONER,
-                               "get_popup requires a sized positioner and "
-                               "a parent surface");
+                               "get_popup requires a sized positioner");
         return;
     }
+    /* NULL parent is legal ONLY for the layer-shell path: the
+     * gtk4-layer-shell shim calls xdg_surface.get_popup(parent=NULL)
+     * and then zwlr_layer_surface_v1.get_popup() to attach it. The
+     * popup stays unplaced until then; a commit without any parent is
+     * rejected below in _surf_commit. */
     _xdg_popup_t *p = vt_malloc0(sizeof(*p));
     if (!p) { wl_client_post_no_memory(cli); return; }
     p->surf = d->surf;
     p->parent = psurf;
+    if (pos) p->pos = *pos;
     d->surf->popup = p;
-    int32_t rx, ry, rw, rh;
-    _popup_place(pos, psurf, _wls ? _wls->out_w : 1024,
-                 _wls ? _wls->out_h : 768, &rx, &ry, &rw, &rh);
-    p->rel_x = rx;
-    p->rel_y = ry;
     struct wl_resource *pres = wl_resource_create(cli,
         &xdg_popup_interface, wl_resource_get_version(res), id);
     if (!pres) { vt_free(p); wl_client_post_no_memory(cli); return; }
     wl_resource_set_implementation(pres, &_popup_impl, p,
                                    _popup_res_destroy);
     p->res = pres;
+    if (!psurf) {
+        /* layer-shell popup: placement + configure happen when
+         * zwlr_layer_surface_v1.get_popup() attaches the parent */
+        xdg_surface_send_configure(res, ++_wls->serial);
+        vt_logd("wayland: popup created (layer parent pending)");
+        return;
+    }
+    int32_t rx, ry, rw, rh;
+    _popup_place(pos, psurf, _wls ? _wls->out_w : 1024,
+                 _wls ? _wls->out_h : 768, &rx, &ry, &rw, &rh);
+    p->rel_x = rx;
+    p->rel_y = ry;
     /* configure sequence per spec: popup.configure, then the
      * xdg_surface configure that lets the client commit */
     xdg_popup_send_configure(pres, rx, ry, rw, rh);
@@ -1736,7 +1744,7 @@ static void _bind_seat(struct wl_client *cli, void *data,
 /* send wl_keyboard.enter for s to its client's keyboards (leave the
  * old focus first). Shared by focus paths so every transition is
  * paired and client-scoped. */
-static void _kbd_enter_focus(_wl_state_t *st, _wl_surf_t *s) {
+void _kbd_enter_focus(_wl_state_t *st, _wl_surf_t *s) {
     if (!st || !s || !s->res) return;
     _wl_surf_t *old = st->kbd_focus;
     if (old && old != s && old->res) {
@@ -2054,7 +2062,6 @@ static void _li_add_device(_wl_state_t *st,
 static _wl_surf_t *_surface_at(_wl_state_t *st, int x, int y) {
     _wl_surf_t *found = NULL;
     _wl_surf_t *s;
-    if (st->panel && vt_wl_panel_contains(st->panel, x, y)) return NULL;
     /* surfaces list is bottom→top: iterate reversed */
     wl_list_for_each_reverse(s, &st->surfaces, link) {
         if (!s->mapped || s->is_cursor || s->minimized) continue;
@@ -2082,7 +2089,7 @@ static _wl_surf_t *_surface_at(_wl_state_t *st, int x, int y) {
     return found;
 }
 
-static void _pointer_focus_update(_wl_state_t *st, bool force) {
+void _pointer_focus_update(_wl_state_t *st, bool force) {
     _wl_surf_t *s = _surface_at(st, st->cursor_x, st->cursor_y);
     if (s == st->ptr_focus && !force) return;
     /* leave old */
@@ -2118,35 +2125,61 @@ static void _pointer_focus_update(_wl_state_t *st, bool force) {
                     wl_pointer_send_frame(pr->res);
             }
         }
-        /* click-to-focus for the keyboard */
-        if (st->kbd_focus != s) {
-            if (st->kbd_focus && st->kbd_focus->res) {
-                _kbd_res_t *kr;
-                wl_list_for_each(kr, &st->kbd_reses, link) {
-                    if (wl_resource_get_client(kr->res) ==
-                        wl_resource_get_client(st->kbd_focus->res))
-                        wl_keyboard_send_leave(kr->res, ++st->serial,
-                                               st->kbd_focus->res);
-                }
-            }
-            st->kbd_focus = s;
-            st->focused_toplevel = s->toplevel;
-            _kbd_res_t *kr;
-            wl_list_for_each(kr, &st->kbd_reses, link) {
-                if (wl_resource_get_client(kr->res) ==
-                    wl_resource_get_client(s->res)) {
-                    struct wl_array keys;
-                    wl_array_init(&keys);
-                    wl_keyboard_send_enter(kr->res, ++st->serial, s->res,
-                                           &keys);
-                    wl_array_release(&keys);
-                }
-            }
-            if (s->toplevel)
-                _emit_win(st, VT_BACKEND_WL_EVENT_WIN_FOCUS, s->toplevel);
-            _broadcast_selection(st);
+        /* pointer enter/leave only — the keyboard follows CLICKS, not
+         * the pointer. Focusing on hover both violates the WM's
+         * click-to-focus default AND rips the keyboard focus out of an
+         * open grabbed popup the moment the pointer wanders off it
+         * (GTK popovers close themselves on focus loss: menus would
+         * flash shut while the user was still scrolling them). */
+    }
+}
+
+/* click-to-focus: called on button PRESS only. */
+static void _click_to_focus(_wl_state_t *st, _wl_surf_t *s) {
+    if (!s || !s->res) return;
+    /* a grabbed popup owns the keyboard until it is dismissed — never
+     * steal its focus from it (the dismissal path in _pointer_button
+     * handles clicks that land outside) */
+    if (st->kbd_focus && st->kbd_focus->popup &&
+        st->kbd_focus->popup->grabbed)
+        return;
+    /* docked layer surfaces take focus ONLY when they asked for keys
+     * (keyboard mode on-demand/exclusive); a passive dock never does */
+    if (s->layer && !_layer_wants_kbd(s))
+        return;
+    /* an exclusive-keyboard layer surface (lock screen) keeps the keys */
+    _wl_surf_t *_ls;
+    wl_list_for_each(_ls, &st->surfaces, link) {
+        if (_ls != s && _layer_kbd_exclusive(_ls)) return;
+    }
+    if (st->kbd_focus == s) return;
+    if (s->xwl)
+        _xwl_focus_changed(st, s);
+    if (st->kbd_focus && st->kbd_focus->res) {
+        _kbd_res_t *kr;
+        wl_list_for_each(kr, &st->kbd_reses, link) {
+            if (wl_resource_get_client(kr->res) ==
+                wl_resource_get_client(st->kbd_focus->res))
+                wl_keyboard_send_leave(kr->res, ++st->serial,
+                                       st->kbd_focus->res);
         }
     }
+    st->kbd_focus = s;
+    st->focused_toplevel = s->toplevel;
+    _kbd_res_t *kr;
+    wl_list_for_each(kr, &st->kbd_reses, link) {
+        if (wl_resource_get_client(kr->res) ==
+            wl_resource_get_client(s->res)) {
+            struct wl_array keys;
+            wl_array_init(&keys);
+            wl_keyboard_send_enter(kr->res, ++st->serial, s->res,
+                                   &keys);
+            wl_array_release(&keys);
+        }
+    }
+    if (s->toplevel)
+        _emit_win(st, VT_BACKEND_WL_EVENT_WIN_FOCUS, s->toplevel);
+    _broadcast_selection(st);
 }
 
 static void _pointer_motion(_wl_state_t *st, double dx, double dy) {
@@ -2187,9 +2220,14 @@ static void _pointer_motion(_wl_state_t *st, double dx, double dy) {
             st->op_surf->h = st->op_start_h + st->cursor_y - st->op_grab_y;
             if (st->op_surf->w < 1) st->op_surf->w = 1;
             if (st->op_surf->h < 1) st->op_surf->h = 1;
-            if (st->op_surf->toplevel)
+            if (st->op_surf->xwl) {
+                _xwl_move_resize(st->op_surf, st->op_surf->x,
+                                 st->op_surf->y, st->op_surf->w,
+                                 st->op_surf->h);
+            } else if (st->op_surf->toplevel) {
                 _toplevel_configure(st->op_surf->toplevel->res,
                                     st->op_surf->w, st->op_surf->h, 0);
+            }
         } else {
             st->op_surf->x = st->cursor_x - st->op_grab_x;
             st->op_surf->y = st->cursor_y - st->op_grab_y;
@@ -2198,6 +2236,9 @@ static void _pointer_motion(_wl_state_t *st, double dx, double dy) {
             if (st->op_surf->toplevel)
                 _emit_win(st, VT_BACKEND_WL_EVENT_WIN_GEOMETRY,
                           st->op_surf->toplevel);
+            if (st->op_surf->xwl)
+                _xwl_move_resize(st->op_surf, st->op_surf->x,
+                                 st->op_surf->y, 0, 0);
         }
     }
     st->dirty = true;
@@ -2208,16 +2249,6 @@ static void _pointer_button(_wl_state_t *st, uint32_t button,
     if (button == 0x110 && !pressed)
         st->op_active = false;     /* BTN_LEFT release ends interactive op */
     if (st->op_active && pressed) return;
-    /* panel (bar + menus) swallows pointer events before any client */
-    if (st->panel &&
-        vt_wl_panel_pointer(st->panel, st->cursor_x, st->cursor_y,
-                            pressed ? 1 : 2,
-                            button == 0x110 ? 1 :
-                            button == 0x111 ? 2 :
-                            button == 0x112 ? 3 : 0)) {
-        st->dirty = true;
-        return;
-    }
     /* a grabbed popup is dismissed when the press is NOT inside it or
      * its parent chain (menus close when you click elsewhere) */
     if (pressed) {
@@ -2263,6 +2294,9 @@ static void _pointer_button(_wl_state_t *st, uint32_t button,
                 return;
             }
         }
+        /* click-to-focus on PRESS (the keyboard never follows motion) */
+        if (pressed)
+            _click_to_focus(st, s);
         /* SSD frame interactions (titlebar drag, buttons, edges) */
         if (s->ssd && s->toplevel && pressed && button == 0x110) {
             int fx, fy, fw, fh;
@@ -2329,13 +2363,6 @@ static void _pointer_button(_wl_state_t *st, uint32_t button,
 }
 
 static void _pointer_axis(_wl_state_t *st, double value) {
-    /* panel (menus + volume wheel) consumes scroll events first */
-    if (st->panel &&
-        vt_wl_panel_axis(st->panel, st->cursor_x, st->cursor_y,
-                         value > 0 ? 1 : -1)) {
-        st->dirty = true;
-        return;
-    }
     _wl_surf_t *s = st->ptr_focus;
     if (s && s->res) {
         _ptr_res_t *pr;
@@ -2424,29 +2451,6 @@ static void _kbd_key(_wl_state_t *st, uint32_t key, bool pressed) {
         const xkb_keysym_t *syms;
         int ns = xkb_state_key_get_syms(st->xkb_st, key + 8, &syms);
         for (int i = 0; i < ns; i++) {
-            /* open panel menus consume keys first: Escape closes,
-             * BackSpace edits the search, printable characters type
-             * into the search bar */
-            if (st->panel) {
-                const char *combo = NULL;
-                char cmb[96] = "";
-                if (syms[i] == XKB_KEY_Escape) combo = "Escape";
-                else if (syms[i] == XKB_KEY_BackSpace) combo = "BackSpace";
-                else if (!_combo_from_xkb(st, syms[i], cmb, sizeof(cmb)))
-                    combo = NULL;
-                /* try combo form first (Escape/BackSpace) */
-                if (combo && vt_wl_panel_key(st->panel, combo, 0)) {
-                    st->dirty = true;
-                    return;
-                }
-                /* printable → search text */
-                uint32_t cp = xkb_keysym_to_utf32(syms[i]);
-                if (!combo && cp > 0 &&
-                    vt_wl_panel_key(st->panel, NULL, cp)) {
-                    st->dirty = true;
-                    return;
-                }
-            }
             char combo[96];
             if (_combo_from_xkb(st, syms[i], combo, sizeof(combo)) &&
                 _hotkey_try(st->backend_self, combo)) {
@@ -2722,7 +2726,7 @@ static int _drm_fd_cb(int fd, uint32_t mask, void *data) {
 /* ------------------------------------------------------------ painting */
 
 /* draw the compositor-side SSD frame (title bar + border + buttons) */
-static void _ssd_frame_geom(const _wl_surf_t *s, int *fx, int *fy,
+void _ssd_frame_geom(const _wl_surf_t *s, int *fx, int *fy,
                             int *fw, int *fh) {
     *fx = s->x - _WL_SSD_BORDER;
     *fy = s->y - (_WL_SSD_TITLE + _WL_SSD_BORDER);
@@ -2730,7 +2734,173 @@ static void _ssd_frame_geom(const _wl_surf_t *s, int *fx, int *fy,
     *fh = s->h + _WL_SSD_TITLE + 2 * _WL_SSD_BORDER;
 }
 
-static void _ssd_paint(_wl_state_t *st, _wl_surf_t *s) {
+/* ---- SSD title text (FreeType, fontconfig "sans", 13px) --------
+ * Rendered once per (title, color) and cached: titles change rarely,
+ * so the cache hit rate is near 100% while dragging. */
+typedef struct _title_cache {
+    char *key;
+    uint32_t *argb;
+    int w, h;
+    struct _title_cache *next;
+} _title_cache_t;
+static _title_cache_t *_title_cache;
+
+static void _title_cache_free_all(void) {
+    _title_cache_t *t = _title_cache;
+    while (t) {
+        _title_cache_t *n = t->next;
+        vt_free(t->key);
+        vt_free(t->argb);
+        vt_free(t);
+        t = n;
+    }
+    _title_cache = NULL;
+}
+
+static void _ssd_title_paint(uint32_t *fb, int W, int H,
+                             int x, int y, int max_w, const char *utf8,
+                             uint32_t argb, bool active) {
+#if defined(VT_HAVE_FREETYPE)
+    (void)active;
+    /* cache key: title + color (both change the bitmap) */
+    char key[256];
+    snprintf(key, sizeof(key), "%08x:%.200s", argb, utf8);
+    _title_cache_t *hit = NULL;
+    for (_title_cache_t *t = _title_cache; t; t = t->next)
+        if (strcmp(t->key, key) == 0) { hit = t; break; }
+    if (!hit) {
+        static FT_Library ft = NULL;
+        static FT_Face face = NULL;
+        static bool face_tried = false;
+        if (!face && !face_tried) {
+            face_tried = true;
+            if (FT_Init_FreeType(&ft) == 0) {
+                FcPattern *pat = FcNameParse((const FcChar8 *)"sans");
+                FcConfigSubstitute(NULL, pat, FcMatchPattern);
+                FcDefaultSubstitute(pat);
+                FcResult res = FcResultNoMatch;
+                FcPattern *mat = FcFontMatch(NULL, pat, &res);
+                if (mat) {
+                    FcChar8 *file = NULL;
+                    if (FcPatternGetString(mat, FC_FILE, 0, &file) ==
+                        FcResultMatch) {
+                        FT_New_Face(ft, (const char *)file, 0, &face);
+                        if (face)
+                            FT_Set_Pixel_Sizes(face, 0, 13);
+                    }
+                    FcPatternDestroy(mat);
+                }
+                FcPatternDestroy(pat);
+            }
+        }
+        if (!face) return;
+        hit = vt_malloc0(sizeof(*hit));
+        if (!hit) return;
+        hit->key = vt_strdup(key);
+        /* measure */
+        int adv = 0;
+        for (const unsigned char *p = (const unsigned char *)utf8;
+             *p && adv <= max_w;) {
+            unsigned cp;
+            int len = 1;
+            if ((*p & 0x80) == 0) { cp = *p; len = 1; }
+            else if ((*p & 0xE0) == 0xC0 && p[1]) { cp = ((*p & 0x1F) << 6) | (p[1] & 0x3F); len = 2; }
+            else if ((*p & 0xF0) == 0xE0 && p[1] && p[2]) { cp = ((*p & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F); len = 3; }
+            else if ((*p & 0xF8) == 0xF0 && p[1] && p[2] && p[3]) { cp = ((*p & 0x07) << 18) | ((p[1] & 0x3F) << 12) | ((p[2] & 0x3F) << 6) | (p[3] & 0x3F); len = 4; }
+            else { cp = '?'; len = 1; }
+            if (FT_Load_Char(face, cp, FT_LOAD_RENDER) == 0) {
+                adv += (int)face->glyph->advance.x >> 6;
+                if (adv > max_w) { adv = max_w; break; }
+            }
+            p += len;
+        }
+        int asc = (int)(face->size->metrics.ascender >> 6);
+        int desc = (int)(-face->size->metrics.descender >> 6);
+        hit->w = adv;
+        hit->h = asc + desc + 2;
+        if (hit->w < 1) hit->w = 1;
+        hit->argb = vt_malloc0(sizeof(uint32_t) *
+                               (size_t)hit->w * (size_t)hit->h);
+        /* rasterize */
+        int cx = 0;
+        for (const unsigned char *p = (const unsigned char *)utf8;
+             *p && cx < max_w;) {
+            unsigned cp;
+            int len = 1;
+            if ((*p & 0x80) == 0) { cp = *p; len = 1; }
+            else if ((*p & 0xE0) == 0xC0 && p[1]) { cp = ((*p & 0x1F) << 6) | (p[1] & 0x3F); len = 2; }
+            else if ((*p & 0xF0) == 0xE0 && p[1] && p[2]) { cp = ((*p & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F); len = 3; }
+            else if ((*p & 0xF8) == 0xF0 && p[1] && p[2] && p[3]) { cp = ((*p & 0x07) << 18) | ((p[1] & 0x3F) << 12) | ((p[2] & 0x3F) << 6) | (p[3] & 0x3F); len = 4; }
+            else { cp = '?'; len = 1; }
+            if (FT_Load_Char(face, cp, FT_LOAD_RENDER) == 0) {
+                FT_Bitmap *bm = &face->glyph->bitmap;
+                int gx = cx + (int)face->glyph->bitmap_left;
+                int gy = asc - (int)face->glyph->bitmap_top;
+                for (unsigned yy = 0; yy < bm->rows; yy++) {
+                    int dy = gy + (int)yy;
+                    if (dy < 0 || dy >= hit->h) continue;
+                    for (unsigned xx = 0; xx < bm->width; xx++) {
+                        int dx = gx + (int)xx;
+                        if (dx < 0 || dx >= hit->w) continue;
+                        unsigned char a = bm->buffer
+                            ? bm->buffer[yy * bm->pitch + xx] : 0;
+                        if (a == 0) continue;
+                        uint32_t old = hit->argb[dy * hit->w + dx];
+                        unsigned na = (a * 255u) / 255u;
+                        unsigned oa = old >> 24;
+                        unsigned mix = (na > oa) ? na : oa;
+                        hit->argb[dy * hit->w + dx] =
+                            (mix << 24) | (argb & 0xffffff);
+                    }
+                }
+                cx += (int)face->glyph->advance.x >> 6;
+            }
+            p += len;
+        }
+        hit->next = _title_cache;
+        _title_cache = hit;
+        /* keep the cache bounded */
+        int n = 0;
+        for (_title_cache_t *t = _title_cache; t; t = t->next) n++;
+        if (n > 64) {
+            _title_cache_t *t = _title_cache;
+            while (t->next && t->next->next) t = t->next;
+            if (t->next) {
+                vt_free(t->next->key);
+                vt_free(t->next->argb);
+                vt_free(t->next);
+                t->next = NULL;
+            }
+        }
+    }
+    if (!hit || !hit->argb) return;
+    /* alpha-blend the cached bitmap onto the framebuffer */
+    int x0 = x, y0 = y;
+    for (int yy = 0; yy < hit->h; yy++) {
+        int dy = y0 + yy;
+        if (dy < 0 || dy >= H) continue;
+        for (int xx = 0; xx < hit->w; xx++) {
+            int dx = x0 + xx;
+            if (dx < 0 || dx >= W) continue;
+            uint32_t sp = hit->argb[yy * hit->w + xx];
+            uint32_t a = sp >> 24;
+            if (a == 0) continue;
+            uint32_t dp = fb[dy * W + dx];
+            uint32_t rb = ((sp & 0x00ff00ff) * a +
+                           (dp & 0x00ff00ff) * (255 - a)) / 255;
+            uint32_t g = ((sp & 0x0000ff00) * a +
+                          (dp & 0x0000ff00) * (255 - a)) / 255;
+            fb[dy * W + dx] = 0xff000000 | (rb & 0x00ff00ff) |
+                              (g & 0x0000ff00);
+        }
+    }
+#else
+    (void)fb; (void)W; (void)H; (void)x; (void)y; (void)max_w;
+    (void)utf8; (void)argb; (void)active;
+#endif
+}
+
+void _ssd_paint(_wl_state_t *st, _wl_surf_t *s) {
     if (!s->ssd || !s->toplevel) return;
     int fx, fy, fw, fh;
     _ssd_frame_geom(s, &fx, &fy, &fw, &fh);
@@ -2811,21 +2981,15 @@ static void _ssd_paint(_wl_state_t *st, _wl_surf_t *s) {
             }
         }
     }
-    /* title text: reuse the panel's glyph rasterizer through a tiny
-     * local copy (the panel module owns FreeType); we draw with the
-     * built-in 5x7-free path via vt_wl_panel text when available */
-    if (st->panel && s->toplevel->title && *s->toplevel->title) {
-        extern int vt_wl_panel_ssd_title(vt_wl_panel_t *p, uint32_t *fb,
-                                         int fbw, int fbh, int x, int y,
-                                         int max_w, const char *utf8,
-                                         uint32_t argb);
-        vt_wl_panel_ssd_title(st->panel, fb, W, H, fx + 8,
-                              fy + 2, bx - fx - 12,
-                              s->toplevel->title, fg);
+    /* title text: our own FreeType rasterizer (fontconfig "sans"),
+     * rendered once per title+color and cached — titles change rarely */
+    if (s->toplevel->title && *s->toplevel->title) {
+        _ssd_title_paint(fb, W, H, fx + 8, fy + 2, bx - fx - 12,
+                         s->toplevel->title, fg, active);
     }
 }
 
-static void _paint_background(_wl_state_t *st) {
+void _paint_background(_wl_state_t *st) {
     /* the SAME wallpaper the X11 desktop shows (config [wallpaper]):
      * rendered once into bg_pix at startup, blitted every frame.
      * Previously this was a flat hardcoded gray — the user's "blue
@@ -2842,41 +3006,88 @@ static void _paint_background(_wl_state_t *st) {
     }
 }
 
-/* ---- panel glue: compositor → panel callbacks ---- */
-static void _panel_cb_focus(uint64_t id, void *ud) {
-    _wl_state_t *st = ud;
+/* ---------------------------------------------------- toplevel pool */
+/* One allocation path for WM-visible windows: xdg toplevels AND
+ * Xwayland X windows both need a stable id + title + app_id for the
+ * taskbar/pager/IPC — the X11-app path creates synthetic toplevels. */
+_xdg_toplevel_t *_toplevel_new(_wl_state_t *st, _wl_surf_t *s,
+                               const char *title, const char *app_id) {
+    _xdg_toplevel_t *t = vt_malloc0(sizeof(*t));
+    if (!t) return NULL;
+    t->surf = s;
+    t->id = ++st->next_win_id;
+    t->title = vt_strdup(title ? title : "");
+    t->app_id = vt_strdup(app_id ? app_id : "");
+    if (s) s->toplevel = t;
+    return t;
+}
+
+void _toplevel_free(_xdg_toplevel_t *t) {
+    if (!t) return;
+    if (t->surf && t->surf->toplevel == t) t->surf->toplevel = NULL;
+    vt_free(t->title);
+    vt_free(t->app_id);
+    vt_free(t);
+}
+
+/* ---------------------------------------------------- stacking rules */
+/* Order (bottom→top): background/bottom layer surfaces → toplevels →
+ * top/overlay layer surfaces → popups. The old code pushed everything
+ * to the very top, which stacked new windows above docked panels. */
+void _stack_insert(_wl_surf_t *s) {
+    _wl_state_t *st = _wls;
     if (!st) return;
-    _wl_surf_t *s;
-    wl_list_for_each(s, &st->surfaces, link) {
-        if (s->toplevel && s->toplevel->id == id) {
-            /* taskbar restore: bring a minimized window back */
-            if (s->minimized) {
-                s->minimized = false;
-                s->toplevel->minimized = false;
-                s->ws = st->ws_cur;
-                vt_logi("wayland: window 0x%llx restored from taskbar",
-                        (unsigned long long)id);
+    if (s->popup) {
+        wl_list_insert(st->surfaces.prev, &s->link);
+        return;
+    }
+    if (s->layer) {
+        bool low = _layer_is_bottom(s);
+        _wl_surf_t *it;
+        if (low) {
+            /* below the first toplevel (background panels) */
+            wl_list_for_each(it, &st->surfaces, link) {
+                if (it->toplevel) {
+                    wl_list_insert(it->link.prev, &s->link);
+                    return;
+                }
             }
-            /* raise to the top of the stack */
-            wl_list_remove(&s->link);
-            wl_list_insert(st->surfaces.prev, &s->link);
-            st->kbd_focus = s;
-            st->focused_toplevel = s->toplevel;
-            _pointer_focus_update(st, true);
-            _kbd_enter_focus(st, s);
-            _emit_win(st, VT_BACKEND_WL_EVENT_WIN_FOCUS, s->toplevel);
-            st->dirty = true;
+        } else {
+            /* above toplevels, below the first popup (top panels) */
+            wl_list_for_each(it, &st->surfaces, link) {
+                if (it->popup) {
+                    wl_list_insert(it->link.prev, &s->link);
+                    return;
+                }
+            }
+        }
+        wl_list_insert(st->surfaces.prev, &s->link);
+        return;
+    }
+    /* toplevel (or Xwayland window): above other toplevels but below
+     * top/overlay layer surfaces (docked panels stay on top) */
+    _wl_surf_t *it;
+    wl_list_for_each(it, &st->surfaces, link) {
+        if (_layer_is_top(it) && it->mapped) {
+            wl_list_insert(it->link.prev, &s->link);
             return;
         }
     }
+    wl_list_insert(st->surfaces.prev, &s->link);
 }
 
-static void _panel_cb_close(uint64_t id, void *ud) {
-    vt_backend_t *self = ((_wl_state_t *)ud)->backend_self;
-    if (self && self->close_window) self->close_window(self, id);
+void _stack_resort(_wl_state_t *st) {
+    if (!st) return;
+    _wl_surf_t *s, *tmp;
+    wl_list_for_each_safe(s, tmp, &st->surfaces, link) {
+        if (!s->layer) continue;
+        wl_list_remove(&s->link);
+        _stack_insert(s);
+    }
 }
 
-static void _panel_emit_ws(_wl_state_t *st) {
+/* workspace event emission (panel + WM both subscribe) */
+static void _emit_ws(_wl_state_t *st) {
     vt_backend_wl_event_t ev;
     memset(&ev, 0, sizeof(ev));
     ev.kind = VT_BACKEND_WL_EVENT_WORKSPACE;
@@ -2884,87 +3095,6 @@ static void _panel_emit_ws(_wl_state_t *st) {
     ev.title = NULL;
     ev.app_id = NULL;
     vt_backend_emit_event(st->backend_self, &ev);
-}
-
-static void _panel_cb_ws(int ws, void *ud) {
-    _wl_state_t *st = ud;
-    if (!st || ws < 0 || ws >= st->ws_count || ws == st->ws_cur) return;
-    st->ws_cur = ws;
-    vt_wl_panel_set_workspaces(st->panel, st->ws_count, st->ws_cur);
-    _panel_emit_ws(st);
-    _focus_top_on_ws(st);
-    st->dirty = true;
-    vt_logi("wayland: workspace -> %d", ws + 1);
-}
-
-static void _panel_cb_logout(const char *action, void *ud) {
-    _wl_state_t *st = ud;
-    if (!st) return;
-    const char *act = action ? action : "";
-    /* Session-managed run: the session manager owns child supervision
-     * and the shutdown policy — ask IT to end the session. It will
-     * SIGTERM every child (including this compositor, whose unwind
-     * restores the CRTC and returns the VT to text) and then exit,
-     * leaving the user back on their original TTY. Exiting here
-     * WITHOUT telling the session would trigger the supervisor's
-     * restart loop and re-take the screen — the old "trapped
-     * session" bug.
-     * Standalone run (no session manager): local clean unwind. */
-    const char *rd = getenv("XDG_RUNTIME_DIR");
-    if (rd && *rd) {
-        char *path = vt_strprintf("%s/vantage-session.sock", rd);
-        vt_ipc_t *ipc = vt_ipc_new_client(path);
-        vt_free(path);
-        if (ipc) {
-            vt_ipc_msg_t resp = {0};
-            vt_ipc_call(ipc, VT_IPC_MSG_WM_LOGOUT, act, (uint32_t)strlen(act),
-                        &resp, 1500);
-            vt_ipc_msg_free(&resp);
-            vt_ipc_free(ipc);
-            vt_logi("wayland: panel logout (%s) — session manager is "
-                    "ending the session (supervised shutdown, no restart)",
-                    *act ? act : "logout");
-            return;
-        }
-    }
-    if (vt_streq(act, "reboot") || vt_streq(act, "shutdown")) {
-        /* no session manager — schedule the power action to run AFTER
-         * our own clean unwind (detached child in its own session
-         * survives the compositor exit) */
-        char *cmd = vt_strprintf(
-            "sleep 1 && (loginctl %s 2>/dev/null || systemctl %s "
-            "2>/dev/null)", act, act);
-        vt_proc_spawn_detached(cmd);
-        vt_free(cmd);
-        vt_logw("wayland: panel %s without a session manager — the "
-                "action runs right after the compositor exits", act);
-    }
-    vt_logi("wayland: panel logout — no session manager; clean unwind");
-    _hotkey_try(st->backend_self, "Ctrl+Alt+Delete");
-}
-
-static void _panel_sync_windows(_wl_state_t *st) {
-    vt_wl_panel_win_t wins[32];
-    size_t n = 0;
-    _wl_surf_t *s;
-    wl_list_for_each_reverse(s, &st->surfaces, link) {
-        if (!s->mapped || s->is_cursor || !s->toplevel) continue;
-        /* ALL workspaces: the taskbar shows the current one, the pager
-         * miniatures need every workspace's windows with their real
-         * position and size */
-        wins[n].id = s->toplevel->id;
-        wins[n].title = s->toplevel->title ? s->toplevel->title : "";
-        wins[n].app_id = s->toplevel->app_id ? s->toplevel->app_id : "";
-        wins[n].focused = (st->kbd_focus == s);
-        wins[n].minimized = s->minimized;
-        wins[n].ws = s->ws;
-        wins[n].x = s->x;
-        wins[n].y = s->y;
-        wins[n].w = s->w;
-        wins[n].h = s->h;
-        if (++n >= 32) break;
-    }
-    vt_wl_panel_set_windows(st->panel, wins, n);
 }
 
 /* alpha-blend an ARGB sprite over the XRGB framebuffer.
@@ -3082,11 +3212,6 @@ static void _paint(void) {
             vt_free(n);
         }
     }
-    /* the REAL compositor panel: bar + open menus, on top of clients */
-    if (st->panel) {
-        _panel_sync_windows(st);
-        vt_wl_panel_paint(st->panel, st->fb, st->out_w, st->out_h);
-    }
     /* Software cursor sprite — ALWAYS drawn. The hardware cursor plane
      * is a bonus (used when the driver actually supports it); making the
      * sprite the source of truth guarantees a visible cursor on every
@@ -3156,6 +3281,11 @@ static int _wl_close_window(vt_backend_t *self, uint64_t id) {
     _wl_surf_t *s;
     wl_list_for_each(s, &st->surfaces, link) {
         if (s->toplevel && s->toplevel->id == id) {
+            if (s->xwl) {
+                /* X11 window: WM_DELETE_WINDOW through the X display */
+                _xwl_close(s);
+                return 0;
+            }
             if (s->toplevel->res)
                 xdg_toplevel_send_close(s->toplevel->res);
             return 0;
@@ -3464,7 +3594,20 @@ static int _wl_init(vt_backend_t *self) {
     }
     st->client_created.notify = _client_destroyed;
     wl_display_add_client_created_listener(st->display, &st->client_created);
-    const char *sock = wl_display_add_socket_auto(st->display);
+    /* deterministic socket name: the session manager sets
+     * VANTAGE_WAYLAND_SOCKET so it can hand children the exact
+     * WAYLAND_DISPLAY without polling the runtime dir */
+    const char *want_sock = getenv("VANTAGE_WAYLAND_SOCKET");
+    const char *sock = NULL;
+    if (want_sock && *want_sock) {
+        if (wl_display_add_socket(st->display, want_sock) == 0)
+            sock = want_sock;
+        else
+            vt_logw("wayland: cannot bind socket '%s' — falling back to "
+                    "an automatic name", want_sock);
+    }
+    if (!sock)
+        sock = wl_display_add_socket_auto(st->display);
     if (!sock) {
         _stage_fail(12, "wl_display_add_socket_auto failed (bad "
                         "XDG_RUNTIME_DIR?)");
@@ -3535,21 +3678,18 @@ static int _wl_init(vt_backend_t *self) {
     _wls = st;
     st->dirty = true;
 
-    /* ---- the REAL compositor panel (no placeholder blocks) -------- */
+    /* ---- workspace model + layer-shell + Xwayland ---------------- */
     st->ws_count = 4;
     st->ws_cur = 0;
-    st->panel = vt_wl_panel_create(st->out_w, 32);
-    vt_wl_panel_set_screen(st->panel, st->out_w, st->out_h);
-    vt_wl_panel_set_workspaces(st->panel, st->ws_count, st->ws_cur);
-    {
-        vt_wl_panel_cbs_t cbs = {
-            .focus_window = _panel_cb_focus,
-            .close_window = _panel_cb_close,
-            .switch_ws = _panel_cb_ws,
-            .logout = _panel_cb_logout,
-        };
-        vt_wl_panel_set_callbacks(st->panel, &cbs, st);
-    }
+    /* the panel is a CLIENT now: docked through wlr-layer-shell (the
+     * same protocol every independent panel uses) — not code baked
+     * into the compositor */
+    _layer_shell_global_create(st);
+    if (!st->layer_shell_g)
+        vt_logw("wayland: layer-shell global creation failed — docked "
+                "panels cannot attach");
+    /* Xwayland: X11 apps become first-class windows of this session */
+    st->xwl_enabled = _xwl_start(st);
 
     /* ---- stage 15/15: desktop (first frame) -------------------------- */
     _stage_begin(14, "first frame");
@@ -3570,8 +3710,7 @@ static int _wl_init(vt_backend_t *self) {
     _paint();
     _present();
     _stage_ok(14, "desktop painted %dx%d (%s), wallpaper background, "
-              "cursor software sprite, compositor panel (Vantage menu, "
-              "taskbar, pager, clock, session menu)",
+              "cursor software sprite, layer-shell + Xwayland ready",
               st->out_w, st->out_h,
               st->kms ? vt_kms_out_name(st->kms, 0) : "headless");
     vt_logi("[wayland] desktop: ready");
@@ -3591,10 +3730,9 @@ static void _wl_fini(vt_backend_t *self) {
     if (self->priv != _wls || !_wls) return;
     _wl_state_t *st = _wls;
     vt_logi("wayland: shutting down the compositor");
-    if (st->panel) {
-        vt_wl_panel_destroy(st->panel);
-        st->panel = NULL;
-    }
+    _xwl_stop(st);
+    _layer_shell_global_destroy(st);
+    _title_cache_free_all();
     _input_fini(st);
     _xkb_fini(st);
     if (st->drm_src) { wl_event_source_remove(st->drm_src); st->drm_src = NULL; }
@@ -3629,6 +3767,9 @@ static int _wl_dispatch(vt_backend_t *self, int timeout_ms) {
     else
         wl_event_loop_dispatch(st->loop, 0);
     wl_display_flush_clients(st->display);
+    /* Xwayland window events (MapRequest/properties/…) arrive on the
+     * xcb connection, not the wayland loop — drain them here */
+    _xwl_dispatch();
     _paint();
     _present();
     return 0;
@@ -3681,6 +3822,58 @@ static int _wl_test_input(vt_backend_t *self, const char *spec) {
         _pointer_axis(st, (double)(d * 15));
         return 0;
     }
+    /* key <name>: inject through the REAL keyboard path (the same
+     * _kbd_key handler libinput feeds), so integration harnesses can
+     * type into panel search bars and drive menus. Uppercase names
+     * (e.g. "A", "F1") auto-apply Shift. */
+    if (strncmp(spec, "key ", 4) == 0) {
+        const char *name = spec + 4;
+        while (*name == ' ') name++;
+        if (!*name) return -1;
+#if defined(VT_HAVE_XKBCOMMON)
+        bool shift = false;
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%s", name);
+        if (strlen(buf) == 1 && buf[0] >= 'A' && buf[0] <= 'Z') {
+            buf[0] = (char)(buf[0] - 'A' + 'a');
+            shift = true;
+        }
+        xkb_keysym_t sym = xkb_keysym_from_name(buf, 0);
+        if (sym == XKB_KEY_NoSymbol)
+            sym = xkb_keysym_from_name(name, 0);
+        if (sym == XKB_KEY_NoSymbol) {
+            vt_logw("wayland: test-input: unknown key '%s'", name);
+            return -1;
+        }
+        /* find the keycode that produces this keysym */
+        for (xkb_keycode_t kc = 8; kc < 256; kc++) {
+            if (xkb_state_key_get_one_sym(st->xkb_st, kc) == sym) {
+                if (shift) {
+                    _kbd_key(st, 42, true);   /* KEY_LEFTSHIFT */
+                }
+                _kbd_key(st, (uint32_t)(kc - 8), true);
+                _kbd_key(st, (uint32_t)(kc - 8), false);
+                if (shift) {
+                    _kbd_key(st, 42, false);
+                }
+                return 0;
+            }
+        }
+        vt_logw("wayland: test-input: no keycode for '%s'", name);
+        return -1;
+#else
+        (void)name;
+        return -1;
+#endif
+    }
+    /* click x,y: motion + press + release convenience */
+    if (sscanf(spec, "click %d,%d", &x, &y) == 2) {
+        _pointer_motion(st, (double)(x - st->cursor_x),
+                        (double)(y - st->cursor_y));
+        _pointer_button(st, 0x110, true);
+        _pointer_button(st, 0x110, false);
+        return 0;
+    }
     vt_logw("wayland: test-input: unrecognized spec '%s'", spec);
     return -1;
 }
@@ -3689,7 +3882,7 @@ static int _wl_test_input(vt_backend_t *self, const char *spec) {
  * workspace switches — every WM focuses something on the desktop you
  * switch to; leaving focus on an invisible window means keystrokes go
  * nowhere and the pager shows no focused miniature) */
-static void _focus_top_on_ws(_wl_state_t *st) {
+void _focus_top_on_ws(_wl_state_t *st) {
     if (!st) return;
     _wl_surf_t *s;
     wl_list_for_each_reverse(s, &st->surfaces, link) {
@@ -3723,9 +3916,9 @@ static int _wl_set_workspace(vt_backend_t *self, int ws) {
                       ? _wls : NULL;
     if (!st || ws < 0 || ws >= st->ws_count || ws == st->ws_cur) return -1;
     st->ws_cur = ws;
-    vt_wl_panel_set_workspaces(st->panel, st->ws_count, st->ws_cur);
-    _panel_emit_ws(st);
+    _emit_ws(st);
     _focus_top_on_ws(st);
+    _xwl_workspace_changed(st);
     st->dirty = true;
     vt_logi("wayland: workspace -> %d (remote)", ws + 1);
     return 0;

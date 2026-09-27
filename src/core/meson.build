@@ -2,7 +2,6 @@
 src_core = [
   'vt-core.c',
   'vt-paths.c',
-  'vt-apps.c',
 ]
 
 lib_vantage_core = static_library('vantage-core',

@@ -11,7 +11,6 @@ install_headers(
   'vantage/vt-compositor.h',
   'vantage/vt-wm.h',
   'vantage/vt-session.h',
-  'vantage/vt-panel.h',
   'vantage/vt-desktop.h',
   'vantage/vt-wallpaper.h',
   'vantage/vt-theme.h',

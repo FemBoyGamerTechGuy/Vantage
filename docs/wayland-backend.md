@@ -204,44 +204,37 @@ position), so that class of bug cannot return silently.
 `VANTAGE_WL_CURSOR=builtin` forces the built-in arrow (tests, and a
 manual override when a theme misbehaves).
 
-## The compositor panel
+## The desktop shell: GTK4 panel + XWayland
 
-The native Wayland session draws a REAL panel with the compositor itself
-(vt-wl-panel.c) — not XWayland, not X11 clients, and not placeholder
-blocks:
+The desktop shell is now REAL and standard:
 
-* LEFT: **Programs** button (themed `start-here` icon from the active
-  icon theme — XFCE-style start button; `VANTAGE_START_ICON` overrides,
-  drawn grid glyph as the honest fallback) → categorized application
-  menu built from XDG `.desktop` entries via the SHARED vt-apps database
-  (identical parser, locale handling and category table as the X11
-  panel — there is no second app list) with a **search bar** (type to
-  filter by name and keywords, BackSpace edits, Escape closes),
-  **scrolling** (wheel over the list, scrollbar indicator), **icon-theme
-  icons at 24px** (SVG themes rasterize at the exact display size via
-  librsvg; raster icons are area-averaged — no more low-res smears) and
-  a Quit Session entry; **taskbar** of xdg toplevels (app icons from the
-  icon theme via `app_id`, adaptive button widths, focused/minimized
-  states, click focuses/restores, right-click closes)
-* RIGHT: **workspace PAGER** — each cell is a miniature of that desktop
-  showing its windows at their true relative position and size (click a
-  cell to switch, wheel cycles; switching focuses the top window on the
-  desktop you land on), network indicator (real `/sys/class/net` state,
-  wired + wireless quality), volume (native ALSA mixer — real values,
-  wheel adjusts, popup slider), clock with a calendar popup
-  (previous/next month), username menu with Lock Screen / Suspend /
-  Switch User / Log Out / Reboot / Shutdown / Exit Session
+* **The panel** (`vantage-panel`, subprojects/panel) is a GTK4 CLIENT
+  of the compositor — not compositor-internal code. It docks through
+  **`zwlr_layer_shell_v1`** (top layer, exclusive zone = the panel
+  height, so maximized/fullscreen windows leave room for it; keyboard
+  interactivity on-demand so the menu search bar gets keys). The
+  compositor implements the protocol in `vt-wl-layer.c`: layer
+  surfaces get configured, anchored and composited ABOVE normal
+  windows, their exclusive zone shrinks the workarea, and layer
+  popups (the Programs menu) stack correctly. One binary, one look —
+  the SAME panel docks as an EWMH dock window on the X11 backend.
+* **XWayland**: the compositor launches and manages `Xwayland` itself
+  (`vt-wl-xwayland.c` + the `xwayland_shell_v1` protocol): X11 windows
+  are associated with their `wl_surface`, managed ICCCM/EWMH-style
+  (frame decorations, focus, workspaces, maximize/minimize) and appear
+  in the SAME taskbar, pager and window list as native Wayland
+  windows. Legacy X11 apps need zero configuration to run inside the
+  native session; `DISPLAY` is exported for children.
 
-Text is rasterized with FreeType + fontconfig **with per-codepoint font
-fallback** (a second face is matched lazily when the primary sans lacks
-a glyph — Cyrillic/CJK app names render correctly); a built-in bitmap
-font is the fallback so labels never disappear.
-
-Applications actually launch: the `Exec=` line is cleaned of field codes
-(`%f %u …`), `Terminal=true` entries are wrapped in a real terminal
-emulator, and children inherit `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR` from
-the compositor (it exported them when it created the socket). Launched
-children are auto-reaped (`SIGCHLD: SIG_IGN`) — no zombies.
+The panel carries the full desktop surface: Programs menu (GDesktopApp
+database — locale-aware names, categories, themed icons, search bar),
+taskbar (per-window icons, focused/minimized states, click to focus,
+click again to minimize), the workspace PAGER (live miniatures at true
+relative geometry), network and volume applets (real ALSA mixer
+values), clock and the session menu. Applications launch through the
+`.desktop` `Exec=` line with field codes stripped; `Terminal=true`
+entries are wrapped in a real terminal emulator; children inherit
+`WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR` and are auto-reaped (no zombies).
 
 Session actions route through the SESSION MANAGER when one is running:
 "Log Out"/"Exit Session"/"Reboot"/"Shutdown" send the session IPC
@@ -249,8 +242,7 @@ message, the supervisor then SIGTERMs every child (the compositor's
 unwind restores the CRTC and returns the VT to text mode) and the
 session exits — **it never restarts the compositor on a clean logout**
 (see "Logout that actually returns to the TTY" below). Lock/Suspend
-spawn `loginctl` detached — the compositor event loop never blocks on
-`system()`. Failures are reported honestly in the menu status line.
+spawn `loginctl` detached — the panel event loop never blocks.
 
 Real-client protocol surface: `wl_compositor`, `wl_shm`, `wl_seat`
 (pointer + keyboard, xkb keymaps, `wl_pointer` frame events),
@@ -260,10 +252,10 @@ constraint adjustments, `xdg_popup.grab`, `popup_done` dismissal),
 **`wl_subcompositor`/`wl_subsurface`** (GTK/Qt overlays paint relative
 to their parent), **`wl_data_device_manager`** (in-session clipboard:
 selection tracking, per-client offers, `data_offer.receive` pipe
-through to the source) and **`xdg-decoration-unstable-v1`** (CSD apps
+through to the source), **`xdg-decoration-unstable-v1`** (CSD apps
 are never double-decorated: client mode is the default; a toplevel that
 explicitly requests server mode gets a compositor-drawn titlebar with
-move/resize/close buttons).
+move/resize/close buttons) and **`zwlr_layer_shell_v1`** (panels/docks).
 
 Client buffers are COPIED at commit time and released immediately
 (`wl_buffer.release`), so double-buffered toolkits never stall and the
@@ -279,7 +271,6 @@ same wallpaper.
 
 Super+drag moves any window (left button) or resizes it (right button)
 even when the app has no titlebar of its own.
-
 ## Input requirements (no session manager)
 
 When the session runs through elogind/logind or seatd, input devices are
@@ -341,13 +332,13 @@ mode, exit 0).
   framebuffer for tests/CI. It never *claims* a real display it does
   not own; `VANTAGE_WAYLAND_REQUIRE_KMS=1` turns the fallback into an
   error.
-* The panel and desktop components are X11 clients today; the Wayland
-  session runs the compositor + WM (windows are composited and
-  manageable through `vantage-remote`).
 * Composition is CPU-side into the mapped scanout buffers — the same
   code path the headless tests exercise. The EGL/GLES context exists
   for honest renderer reporting and future GPU compositing.
 * Multi-monitor: every connected connector is driven (cloned content);
   per-monitor layouts are not yet configurable.
-* wl_subcompositor, pointer gestures and IME are not implemented; the
-  core desktop protocols (compositor/shm/seat/output/xdg_shell) are.
+* Pointer gestures and IME are not implemented; the core desktop
+  protocols (compositor/shm/seat/output/xdg_shell, layer-shell,
+  Xwayland) are. The X11 desktop-icons component (`vantage-desktop`)
+  is X11-only today; the Wayland session ships the compositor, WM,
+  panel and XWayland support.
