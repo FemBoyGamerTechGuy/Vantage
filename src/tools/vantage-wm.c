@@ -264,16 +264,19 @@ static int _h_wm_query(vt_ipc_t *ipc, const vt_ipc_msg_t *req,
     for (size_t i = 0; i < wm->windows.size; i++) {
         vt_window_t *w = *(vt_window_t **)vt_vec_at(&wm->windows, i);
         if (!w) continue;
-        char flags[8] = {0};
+        char flags[10] = {0};
         int fi = 0;
         if (w->focused) flags[fi++] = 'F';
         if (w->minimized) flags[fi++] = 'M';
         if (w->maximized) flags[fi++] = 'X';
         if (w->fullscreen) flags[fi++] = 'S';
         if (w->urgent) flags[fi++] = 'U';
+        if (w->is_dock) flags[fi++] = 'D';
+        if (w->is_desktop) flags[fi++] = 'K';
         /* geometry columns feed the panel's workspace PAGER: each cell
          * draws the windows of that desktop at their real relative
-         * position and size */
+         * position and size. The D/K flags let the panel treat shell
+         * chrome (this WM's own dock/desktop windows) correctly. */
         vt_strbuilder_appendf(&sb,
                               "%u\t%s\t%d\t%s\t%s\t%s\t%d\t%d\t%d\t%d\n",
                               w->id,

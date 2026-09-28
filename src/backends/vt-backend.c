@@ -160,10 +160,14 @@ int vt_backend_remove_event_sink(vt_backend_t *b, int sink_id) {
 
 void vt_backend_emit_event(vt_backend_t *b, void *event) {
     if (!b || !event) return;
-    /* Iterate over a snapshot: a sink may remove itself during dispatch. */
+    /* Iterate over a snapshot: a sink may remove itself during dispatch.
+     * A backend with NO sinks yet has a NULL data vector — memcpy
+     * (dst, NULL, 0) is still undefined behavior (UBSan flags it, and
+     * it fires on every event before the WM registers its sink). */
     vt_backend_sink_t snap[16];
     size_t n = b->sinks.size < 16 ? b->sinks.size : 16;
-    memcpy(snap, b->sinks.data, n * sizeof(vt_backend_sink_t));
+    if (n > 0 && b->sinks.data)
+        memcpy(snap, b->sinks.data, n * sizeof(vt_backend_sink_t));
     for (size_t i = 0; i < n; i++)
         snap[i].fn(snap[i].ud, event);
 }

@@ -317,6 +317,10 @@ static void _read_type_and_state(_client_t *c) {
         }
         XFree(data);
     }
+    /* mirror into the WM model: WM_QUERY flags D/K carry this to the
+     * panel (docks/desktops are shell chrome, never taskbar entries) */
+    c->model.is_dock = c->is_dock;
+    c->model.is_desktop = c->is_desktop;
     c->model.fullscreen = vt_x11_has_state(c->win, a->net_wm_state_fullscreen);
     c->model.sticky = vt_x11_has_state(c->win, a->net_wm_state_sticky);
     c->model.layer = vt_x11_has_state(c->win, a->net_wm_state_above) ? VT_WM_LAYER_ABOVE
@@ -661,13 +665,30 @@ static void _frame_paint(vt_wm_x11_t *e, _client_t *c) {
         char shown[128];
         snprintf(shown, sizeof(shown), "%s", title);
         if (gi.xOff > max_w && max_w > 16) {
-            for (;;) {
-                size_t l = strlen(shown);
-                if (l < 2 || gi.xOff <= max_w) break;
-                shown[l - 1] = 0;
-                snprintf(shown + strlen(shown),
-                         sizeof(shown) - strlen(shown), "%s",
-                         "\xe2\x80\xa6");   /* ellipsis */
+            /* Shrink MONOTONICALLY. The old loop removed ONE byte and
+             * appended a THREE-byte ellipsis each pass — the string
+             * GREW by 2 bytes per iteration, the measured width could
+             * never fall back below max_w, and the WM spun in this
+             * loop forever (100% CPU, main loop wedged). Under
+             * CompositeRedirectManual a wedged composite manager means
+             * a frozen DISPLAY — "opening any app locks the whole DE",
+             * recoverable only by killing Xorg and the WM from a TTY.
+             * Cut at UTF-8 LEAD bytes only (never split a sequence into
+             * invalid bytes), keep the cut index strictly decreasing,
+             * and bound the loop as a second guard against font
+             * weirdness. */
+            size_t cut = strlen(shown);
+            int guard = 64;
+            while (cut > 1 && gi.xOff > max_w && guard-- > 0) {
+                cut--;
+                while (cut > 0 && ((unsigned char)shown[cut] & 0xc0) == 0x80)
+                    cut--;          /* back up onto a UTF-8 lead byte */
+                if (cut + 4 <= sizeof(shown)) {
+                    memcpy(shown + cut, "\xe2\x80\xa6", 3);   /* … */
+                    shown[cut + 3] = 0;
+                } else {
+                    shown[cut] = 0; /* no room for the ellipsis: cut */
+                }
                 XftTextExtentsUtf8(dpy, e->tfont, (const FcChar8 *)shown,
                                    (int)strlen(shown), &gi);
             }
@@ -1156,6 +1177,25 @@ static void _manage(vt_wm_x11_t *e, Window w) {
         if (c->model.x < out.x) c->model.x = out.x;
         if (c->model.y < out.y) c->model.y = out.y;
     }
+    /* Self-positioned windows (USPosition/session restore) may ask for
+     * a spot behind the docked panel — the title bar would be hidden
+     * with nothing left to grab. Clamp ANY placement into the workarea
+     * the panel's struts actually reserve — FRAME-aware: the SSD title
+     * band (26+2px) sits ABOVE the client window, so clamping the
+     * client to the bare workarea top still parks the grab bar behind
+     * the panel. CSD (motif-undecorated) windows carry their own grab
+     * bar INSIDE the client area — for them the bare top is right. */
+    if (!c->is_dock && !c->is_desktop) {
+        _rect_t rwa = e->workarea;
+        int tbar = _motif_undecorated(c, e->dpy)
+                       ? 0 : (_FR_TITLE + _FR_BORDER);
+        if (c->model.y < rwa.y + tbar) c->model.y = rwa.y + tbar;
+        if (c->model.x < rwa.x + _FR_BORDER) c->model.x = rwa.x + _FR_BORDER;
+        if (c->model.x + c->model.w > rwa.x + rwa.w && rwa.w > c->model.w)
+            c->model.x = rwa.x + rwa.w - c->model.w;
+        if (c->model.y + c->model.h > rwa.y + rwa.h && rwa.h > c->model.h)
+            c->model.y = rwa.y + rwa.h - c->model.h;
+    }
 
     _apply_configure(e, c, c->model.x, c->model.y, c->model.w, c->model.h);
 
@@ -1417,8 +1457,20 @@ static void _op_motion(vt_wm_x11_t *e, int px, int py) {
     _client_t *c = e->op_client;
     int dx = px - e->op_start_x, dy = py - e->op_start_y;
     if (e->op_mode == 0) {
-        _apply_configure(e, c, e->op_win_x + dx, e->op_win_y + dy,
-                         c->model.w, c->model.h);
+        int nx = e->op_win_x + dx;
+        int ny = e->op_win_y + dy;
+        /* keep the title bar REACHABLE: clamping to the workarea top
+         * (not the screen top) means a window can never be dragged
+         * fully behind the panel with no grab handle left — and the
+         * clamp is FRAME-aware: the SSD title band sits ABOVE the
+         * client window, so the client must clear the workarea top
+         * by the full band or the grab bar still hides behind the
+         * panel (CSD windows: their own chrome IS the grab bar) */
+        int tbar = _framed(c) ? (c->fr_title + _FR_BORDER) : 0;
+        if (ny < e->workarea.y + tbar) ny = e->workarea.y + tbar;
+        if (nx + c->model.w < e->workarea.x + 40)
+            nx = e->workarea.x + 40 - c->model.w;
+        _apply_configure(e, c, nx, ny, c->model.w, c->model.h);
     } else {
         int x = e->op_win_x, y = e->op_win_y;
         int w = e->op_win_w, h = e->op_win_h;

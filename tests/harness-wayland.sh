@@ -869,6 +869,169 @@ done
 wait "$PG_A_PID" 2>/dev/null
 wait "$PG_B_PID" 2>/dev/null
 
+# ------------------------------------------------- burst drag stress
+# "moving the windows too fast bugs out the pager ... it locks the
+# entire DE until it updates": a full-speed drag floods the WM event
+# socket with geometry broadcasts; the old BLOCKING write parked the
+# compositor inside send() until the panel drained (~2 s whole-DE
+# freeze), and the misaligned WS answer collapsed the pager to one
+# cell mid-drag. The dragged window is a REAL X11 app through
+# Xwayland — the user's exact scenario (SSD title bar, X-side
+# configure round-trips) — which also pins the Composite-Redirect
+# pixel path: an Xwayland window that renders nothing has no color
+# blob to find and fails here. Pins: the 5000-step burst dispatches
+# fast (throttle + non-blocking broadcasts), the window lands where
+# it was dragged with its title bar still REACHABLE (frame-aware
+# workarea clamp), and the pager still shows the full 4-cell band.
+echo "== harness-wayland: full-speed drag burst (no DE lock, pager intact) =="
+XWL_DISPLAY1=$(grep -o 'xwayland: ready — DISPLAY=:[0-9]*' "$WORK/wm.log" \
+                2>/dev/null | head -1 | grep -o ':[0-9]*$')
+XWL_AUTH1=$(grep -o 'auth [^ )]*' "$WORK/wm.log" 2>/dev/null \
+            | head -1 | cut -d' ' -f2)
+DRAG_LOG="$WORK/drag-client.log"
+if [ -n "$XWL_DISPLAY1" ] && [ -n "$XWL_AUTH1" ]; then
+  timeout 12 env DISPLAY="$XWL_DISPLAY1" XAUTHORITY="$XWL_AUTH1" \
+    "$(tc vt-x11-testclient)" --seconds 10 --title "DragProbe" \
+    > "$DRAG_LOG" 2>&1 &
+  DRAG_PID=$!
+  for i in $(seq 1 80); do
+    grep -q "^mapped" "$DRAG_LOG" 2>/dev/null && break
+    kill -0 "$DRAG_PID" 2>/dev/null || break
+    sleep 0.05
+  done
+  sleep 0.4    # frame + WM-manage settle
+fi
+# locate the dragged window by its unique color: the X11 test
+# client's second window is solid 0x9a3a5f (300x220)
+rm -f /tmp/vantage-wayland.ppm
+kill -USR1 "$WM_PID" 2>/dev/null
+wait_ppm || true
+DRAG_GEOM=$(python3 - <<'PYDRAG0'
+with open('/tmp/vantage-wayland.ppm','rb') as f:
+    data = f.read()
+vals, pos = [], data.find(b'P6') + 2
+while len(vals) < 3:
+    while data[pos:pos+1].isspace(): pos += 1
+    j = pos
+    while not data[j:j+1].isspace(): j += 1
+    vals.append(int(data[pos:j])); pos = j
+pos += 1
+w, h, _ = vals
+pix = data[pos:pos + w*h*3]
+xs, ys = [], []
+for y in range(0, h, 2):
+    for x in range(0, w, 2):
+        i = (y*w + x)*3
+        if abs(pix[i]-0x9a) <= 8 and abs(pix[i+1]-0x3a) <= 8 \
+           and abs(pix[i+2]-0x5f) <= 8:
+            xs.append(x); ys.append(y)
+if xs and len(xs) > 500:
+    print(f"{(min(xs)+max(xs))//2} {min(ys)}")
+PYDRAG0
+)
+TBX=${DRAG_GEOM%% *}
+# the SSD title bar sits ABOVE the client surface (26px title + 2px
+# border): grab the middle of the title band, not the client area
+TBY=$(($(echo "$DRAG_GEOM" | cut -d' ' -f 2) - 14))
+if [ -n "$TBX" ] && [ "$TBX" -gt 0 ] 2>/dev/null; then
+  ti "motion x=$TBX y=$TBY"
+  ti "press b=1"
+  # ONE IPC dispatch carrying 5000 motion steps — the reproducer
+  # class for the flood: the old code emitted one geometry broadcast
+  # per step (350 KB of events, more than the socket buffer) and
+  # blocked inside send() until the panel drained
+  BURST_T0=$(date +%s%N)
+  ti "burst n=5000 x0=$TBX y0=$TBY x1=250 y1=520"
+  BURST_RC=$?
+  BURST_T1=$(date +%s%N)
+  BURST_MS=$(( (BURST_T1 - BURST_T0) / 1000000 ))
+  ti "release b=1"
+  # second burst: drag the window UP INTO the panel — the workarea
+  # clamp must keep the title bar grabbable below the docked panel
+  ti "press b=1"
+  ti "burst n=2000 x0=250 y0=520 x1=300 y1=-400"
+  ti "release b=1"
+  # compositor liveness: a fresh frame dump must arrive promptly (a
+  # wedged main loop never services the dump request)
+  rm -f /tmp/vantage-wayland.ppm
+  LIVE_T0=$(date +%s%N)
+  kill -USR1 "$WM_PID" 2>/dev/null
+  DRAG_LIVE=""
+  for i in $(seq 1 40); do
+    [ -s /tmp/vantage-wayland.ppm ] && { DRAG_LIVE=1; break; }
+    sleep 0.05
+  done
+  LIVE_T1=$(date +%s%N)
+  LIVE_MS=$(( (LIVE_T1 - LIVE_T0) / 1000000 ))
+  [ "$BURST_RC" -eq 0 ] && [ "$BURST_MS" -lt 1500 ] \
+    && ok "5000-step drag burst dispatched in ${BURST_MS}ms (event path never blocks)" \
+    || bad "drag burst wedged the compositor (rc=$BURST_RC, ${BURST_MS}ms)"
+  [ -n "$DRAG_LIVE" ] && [ "$LIVE_MS" -lt 400 ] \
+    && ok "compositor responsive right after the burst (dump in ${LIVE_MS}ms)" \
+    || bad "compositor unresponsive after the burst (dump ${LIVE_MS}ms)"
+  # let the panel's 400 ms refresh tick resync, then verify the window
+  # moved + title bar reachable + pager still the full 4-cell band
+  sleep 0.9
+  rm -f /tmp/vantage-wayland.ppm
+  kill -USR1 "$WM_PID" 2>/dev/null
+  wait_ppm || true
+  python3 - <<'PYDRAG1'
+import sys
+with open('/tmp/vantage-wayland.ppm','rb') as f:
+    data = f.read()
+vals, pos = [], data.find(b'P6') + 2
+while len(vals) < 3:
+    while data[pos:pos+1].isspace(): pos += 1
+    j = pos
+    while not data[j:j+1].isspace(): j += 1
+    vals.append(int(data[pos:j])); pos = j
+pos += 1
+w, h, _ = vals
+pix = data[pos:pos + w*h*3]
+def near(r,g,b,R,G,B,t=6):
+    return abs(r-R)<=t and abs(g-G)<=t and abs(b-B)<=t
+# the window after both drags: unique color, its top must sit at the
+# workarea top PLUS the SSD title band (title 26 + border 2): the
+# whole frame — grab bar included — stays below the docked panel.
+# Panel height follows the font (44..58px) → expected top ≈ 72..86,
+# asserted with margin; a client clamped to the BARE workarea top
+# would hide the title bar behind the panel (the old off-by-28 bug)
+xs, ys = [], []
+for y in range(0, h, 2):
+    for x in range(0, w, 2):
+        i = (y*w + x)*3
+        if near(pix[i],pix[i+1],pix[i+2],0x9a,0x3a,0x5f,8):
+            xs.append(x); ys.append(y)
+top = min(ys) if ys else -1
+# pager band integrity: 4 cells of 64px + gaps ≈ 280 columns of cell
+# background; the mid-drag WS misalignment used to collapse it to 1
+from collections import Counter
+colcnt = Counter()
+for y in range(4, 54):
+    for x in range(0, w):
+        i = (y*w + x)*3
+        if near(pix[i],pix[i+1],pix[i+2],0x47,0x75,0xc7,2) or \
+           near(pix[i],pix[i+1],pix[i+2],0x2e,0x30,0x38,2):
+            colcnt[x] += 1
+cols = [x for x, c in colcnt.items() if c >= 20]
+span = (cols[-1] - cols[0]) if cols else 0
+foc = 0
+if cols:
+    for y in range(4, 54):
+        for x in range(cols[0], cols[-1] + 1):
+            i = (y*w + x)*3
+            if pix[i] >= 0xe0 and pix[i+1] >= 0xe0 and pix[i+2] >= 0xe0:
+                foc += 1
+print(f"drag: win-top={top} pager-span={span} focused-mini={foc}")
+sys.exit(0 if (70 <= top <= 100 and span >= 200 and foc >= 6) else 1)
+PYDRAG1
+  [ $? -eq 0 ] && ok "window dragged: title bar reachable, pager 4-cell band intact" \
+    || bad "drag result wrong (window strand/pager collapse)"
+else
+  bad "X11 drag window never rendered under Xwayland (composite path?)"
+fi
+wait "${DRAG_PID:-}" 2>/dev/null
+
 # ------------------------------------------------------------- shutdown
 # Ctrl+C (SIGINT) takes the same clean-unwind path as SIGTERM: restore,
 # unwind, exit 0. Assert the exit STATUS and the cleanup logs.
@@ -1030,6 +1193,136 @@ done
 [ -n "$SESS_PANEL_MAPPED" ] \
   && ok "session panel docked through the compositor (layer surface mapped)" \
   || bad "session panel never docked its layer surface"
+
+# ------------------------------------------- panel session-menu logout
+# The REAL user path: the session menu button → Log Out row → the
+# confirm view INSIDE the popover. The old code opened a GtkAlertDialog
+# — a modal xdg toplevel transient for a layer-shell parent that has
+# no xdg_toplevel, so it NEVER MAPPED: clicking Log Out did nothing
+# ("i cant log out of the DE in wayland"). The confirm view is pinned
+# by driving the actual pixels: open the menu, click the first action
+# row, click the blue confirm button, expect the session to END.
+echo "== harness-wayland: panel session-menu logout (user path) =="
+UI_LOGOUT_CLICKED=""
+if [ -n "${SESS_PID:-}" ] && kill -0 "$SESS_PID" 2>/dev/null; then
+  WM_CHILD2=$(grep -o "started 'wm' pid=[0-9]*" "$SESS_LOG" 2>/dev/null \
+              | head -1 | cut -d= -f2)
+  if [ -n "${WM_CHILD2:-}" ] && kill -0 "$WM_CHILD2" 2>/dev/null; then
+    # detection helpers, polled with fresh frame dumps: under ASan the
+    # panel renders 5-10x slower, and a fixed sleep photographed an
+    # empty popover (the same lesson the Programs-menu check learned)
+    cat > "$WORK/find-row.py" <<'PYSESS1'
+with open('/tmp/vantage-wayland.ppm','rb') as f:
+    data = f.read()
+vals, pos = [], data.find(b'P6') + 2
+while len(vals) < 3:
+    while data[pos:pos+1].isspace(): pos += 1
+    j = pos
+    while not data[j:j+1].isspace(): j += 1
+    vals.append(int(data[pos:j])); pos = j
+pos += 1
+w, h, _ = vals
+pix = data[pos:pos + w*h*3]
+rows = []
+for y in range(44, 280):
+    light = 0
+    for x in range(840, 1016):
+        i = (y*w + x)*3
+        if pix[i] >= 0x90 and pix[i+1] >= 0x90 and pix[i+2] >= 0x90:
+            light += 1
+    rows.append((y, light))
+bands, cur = [], []
+for y, light in rows:
+    if light >= 3:
+        cur.append(y)
+    elif cur:
+        bands.append(cur); cur = []
+if cur: bands.append(cur)
+if bands:
+    band = bands[0]
+    ycen = (band[0] + band[-1]) // 2
+    xs = [x for x in range(840, 1016)
+          for yy in (band[0], band[len(band)//2], band[-1])
+          if pix[(yy*w + x)*3] >= 0x90]
+    xcen = (min(xs) + max(xs)) // 2 if xs else 940
+    print(f"{xcen},{ycen}")
+PYSESS1
+    cat > "$WORK/find-ok.py" <<'PYSESS2'
+with open('/tmp/vantage-wayland.ppm','rb') as f:
+    data = f.read()
+vals, pos = [], data.find(b'P6') + 2
+while len(vals) < 3:
+    while data[pos:pos+1].isspace(): pos += 1
+    j = pos
+    while not data[j:j+1].isspace(): j += 1
+    vals.append(int(data[pos:j])); pos = j
+pos += 1
+w, h, _ = vals
+pix = data[pos:pos + w*h*3]
+xs, ys = [], []
+for y in range(40, 300):
+    for x in range(700, 1020):
+        i = (y*w + x)*3
+        if abs(pix[i]-0x4f) <= 22 and abs(pix[i+1]-0x9a) <= 22 \
+           and abs(pix[i+2]-0xdc) <= 22:
+            xs.append(x); ys.append(y)
+if xs and len(xs) > 200:   # a real button, not antialias debris
+    print(f"{(min(xs)+max(xs))//2},{(min(ys)+max(ys))//2}")
+PYSESS2
+    # the session button is the LAST bar element: right-anchored, so a
+    # click 49px from the right edge lands inside it for any username
+    ti "click 975,22"
+    # first action row of the right-hand popover = Log Out: light text
+    # on the dark sheet, clustered into bands; click band 1's center
+    SESS_ROW=""
+    for try in 1 2 3 4 5 6; do
+      sleep 0.5
+      rm -f /tmp/vantage-wayland.ppm
+      kill -USR1 "$WM_CHILD2" 2>/dev/null
+      wait_ppm || continue
+      [ -s /tmp/vantage-wayland.ppm ] || continue
+      SESS_ROW=$(python3 "$WORK/find-row.py" 2>/dev/null)
+      [ -n "$SESS_ROW" ] && break
+    done
+    if [ -n "$SESS_ROW" ]; then
+      ti "click ${SESS_ROW%,*},${SESS_ROW#*,}"
+      # the confirm view: question + [Cancel] [Log Out]; the confirm
+      # button is the ONLY blue object on screen (#4f9adc) — find it
+      OKBTN=""
+      for try in 1 2 3 4 5 6; do
+        sleep 0.5
+        rm -f /tmp/vantage-wayland.ppm
+        kill -USR1 "$WM_CHILD2" 2>/dev/null
+        wait_ppm || continue
+        [ -s /tmp/vantage-wayland.ppm ] || continue
+        OKBTN=$(python3 "$WORK/find-ok.py" 2>/dev/null)
+        [ -n "$OKBTN" ] && break
+      done
+      if [ -n "$OKBTN" ]; then
+        ti "click ${OKBTN%,*},${OKBTN#*,}"
+        UI_LOGOUT_CLICKED=1
+        # the panel's OWN action must end the session — graceful
+        # SIGTERM policy, exit 0, no stragglers (asserted below by
+        # the shared round-trip section)
+        for i in $(seq 1 60); do
+          kill -0 "$SESS_PID" 2>/dev/null || break
+          sleep 0.1
+        done
+        if ! kill -0 "$SESS_PID" 2>/dev/null; then
+          ok "panel session menu logged the DE out (popover confirm flow)"
+        else
+          bad "panel logout confirm clicked but session survived"
+        fi
+      else
+        bad "session confirm view never showed its Log Out button"
+      fi
+    else
+      bad "session menu popover did not show action rows"
+    fi
+  else
+    bad "no WM child for the panel-logout check"
+  fi
+fi
 
 # ------------------------------------------------- logout round-trip
 # The panel's session menu sends WM_LOGOUT to the session IPC socket

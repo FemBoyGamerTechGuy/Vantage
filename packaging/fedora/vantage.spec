@@ -1,5 +1,5 @@
 Name:       vantage
-Version:    0.3.2
+Version:    0.3.3
 Release:    1%{?dist}
 Summary:    Lightweight raw-C Linux desktop environment
 License:    LicenseRef-Vantage-Proprietary

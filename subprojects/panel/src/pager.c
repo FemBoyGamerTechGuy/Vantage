@@ -48,16 +48,21 @@ static void _draw_cell(GtkDrawingArea *area, cairo_t *cr, int w, int h,
     /* window miniatures at their real relative geometry */
     if (wm) {
         /* the pager needs the DESKTOP extent, not the window extent:
-         * windows are placed in the output's workarea */
+         * windows are placed in the output's workarea. Docks and the
+         * desktop window itself are SHELL chrome, not content — a
+         * full-screen desktop window used to fill the whole cell
+         * ("the first workspace shows as entirely used") */
         int desk_w = 1024, desk_h = 768;
         for (guint i = 0; i < wm->wins->len; i++) {
             vp_win_t *win = g_ptr_array_index(wm->wins, i);
+            if (win->dock || win->desktop) continue;
             if (win->ws != ws || win->minimized) continue;
             if (win->w > desk_w) desk_w = win->w;
             if (win->h > desk_h) desk_h = win->h;
         }
         for (guint i = 0; i < wm->wins->len; i++) {
             vp_win_t *win = g_ptr_array_index(wm->wins, i);
+            if (win->dock || win->desktop) continue;
             if (win->ws != ws || win->minimized) continue;
             double rx = (double)(win->x < 0 ? 0 : win->x) / desk_w;
             double ry = (double)(win->y < 0 ? 0 : win->y) / desk_h;

@@ -408,6 +408,63 @@ else
   bad "MOTIF CSD window got decorated anyway: $(cat "$MOTIF_LOG")"
 fi
 
+echo "== harness-xvfb: narrow-window regression (title ellipsis wedge) =="
+# "opening any app locks the entire X11 DE": a NARROW window with a
+# LONG title used to spin the WM forever inside the frame-title
+# truncation loop (the working string GREW 2 bytes per pass, so the
+# measured width never fell back under the limit) — 100% CPU, frozen
+# X server under CompositeRedirect, kill-from-TTY territory. Map three
+# of them, then prove the WM answers IPC and idles.
+NARROW_LOG="$WORK/narrow.log"
+"$(tc vt-x11-testclient)" --narrow-probe --seconds 6 > "$NARROW_LOG" 2>&1 &
+NARROW_PID=$!
+NMAPPED=0
+for i in $(seq 1 100); do
+  NMAPPED=$(grep -c "^mapped" "$NARROW_LOG" 2>/dev/null || echo 0)
+  [ "${NMAPPED:-0}" -ge 3 ] && break
+  kill -0 "$NARROW_PID" 2>/dev/null || break
+  sleep 0.05
+done
+[ "${NMAPPED:-0}" -ge 3 ] && ok "three narrow long-title windows mapped" \
+  || bad "narrow windows did not map (${NMAPPED:-0})"
+WMCPU_PID=$(pgrep -f "$(vb vantage-wm)" 2>/dev/null | head -1)
+CPU0=""
+[ -n "$WMCPU_PID" ] && \
+  CPU0=$(awk '{print $14+$15}' "/proc/$WMCPU_PID/stat" 2>/dev/null)
+sleep 0.7
+NLIST=$(timeout 5 "$(vb vantage-remote)" list 2>&1); NRC=$?
+echo "$NLIST" | grep -q "Narrow Title Probe" \
+  && ok "WM responsive with narrow windows on screen" \
+  || bad "WM unresponsive with narrow windows (rc=$NRC)"
+sleep 1.5
+CPU1=""
+[ -n "$WMCPU_PID" ] && \
+  CPU1=$(awk '{print $14+$15}' "/proc/$WMCPU_PID/stat" 2>/dev/null)
+if [ -n "$CPU0" ] && [ -n "$CPU1" ]; then
+  NDELTA=$((CPU1 - CPU0))
+  [ "$NDELTA" -lt 100 ] \
+    && ok "WM idles after narrow-title paint (cpu +${NDELTA} ticks/2.2s)" \
+    || bad "WM spins after narrow-title paint (+${NDELTA} ticks — ellipsis wedge?)"
+fi
+wait "$NARROW_PID" 2>/dev/null
+
+echo "== harness-xvfb: shell chrome classification (D/K flags) =="
+# "the first workspace shows as entirely used + two running apps
+# (Vantage panel / Vantage wm)": shell chrome must NOT count as task
+# content. WM_QUERY now flags docks (D) and desktops (K); the panel's
+# taskbar and the pager filter on exactly these flags.
+CHROME_LIST=$(timeout 5 "$(vb vantage-remote)" list 2>&1)
+PANEL_FLAGS=$(echo "$CHROME_LIST" | awk -F'\t' '$2 ~ /Vantage Panel/ {print $4; exit}')
+DESK_FLAGS=$(echo "$CHROME_LIST" | awk -F'\t' '$2 ~ /Vantage Desktop/ {print $4; exit}')
+case "$PANEL_FLAGS" in
+  *D*) ok "panel window flagged D (_NET_WM_WINDOW_TYPE_DOCK) — no taskbar entry" ;;
+  *)   bad "panel not flagged as dock: flags='${PANEL_FLAGS:-none}' (taskbar pollution)" ;;
+esac
+case "$DESK_FLAGS" in
+  *K*) ok "desktop window flagged K (_NET_WM_WINDOW_TYPE_DESKTOP) — no pager cell fill" ;;
+  *)   bad "desktop not flagged as desktop-type: flags='${DESK_FLAGS:-none}' (pager cell filled)" ;;
+esac
+
 echo "== harness-xvfb: focus policy (click-to-focus, no hover steal) =="
 FOCUS_LOG="$WORK/focus.log"
 "$(tc vt-x11-testclient)" --focus-probe > "$FOCUS_LOG" 2>&1

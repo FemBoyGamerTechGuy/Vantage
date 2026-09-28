@@ -145,6 +145,9 @@ static bool _hotkey_try(vt_backend_t *self, const char *combo) {
 }
 
 /* ------------------------------------------------- window event emission */
+static void _surface_output_enter(_wl_surf_t *s);
+static void _surface_output_leave(_wl_surf_t *s);
+
 void _emit_win(_wl_state_t *st, vt_backend_wl_event_kind_t kind,
                       _xdg_toplevel_t *t) {
     if (!st || !t) return;
@@ -273,6 +276,7 @@ static void _surf_commit(struct wl_client *cli, struct wl_resource *res) {
         if (s->mapped) {
             s->mapped = false;
             wl_list_remove(&s->link);
+            _surface_output_leave(s);
             if (st) st->dirty = true;
             if (st && st->ptr_focus == s) st->ptr_focus = NULL;
             if (st && st->kbd_focus == s) st->kbd_focus = NULL;
@@ -300,11 +304,16 @@ static void _surf_commit(struct wl_client *cli, struct wl_resource *res) {
         s->mapped = true;
         s->minimized = false;
         _stack_insert(s);
+        /* REQUIRED: tell the client which output the surface is on —
+         * Xwayland's software path refuses to attach a buffer before
+         * it, so X11 apps were invisible (buffer created, never sent) */
+        _surface_output_enter(s);
         if (s->xwl) {
             /* Xwayland window: the X-side WM (vt-wl-xwayland.c) owns
              * geometry; the surface paints exactly where the X window
              * is, no xdg configure handshake involved */
             _xwl_win_geom(s);
+            _xwl_announce_geom(s);
             return;
         }
         if (s->popup) {
@@ -552,6 +561,13 @@ static void _compositor_create_surface(struct wl_client *cli,
     wl_resource_set_implementation(sr, &_surf_impl, s,
                                    _surf_resource_destroy);
     s->res = sr;
+    /* wl_surface.enter at CREATION (single-output desktop: every
+     * surface is on the one output). Waiting for the first commit is
+     * circular: Xwayland's software path waits for enter before it
+     * attaches its buffer, so an enter-on-map never happened and X11
+     * apps rendered nothing. Clients that have not bound wl_output
+     * yet are covered by the commit-path retry. */
+    _surface_output_enter(s);
 }
 
 static const struct wl_compositor_interface _compositor_impl = {
@@ -1470,6 +1486,7 @@ void _popup_done(_wl_state_t *st, _wl_surf_t *s) {
     if (s->mapped) {
         s->mapped = false;
         wl_list_remove(&s->link);
+        _surface_output_leave(s);
     }
     if (st->kbd_focus == s) {
         st->kbd_focus = NULL;
@@ -1874,6 +1891,36 @@ static void _bind_decor_mgr(struct wl_client *cli, void *data,
 
 /* --------------------------------------------------------- wl_output */
 
+/* ---------------------------------------------------- wl_output bookkeeping
+ *
+ * wl_surface.enter(output) is a REQUIRED event ("sent when the surface
+ * is shown on an output") — but this compositor never sent it. Real
+ * clients wait for it before rendering: Xwayland's software path
+ * creates a window's wl_shm buffer and then never attaches it, so X11
+ * apps rendered NOTHING under the Wayland session (the surface never
+ * entered any output). Track every bound output resource so each
+ * surface can be entered into its OWN client's output object. */
+#define _MAX_OUT_RES 16
+static struct wl_resource *_out_res[_MAX_OUT_RES];
+static size_t _n_out_res;
+
+static void _out_res_destroy(struct wl_resource *res) {
+    for (size_t i = 0; i < _n_out_res; i++) {
+        if (_out_res[i] == res) {
+            _out_res[i] = _out_res[--_n_out_res];
+            return;
+        }
+    }
+}
+
+static struct wl_resource *_out_res_for_client(struct wl_client *cli) {
+    for (size_t i = 0; i < _n_out_res; i++) {
+        if (wl_resource_get_client(_out_res[i]) == cli)
+            return _out_res[i];
+    }
+    return NULL;
+}
+
 static void _bind_output(struct wl_client *cli, void *data, uint32_t version,
                          uint32_t id) {
     (void)data;
@@ -1881,7 +1928,9 @@ static void _bind_output(struct wl_client *cli, void *data, uint32_t version,
                                                  version < 3 ? version : 3,
                                                  id);
     if (!res) { wl_client_post_no_memory(cli); return; }
-    wl_resource_set_implementation(res, NULL, NULL, NULL);
+    wl_resource_set_implementation(res, NULL, NULL, _out_res_destroy);
+    if (_n_out_res < _MAX_OUT_RES)
+        _out_res[_n_out_res++] = res;
     int w = _wls ? _wls->out_w : 1024;
     int h = _wls ? _wls->out_h : 768;
     wl_output_send_geometry(res, 0, 0, w * 254 / 960, h * 254 / 960, 0,
@@ -1892,6 +1941,27 @@ static void _bind_output(struct wl_client *cli, void *data, uint32_t version,
         wl_output_send_scale(res, 1);
     if (wl_resource_get_version(res) >= WL_OUTPUT_DONE_SINCE_VERSION)
         wl_output_send_done(res);
+}
+
+/* enter the surface into its client's output (single-output desktop:
+ * every mapped surface is on it). Idempotent on the client side —
+ * wayland allows duplicate enters — but we track enter state anyway. */
+static void _surface_output_enter(_wl_surf_t *s) {
+    if (!s || !s->res || s->out_entered) return;
+    struct wl_resource *out = _out_res_for_client(
+        wl_resource_get_client(s->res));
+    if (!out) return;   /* client never bound wl_output yet; re-try on
+                         * the next commit after it does */
+    wl_surface_send_enter(s->res, out);
+    s->out_entered = true;
+}
+
+static void _surface_output_leave(_wl_surf_t *s) {
+    if (!s || !s->res || !s->out_entered) return;
+    struct wl_resource *out = _out_res_for_client(
+        wl_resource_get_client(s->res));
+    if (out) wl_surface_send_leave(s->res, out);
+    s->out_entered = false;
 }
 
 /* ------------------------------------------------------ cursor sprite */
@@ -2231,11 +2301,35 @@ static void _pointer_motion(_wl_state_t *st, double dx, double dy) {
         } else {
             st->op_surf->x = st->cursor_x - st->op_grab_x;
             st->op_surf->y = st->cursor_y - st->op_grab_y;
+            /* Keep the title bar REACHABLE: a window dragged all the
+             * way up disappears behind the top panel (its exclusive
+             * zone is not usable space) and there is nothing left to
+             * grab to pull it back down. Clamp interactive moves to
+             * the workarea top — and clamp the FRAME, not the client:
+             * the SSD title band (26px title + 2px border) sits ABOVE
+             * the client surface, so a client clamped to the bare
+             * workarea top still parks its grab bar behind the panel
+             * (the off-by-a-title-bar version of exactly that bug). */
+            int wx = 0, wy = 0, ww = 0, wh = 0;
+            _layer_workarea(st, &wx, &wy, &ww, &wh);
             if (st->op_surf->x < 0) st->op_surf->x = 0;
-            if (st->op_surf->y < 0) st->op_surf->y = 0;
-            if (st->op_surf->toplevel)
-                _emit_win(st, VT_BACKEND_WL_EVENT_WIN_GEOMETRY,
-                          st->op_surf->toplevel);
+            int ymin = wy + (st->op_surf->ssd
+                                 ? (_WL_SSD_TITLE + _WL_SSD_BORDER) : 0);
+            if (st->op_surf->y < ymin) st->op_surf->y = ymin;
+            /* Geometry events during a drag are THROTTLED: a 125-1000 Hz
+             * pointer floods the panel's event socket with one event per
+             * motion step; the panel only re-queries every 400 ms, so the
+             * flood outpaces any consumer. Even with non-blocking
+             * broadcasts, a bounded rate keeps the panel's input queue
+             * sane. The FINAL geometry goes out on button release. */
+            if (st->op_surf->toplevel) {
+                uint64_t now = vt_time_now_us();
+                if (now - st->op_last_geo_us >= 50000) {   /* 20 fps */
+                    st->op_last_geo_us = now;
+                    _emit_win(st, VT_BACKEND_WL_EVENT_WIN_GEOMETRY,
+                              st->op_surf->toplevel);
+                }
+            }
             if (st->op_surf->xwl)
                 _xwl_move_resize(st->op_surf, st->op_surf->x,
                                  st->op_surf->y, 0, 0);
@@ -2246,8 +2340,15 @@ static void _pointer_motion(_wl_state_t *st, double dx, double dy) {
 
 static void _pointer_button(_wl_state_t *st, uint32_t button,
                             bool pressed) {
-    if (button == 0x110 && !pressed)
-        st->op_active = false;     /* BTN_LEFT release ends interactive op */
+    if (button == 0x110 && !pressed) {
+        /* BTN_LEFT release ends interactive op — emit the FINAL geometry
+         * (drag motion is throttled; the last position must reach the
+         * WM model and the pager even when the last motion was skipped) */
+        if (st->op_active && st->op_surf && st->op_surf->toplevel)
+            _emit_win(st, VT_BACKEND_WL_EVENT_WIN_GEOMETRY,
+                      st->op_surf->toplevel);
+        st->op_active = false;
+    }
     if (st->op_active && pressed) return;
     /* a grabbed popup is dismissed when the press is NOT inside it or
      * its parent chain (menus close when you click elsewhere) */
@@ -3818,6 +3919,27 @@ static int _wl_test_input(vt_backend_t *self, const char *spec) {
         _pointer_motion(st, (double)(x - st->cursor_x),
                         (double)(y - st->cursor_y));
         return 0;
+    }
+    /* burst n=N x0=A y0=B x1=C y1=D: N motion events sweeping between
+     * the two points, delivered in ONE IPC call — a full-speed drag at
+     * real pointer hardware rates (a 1000 Hz mouse moving for a second
+     * is 1000 geometry broadcasts in one dispatch cycle). This is the
+     * reproducer class for the "fast window moves lock the DE"
+     * livelock: the broadcast path must survive its own event flood. */
+    if (strncmp(spec, "burst ", 6) == 0) {
+        int n = 0, x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+        if (sscanf(spec, "burst n=%d x0=%d y0=%d x1=%d y1=%d",
+                   &n, &x0, &y0, &x1, &y1) == 5 && n > 0 && n <= 5000) {
+            for (int i = 1; i <= n; i++) {
+                double t = (double)i / (double)n;
+                int bx = (int)(x0 + (x1 - x0) * t);
+                int by = (int)(y0 + (y1 - y0) * t);
+                _pointer_motion(st, (double)(bx - st->cursor_x),
+                                (double)(by - st->cursor_y));
+            }
+            return 0;
+        }
+        return -1;
     }
     if (sscanf(spec, "press b=%d", &b) == 1 && b >= 1 && b <= 3) {
         _pointer_button(st, b == 2 ? 0x111 : b == 3 ? 0x112 : 0x110,

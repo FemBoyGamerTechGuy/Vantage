@@ -47,6 +47,11 @@ typedef struct {
     uint8_t *rbuf;          /* partial-frame scratch */
     size_t   rbuf_cap;
     size_t   rbuf_len;
+    uint8_t *obuf;          /* event frames the socket could not absorb
+                             * yet (broadcast writes are NON-BLOCKING);
+                             * whole frames, flushed in order */
+    size_t   obuf_cap;
+    size_t   obuf_len;
 } _client_t;
 
 struct vt_ipc {
@@ -237,6 +242,58 @@ static ssize_t _send_all(int fd, const void *buf, size_t n) {
     return (ssize_t)total;
 }
 
+/* ------------------------------------------------- non-blocking events
+ *
+ * Broadcasts ride the compositor's main loop: a blocking write here
+ * freezes EVERYTHING the loop drives (rendering, input, clients) for
+ * as long as the slowest subscriber takes to drain. A fast window
+ * drag used to emit one geometry event per motion step into a panel
+ * that only re-reads its socket every 400 ms — the socket filled, the
+ * compositor parked inside send(), and the whole desktop locked for
+ * ~2 seconds ("it locks the entire DE until it updates"). Event
+ * frames are therefore written with MSG_DONTWAIT; whatever the socket
+ * cannot take is queued per-client and flushed on later steps. A
+ * client that lets the queue hit the cap is not consuming events at
+ * all — it is dropped (the panel reconnects on its own), never
+ * allowed to stall the loop. */
+#define VT_IPC_OBUF_MAX (128u * 1024u)
+
+static void _drop_client(vt_ipc_t *ipc, size_t idx);
+
+/* returns 0 = queue empty, 1 = socket full (retry later), -1 = error */
+static int _client_flush_events(_client_t *c) {
+    while (c->obuf_len > 0) {
+        ssize_t s = send(c->fd, c->obuf, c->obuf_len, MSG_DONTWAIT);
+        if (s < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
+            return -1;
+        }
+        memmove(c->obuf, c->obuf + (size_t)s, c->obuf_len - (size_t)s);
+        c->obuf_len -= (size_t)s;
+    }
+    return 0;
+}
+
+/* append one WHOLE frame after any pending frames (order!);
+ * returns FALSE when the stalled-client cap is exceeded */
+static bool _client_queue_event(_client_t *c, const uint8_t *frame,
+                                size_t n) {
+    if (n > VT_IPC_OBUF_MAX ||
+        c->obuf_len > VT_IPC_OBUF_MAX - n) return false;
+    if (c->obuf_len + n > c->obuf_cap) {
+        size_t cap = c->obuf_cap ? c->obuf_cap : 512;
+        while (cap < c->obuf_len + n) cap *= 2;
+        uint8_t *grown = vt_realloc(c->obuf, cap);
+        if (!grown) return false;
+        c->obuf = grown;
+        c->obuf_cap = cap;
+    }
+    memcpy(c->obuf + c->obuf_len, frame, n);
+    c->obuf_len += n;
+    return true;
+}
+
 /* sending ----------------------------------------------------------------- */
 int vt_ipc_send(vt_ipc_t *ipc, uint32_t msg_id, vt_ipc_msg_type_t type,
                 const void *data, uint32_t len) {
@@ -263,14 +320,47 @@ int vt_ipc_broadcast(vt_ipc_t *ipc, uint32_t msg_id, const void *data,
     uint8_t *buf; size_t n;
     if (vt_ipc_encode(&m, &buf, &n) != VT_IPC_OK) return VT_IPC_E_BADMAGIC;
     int sent = 0;
-    for (size_t i = 0; i < ipc->n_clients; i++) {
+    /* backwards: dropping a client compacts the array, which only
+     * shifts slots we have already visited */
+    for (size_t i = ipc->n_clients; i-- > 0; ) {
         _client_t *c = &ipc->clients[i];
         if (c->fd < 0 || !c->subscribed) continue;
-        if (_send_all(c->fd, buf, n) >= 0) sent++;
-        else {
-            close(c->fd);
-            c->fd = -1; /* drop dead client */
+        /* pending frames from earlier broadcasts must stay AHEAD of
+         * this one — only an empty queue may be written directly */
+        if (c->obuf_len == 0) {
+            ssize_t s;
+            do {
+                s = send(c->fd, buf, n, MSG_DONTWAIT);
+            } while (s < 0 && errno == EINTR);
+            if (s == (ssize_t)n) { sent++; continue; }   /* fast path */
+            if (s < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                vt_logd("ipc: event client vanished (fd %d), dropped",
+                        c->fd);
+                _drop_client(ipc, i);
+                continue;
+            }
+            /* nothing or partly written: queue the remainder */
+            size_t done = s > 0 ? (size_t)s : 0;
+            if (!_client_queue_event(c, buf + done, n - done)) {
+                vt_logd("ipc: event consumer stalled past %u bytes "
+                        "(fd %d), dropped", VT_IPC_OBUF_MAX, c->fd);
+                _drop_client(ipc, i);
+                continue;
+            }
+        } else if (!_client_queue_event(c, buf, n)) {
+            vt_logd("ipc: event consumer stalled past %u bytes "
+                    "(fd %d), dropped", VT_IPC_OBUF_MAX, c->fd);
+            _drop_client(ipc, i);
+            continue;
         }
+        /* opportunistic drain: most stalls clear within one frame */
+        if (_client_flush_events(c) < 0) {
+            vt_logd("ipc: event consumer errored (fd %d), dropped",
+                    c->fd);
+            _drop_client(ipc, i);
+            continue;
+        }
+        sent++;
     }
     vt_free(buf);
     (void)sent;
@@ -335,6 +425,11 @@ static void _drop_client(vt_ipc_t *ipc, size_t idx) {
     vt_free(c->rbuf);
     c->rbuf = NULL;
     c->rbuf_len = 0;
+    c->rbuf_cap = 0;
+    vt_free(c->obuf);
+    c->obuf = NULL;
+    c->obuf_len = 0;
+    c->obuf_cap = 0;
     /* compact */
     for (size_t j = idx; j + 1 < ipc->n_clients; j++)
         ipc->clients[j] = ipc->clients[j + 1];
@@ -461,6 +556,20 @@ int vt_ipc_step(vt_ipc_t *ipc, int timeout_ms) {
     }
 
     /* server: poll listen fd + all clients */
+    /* advance deferred event queues FIRST: broadcast writes that the
+     * socket could not absorb are pending here; a client that has
+     * drained since (the panel reads every refresh tick) gets its
+     * frames now. Runs before pfds/idxmap are built so any drop this
+     * causes cannot stale them. Backwards: drops compact. */
+    for (size_t i = ipc->n_clients; i-- > 0; ) {
+        _client_t *c = &ipc->clients[i];
+        if (c->fd < 0 || c->obuf_len == 0) continue;
+        if (_client_flush_events(c) < 0) {
+            vt_logd("ipc: event consumer errored (fd %d), dropped",
+                    c->fd);
+            _drop_client(ipc, i);
+        }
+    }
     struct pollfd pfds[VT_IPC_MAX_CLIENTS + 1];
     size_t idxmap[VT_IPC_MAX_CLIENTS + 1];
     size_t n = 0;

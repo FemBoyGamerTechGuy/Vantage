@@ -25,6 +25,8 @@ typedef struct {
     gboolean minimized;
     gboolean maximized;
     gboolean fullscreen;
+    gboolean dock;       /* _NET_WM_WINDOW_TYPE_DOCK — never a task */
+    gboolean desktop;    /* _NET_WM_WINDOW_TYPE_DESKTOP — never a task */
 } vp_win_t;
 
 typedef void (*vp_wm_changed_cb)(gpointer user);

@@ -49,6 +49,9 @@
 
 #include <xcb/xcb.h>
 #include <xcb/xcb_icccm.h>
+#if defined(VT_HAVE_XCB_COMPOSITE)
+#include <xcb/composite.h>
+#endif
 
 /* ------------------------------------------------------------ types */
 
@@ -76,6 +79,9 @@ static struct {
     xcb_connection_t *xc;
     _xwl_win_t *wins;               /* list head */
     _wl_state_t *st;
+    struct wl_client *client;       /* the Xwayland wayland client —
+                                       needed to resolve legacy
+                                       WL_SURFACE_ID resource ids */
     /* atoms */
     xcb_atom_t a_wm_name, a_net_wm_name, a_wm_class, a_wm_protocols,
                 a_wm_delete, a_wm_take_focus, a_wm_normal_hints,
@@ -85,8 +91,14 @@ static struct {
                 a_net_current_desktop, a_net_number_desktops,
                 a_net_client_list, a_net_supporting_check, a_net_supported,
                 a_net_workarea, a_net_wm_desktop, a_utf8_string,
-                a_net_wm_ping, a_wm_change_state, a_net_wm_visible_name;
+                a_net_wm_ping, a_wm_change_state, a_net_wm_visible_name,
+                a_wl_surface_id;
     int wm_screen_width, wm_screen_height;
+    /* legacy pairing: WL_SURFACE_ID messages that arrived BEFORE the
+     * window's CreateNotify crossed the X socket */
+    struct { xcb_window_t win; uint32_t surface_id; }
+        pending_ids[8];
+    size_t n_pending_ids;
 } X;
 
 /* ------------------------------------------------------------- utils */
@@ -97,6 +109,19 @@ static void _xwl_free_win(_xwl_win_t *w) {
     else if (X.wins == w) X.wins = w->next;
     if (w->next) w->next->prev = w->prev;
     if (w->surf) w->surf->xwl = NULL;
+    /* The xwayland_surface_v1 resource MUST die with its record: its
+     * destructor dereferences user_data — a resource left alive here
+     * keeps a dangling pointer that the NEXT wl_display_destroy_clients
+     * (or the client's own teardown) dereferences and WRITES through,
+     * corrupting the heap ("corrupted size vs. prev_size", SIGABRT at
+     * shutdown — reproduced with any X11 app mapped once). Destroying
+     * it now runs the destructor on a LIVE record; the guard below is
+     * pre-emptied so the destructor becomes a no-op. */
+    if (w->xwl_res) {
+        struct wl_resource *r = w->xwl_res;
+        w->xwl_res = NULL;
+        wl_resource_destroy(r);
+    }
     if (w->toplevel) {
         _wl_state_t *st = X.st;
         if (st) _emit_win(st, VT_BACKEND_WL_EVENT_WIN_UNMAP, w->toplevel);
@@ -285,15 +310,13 @@ static void _xwl_close_win(_xwl_win_t *w) {
 
 /* -------------------------------------------------------- shell v1 */
 
+static void _xwl_sever(_xwl_win_t *w);
+
 static void _xwl_surface_destroy_req(struct wl_client *cli,
                                      struct wl_resource *res) {
     (void)cli;
     _xwl_win_t *w = wl_resource_get_user_data(res);
-    if (w) {
-        w->xwl_res = NULL;
-        if (w->surf) w->surf->xwl = NULL;
-        w->surf = NULL;
-    }
+    _xwl_sever(w);   /* drops w->xwl_res too: destructor becomes a no-op */
     wl_resource_destroy(res);
 }
 
@@ -315,12 +338,72 @@ static const struct xwayland_surface_v1_interface _xwl_surface_impl = {
     .set_serial  = _xwl_surface_set_serial,
 };
 
+/* Sever the surface↔window pairing WITHOUT killing the X window:
+ * Xwayland recycles a window's wl_surface (pixmap format changes)
+ * by destroying the xwayland_surface wrapper and the wl_surface,
+ * then pairing a NEW surface with the SAME X window. The toplevel's
+ * taskbar identity must move FULLY to the X record for the gap:
+ * leaving s->toplevel set made the wl_surface's destructor FREE the
+ * toplevel while w->toplevel still pointed at it — every later X
+ * event (unmap/destroy) read freed memory and _xwl_free_win
+ * double-freed it (the shutdown heap corruption). A later surface
+ * re-links via _xwl_late_pair. */
+static void _xwl_sever(_xwl_win_t *w) {
+    if (!w) return;
+    if (w->surf) {
+        _wl_surf_t *s = w->surf;
+        if (s->xwl == w) s->xwl = NULL;
+        if (s->toplevel && s->toplevel == w->toplevel)
+            s->toplevel = NULL;
+        w->surf = NULL;
+    }
+    if (w->toplevel && w->toplevel->surf)
+        w->toplevel->surf = NULL;
+    w->xwl_res = NULL;
+}
+
 static void _xwl_surface_res_destroy(struct wl_resource *res) {
     _xwl_win_t *w = wl_resource_get_user_data(res);
-    if (w && w->xwl_res == res) {
-        w->xwl_res = NULL;
-        if (w->surf) w->surf->xwl = NULL;
-        w->surf = NULL;
+    if (w && w->xwl_res == res)
+        _xwl_sever(w);
+}
+
+/* The wl surface can arrive AFTER the X window was already mapped —
+ * Xwayland creates it when the window's first pixmap is ready. The
+ * WIN_MAP event fired back then with no surface attached (the WM
+ * model fell back to 1x1 at +0+0 and the surface rendered at +0+0,
+ * title bar behind the panel). Once the surface pairs up with the
+ * window, backlink the toplevel, seed the surface's geometry and
+ * announce the real position. */
+static void _xwl_late_pair(_xwl_win_t *w, _wl_surf_t *s) {
+    if (!w || !s) return;
+    /* the surface may currently be paired with a PLACEHOLDER record
+     * that get_xwayland_surface created while waiting for the X
+     * window — adopt its resource and free it instead of orphaning
+     * it: an orphaned placeholder's resource destructor would later
+     * NULL s->xwl out from under THIS window (the pairing silently
+     * breaks; geometry sync and teardown go through s->xwl). */
+    _xwl_win_t *ph = s->xwl;
+    if (ph && ph != w && ph->xwin == 0) {
+        if (ph->xwl_res && !w->xwl_res) {
+            w->xwl_res = ph->xwl_res;
+            wl_resource_set_user_data(w->xwl_res, w);
+        }
+        ph->xwl_res = NULL;
+        ph->surf = NULL;
+        vt_free(ph);   /* placeholders are never linked into X.wins */
+    }
+    w->surf = s;
+    s->xwl = w;
+    if (w->toplevel && !w->toplevel->surf) {
+        w->toplevel->surf = s;
+        s->toplevel = w->toplevel;
+        s->x = w->x;
+        s->y = w->y;
+        s->ws = X.st ? X.st->ws_cur : 0;
+        _emit_win(X.st, VT_BACKEND_WL_EVENT_WIN_GEOMETRY, w->toplevel);
+        vt_logd("xwayland: surface paired late with 0x%x (geometry "
+                "re-announced at +%d+%d)", (unsigned)w->xwin, w->x, w->y);
     }
 }
 
@@ -347,6 +430,7 @@ static void _xwl_get_xwayland_surface(struct wl_client *cli,
     wl_resource_set_implementation(r, &_xwl_surface_impl, w,
                                    _xwl_surface_res_destroy);
     w->xwl_res = r;
+    vt_logd("xwayland: get_xwayland_surface request arrived");
     /* try to find the X window that was created just before this
      * surface: newest waiting window without a surface */
     for (_xwl_win_t *cand = X.wins; cand; cand = cand->next) {
@@ -360,6 +444,10 @@ static void _xwl_get_xwayland_surface(struct wl_client *cli,
             wl_resource_set_user_data(r, cand);
             vt_free(w);
             w = cand;
+            cand->waiting_surface = false;
+            /* the window may have been MAPPED before this surface
+             * existed — re-announce its real geometry to the model */
+            _xwl_late_pair(cand, s);
             break;
         }
     }
@@ -378,6 +466,11 @@ static const struct xwayland_shell_v1_interface _xwl_shell_impl = {
 static void _bind_xwl_shell(struct wl_client *cli, void *data,
                             uint32_t version, uint32_t id) {
     (void)data; (void)version;
+    vt_logd("xwayland: client bound xwayland_shell_v1");
+    /* whoever binds the shell IS the Xwayland server's wayland client;
+     * kept for resolving legacy WL_SURFACE_ID resource ids (some
+     * Xwayland builds bind the shell but still use the legacy path) */
+    X.client = cli;
     struct wl_resource *res = wl_resource_create(
         cli, &xwayland_shell_v1_interface, 1, id);
     if (!res) { wl_client_post_no_memory(cli); return; }
@@ -391,11 +484,31 @@ static void _bind_xwl_shell(struct wl_client *cli, void *data,
 void _xwl_win_geom(_wl_surf_t *s) {
     _xwl_win_t *w = _xwl_find_by_surf(s);
     if (!w || !s) return;
+    int ox = s->x, oy = s->y, ow = s->w, oh = s->h;
     s->x = w->x;
     s->y = w->y;
     if (w->w > 0) s->w = w->w;
     if (w->h > 0) s->h = w->h;
     s->ssd = !w->motif_csd && !w->override_redirect;
+    /* The WIN_MAP event fired before any buffer existed — the WM model
+     * fell back to a 1x1 window (invisible in the pager, useless in
+     * the taskbar tooltip). The first commit that carries the real
+     * geometry must propagate it. Emit ONLY on change: this runs on
+     * every redraw, and a per-commit event would recreate the event
+     * flood the broadcast path just learned to survive. */
+    if (w->toplevel && X.st &&
+        (s->x != ox || s->y != oy || s->w != ow || s->h != oh))
+        _emit_win(X.st, VT_BACKEND_WL_EVENT_WIN_GEOMETRY, w->toplevel);
+}
+
+/* first commit of a mapped Xwayland surface: the generic attach path
+ * already sized the surface from the buffer BEFORE _xwl_win_geom's
+ * change detection could see the 0→N transition — the WM model would
+ * keep its 1x1 fallback forever. Announce once per mapping. */
+void _xwl_announce_geom(_wl_surf_t *s) {
+    _xwl_win_t *w = s ? s->xwl : NULL;
+    if (w && w->toplevel && X.st && s->w > 0 && s->h > 0)
+        _emit_win(X.st, VT_BACKEND_WL_EVENT_WIN_GEOMETRY, w->toplevel);
 }
 
 static void _xwl_handle_create(xcb_create_notify_event_t *e) {
@@ -410,6 +523,53 @@ static void _xwl_handle_create(xcb_create_notify_event_t *e) {
     w->w = e->width;
     w->h = e->height;
     w->waiting_surface = true;
+
+    /* a WL_SURFACE_ID message may have arrived BEFORE this record
+     * existed — pair any stashed association now */
+    for (size_t i = 0; i < X.n_pending_ids; i++) {
+        if (X.pending_ids[i].win != e->window) continue;
+        if (X.client && X.st) {
+            struct wl_resource *r = wl_client_get_object(
+                X.client, X.pending_ids[i].surface_id);
+            _wl_surf_t *s = (r &&
+                             wl_resource_instance_of(
+                                 r, &wl_surface_interface, NULL))
+                                ? wl_resource_get_user_data(r) : NULL;
+            if (s && w->surf != s) _xwl_late_pair(w, s);
+        }
+        X.pending_ids[i] = X.pending_ids[X.n_pending_ids - 1];
+        X.n_pending_ids--;
+        break;
+    }
+
+    /* LATE WINDOW: get_xwayland_surface may already have paired the
+     * wl surface with a PLACEHOLDER record (xwin == 0) — the wayland
+     * request was read before this CreateNotify crossed the X socket.
+     * Without adoption the surface keeps the placeholder forever: it
+     * renders at +0+0 (title bar BEHIND the top panel — "apps open
+     * with the bar above the panel"), never learns its geometry, and
+     * the WM model shows a 1x1 window at 0,0. Adopt the placeholder's
+     * surface + resource into this real record. */
+    if (X.st) {
+        _wl_surf_t *s;
+        wl_list_for_each(s, &X.st->surfaces, link) {
+            _xwl_win_t *ph = s->xwl;
+            if (!ph || ph->xwin != 0 || !ph->xwl_res)
+                continue;   /* not an unadopted pairing placeholder */
+            w->surf = s;
+            w->xwl_res = ph->xwl_res;
+            wl_resource_set_user_data(w->xwl_res, w);
+            s->xwl = w;
+            ph->surf = NULL;
+            ph->xwl_res = NULL;
+            vt_free(ph);
+            w->waiting_surface = false;
+            vt_logd("xwayland: late X window 0x%x adopted an already-"
+                    "paired surface", (unsigned)w->xwin);
+            break;
+        }
+    }
+
     w->next = X.wins;
     w->prev = NULL;
     if (X.wins) X.wins->prev = w;
@@ -444,13 +604,31 @@ static void _xwl_map(_xwl_win_t *w) {
     }
     /* manage: frame geometry from the request, placed like a real
      * window (center of the workarea on first map) */
-    if (w->x == 0 && w->y == 0) {
+    {
         int wx, wy, ww, wh;
         _layer_workarea(st, &wx, &wy, &ww, &wh);
-        w->x = wx + (ww - w->w) / 2;
-        w->y = wy + (wh - w->h) / 2;
+        if (w->x == 0 && w->y == 0) {
+            w->x = wx + (ww - w->w) / 2;
+            w->y = wy + (wh - w->h) / 2;
+        }
+        /* X11 apps position THEMSELVES (USPosition, session restore,
+         * -geometry) — y=0 is extremely common there. Under a top
+         * panel that put the title bar BEHIND the panel with nothing
+         * left to grab ("apps open with the bar above the panel").
+         * Clamp any requested position into the usable workarea —
+         * clamping the FRAME: the SSD title band sits ABOVE the X
+         * window, so the client must clear the workarea top by the
+         * full title height or the grab bar hides behind the panel. */
+        int tbar = (!w->motif_csd && !w->override_redirect)
+                       ? (_WL_SSD_TITLE + _WL_SSD_BORDER) : 0;
+        if (w->y < wy + tbar) w->y = wy + tbar;
         if (w->x < wx) w->x = wx;
-        if (w->y < wy) w->y = wy;
+        if (w->x + w->w > wx + ww && wx + ww > w->w)
+            w->x = wx + ww - w->w;
+        if (w->y + w->h > wy + wh && wy + wh > w->h)
+            w->y = wy + wh - w->h;
+        if (w->x < wx) w->x = wx;
+        if (w->y < wy + tbar) w->y = wy + tbar;
     }
     _xwl_configure(w, w->x, w->y, w->w, w->h);
     xcb_map_window(X.xc, w->xwin);
@@ -460,11 +638,13 @@ static void _xwl_map(_xwl_win_t *w) {
         w->surf->y = w->y;
     }
     if (!w->toplevel) {
+        /* _toplevel_new strdups title AND app_id from the class — the
+         * old code overwrote app_id with a SECOND strdup here and
+         * leaked the first (2 B per X11 window under LSan) */
         w->toplevel = _toplevel_new(st, w->surf, w->title,
                                     w->class ? w->class : "");
         if (w->toplevel) {
             _wl_surf_t *s = w->surf;
-            w->toplevel->app_id = vt_strdup(w->class ? w->class : "");
             if (s) {
                 s->x = w->x;
                 s->y = w->y;
@@ -492,8 +672,8 @@ static void _xwl_handle_map_request(xcb_map_request_event_t *e) {
 static void _xwl_handle_destroy(xcb_destroy_notify_event_t *e) {
     _xwl_win_t *w = _xwl_find(e->window);
     if (!w) return;
-    if (w->xwl_res)
-        wl_resource_destroy(w->xwl_res);
+    /* _xwl_free_win destroys the pairing resource (guard-pre-empted
+     * destructor) and unlinks + frees the record */
     _xwl_free_win(w);
 }
 
@@ -545,12 +725,20 @@ static void _xwl_handle_config_req(xcb_configure_request_event_t *e) {
         _xwl_configure(w, nx, ny, nw, nh);
         return;
     }
-    /* honor client requests but keep windows on screen */
+    /* honor client requests but keep windows on screen — and the grab
+     * bar reachable: same frame clamp as _xwl_map (an app that moves
+     * itself to y=0 mid-session must not strand its title bar behind
+     * the top panel) */
     if (st) {
+        int wx, wy, ww, wh;
+        _layer_workarea(st, &wx, &wy, &ww, &wh);
+        int tbar = (!w->motif_csd && !w->override_redirect)
+                       ? (_WL_SSD_TITLE + _WL_SSD_BORDER) : 0;
         if (nx < 0) nx = 0;
-        if (ny < 0) ny = 0;
+        if (ny < wy + tbar) ny = wy + tbar;
         if (nx + nw > st->out_w) nx = st->out_w - nw;
         if (ny + nh > st->out_h) ny = st->out_h - nh;
+        if (ny < wy + tbar) ny = wy + tbar;
     }
     _xwl_configure(w, nx, ny, nw, nh);
     if (w->surf) {
@@ -566,6 +754,37 @@ static void _xwl_handle_config_req(xcb_configure_request_event_t *e) {
 
 static void _xwl_handle_client_msg(xcb_client_message_event_t *e) {
     _wl_state_t *st = X.st;
+
+    if (e->type == X.a_wl_surface_id && st && X.client) {
+        /* LEGACY association: Xwayland announces the wl_surface
+         * resource id that belongs to an X window (the pre-shell
+         * protocol — still what many Xwayland builds actually use;
+         * Debian's 24.1.6 binds xwayland_shell_v1 yet sends these).
+         * Without this the surface never pairs with the window: it
+         * renders at +0+0 (title bar BEHIND the top panel — "apps
+         * open with the bar above the panel") and the WM model shows
+         * a 1x1 window at 0,0. */
+        uint32_t sid = (uint32_t)e->data.data32[0];
+        struct wl_resource *r =
+            wl_client_get_object(X.client, sid);
+        _wl_surf_t *s = (r &&
+                         wl_resource_instance_of(
+                             r, &wl_surface_interface, NULL))
+                            ? wl_resource_get_user_data(r) : NULL;
+        _xwl_win_t *w = _xwl_find(e->window);
+        if (w && s && w->surf != s) {
+            _xwl_late_pair(w, s);
+        } else if (!w && s) {
+            /* surface id arrived before the CreateNotify: stash and
+             * pair when the window record exists */
+            if (X.n_pending_ids < 8) {
+                X.pending_ids[X.n_pending_ids].win = e->window;
+                X.pending_ids[X.n_pending_ids].surface_id = sid;
+                X.n_pending_ids++;
+            }
+        }
+        return;
+    }
     if (e->type == X.a_net_wm_state && st) {
         _xwl_win_t *w = _xwl_find(e->window);
         if (!w) return;
@@ -629,6 +848,11 @@ void _xwl_surface_destroyed(_wl_surf_t *s) {
     if (w->toplevel) {
         /* the wl_surface is gone (client died): the X window follows */
         xcb_destroy_window(X.xc, w->xwin);
+        _xwl_free_win(w);
+    } else if (w->xwin == 0) {
+        /* a placeholder that never met its X window dies with the
+         * surface (it is not in X.wins; leaving it leaks the record
+         * and its pairing resource outlives it) */
         _xwl_free_win(w);
     }
 }
@@ -969,6 +1193,7 @@ bool _xwl_start(_wl_state_t *st) {
     X.a_net_wm_ping    = _atom(xc, "_NET_WM_PING");
     X.a_wm_change_state = _atom(xc, "WM_CHANGE_STATE");
     X.a_net_wm_visible_name = _atom(xc, "_NET_WM_VISIBLE_NAME");
+    X.a_wl_surface_id = _atom(xc, "WL_SURFACE_ID");
 
     /* 6. become the WM: SubstructureRedirect on the root */
     xcb_screen_t *scr = xcb_setup_roots_iterator(xcb_get_setup(xc)).data;
@@ -985,6 +1210,19 @@ bool _xwl_start(_wl_state_t *st) {
         free(err);
         return false;
     }
+
+#if defined(VT_HAVE_XCB_COMPOSITE)
+    /* 6b. THE visibility switch: redirect every root child MANUAL.
+     * Xwayland only creates a wl_surface (and sends the association
+     * message + buffers) for windows whose redirectDraw is MANUAL —
+     * which happens for children of a Subwindows-redirected root.
+     * Without this call X11 apps under the Wayland session render
+     * NOTHING: Xwayland creates the window's shm pixmap but never
+     * attaches it to any surface (verified by wire trace; weston and
+     * wlroots issue the same request from their XWM). */
+    xcb_composite_redirect_subwindows(xc, scr->root,
+                                      XCB_COMPOSITE_REDIRECT_MANUAL);
+#endif
 
     /* 7. EWMH presence on the nested display (so apps see a real WM) */
     xcb_window_t wmwin = xcb_generate_id(xc);

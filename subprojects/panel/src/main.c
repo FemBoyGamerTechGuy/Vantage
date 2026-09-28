@@ -98,7 +98,35 @@ static const char _css[] =
 "popover.vantage-menu list row { background-color: transparent; "
 "                                min-height: 30px; "
 "                                color: #e8eaed; }\n"
-"popover.vantage-menu row:hover { background-color: #2e3238; }\n";
+"popover.vantage-menu row:hover { background-color: #2e3238; }\n"
+/* the session menu popover shares the same pinned sheet (its confirm
+ * view — the logout confirmation — lives INSIDE this popover: a modal
+ * GtkAlertDialog would be a separate xdg toplevel transient for a
+ * layer-shell parent that has no xdg_toplevel, so it never maps) */
+"popover.vantage-session-pop,\n"
+"popover.vantage-session-pop > contents,\n"
+"popover.vantage-session-pop > arrow {\n"
+"  background-color: #1f2126;\n"
+"  color: #e8eaed;\n"
+"}\n"
+"popover.vantage-session-pop label { color: #e8eaed; }\n"
+"popover.vantage-session-pop button { color: #e8eaed; }\n"
+/* Adwaita paints GtkButtons with a background-IMAGE (light gradient)
+ * layered OVER background-color — a plain background-color rule is
+ * invisible under it. The taskbar buttons dodge this with the "flat"
+ * class (which the theme maps to image: none); the confirm button
+ * wants a SOLID look, so clear the image layer explicitly. The
+ * :hover companion keeps the primary action blue while generic
+ * buttons darken (specificity (0,3,2) beats the (0,2,2) below). */
+"popover.vantage-session-pop button.vantage-confirm-ok,\n"
+"popover.vantage-session-pop button.vantage-confirm-ok:hover {\n"
+"  background-image: none;\n"
+"  background-color: #4f9adc;\n"
+"  border-color: #4f9adc;\n"
+"  color: #10131a; font-weight: bold;\n"
+"}\n"
+"popover.vantage-session-pop button:hover { "
+"  background-image: none; background-color: #2e3238; }\n";
 
 /* Popovers open INSTANTLY. GTK's stock fade-in is driven by frame
  * callbacks; on a software renderer (headless runs, slow boxes) the

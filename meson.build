@@ -1,5 +1,5 @@
 project('vantage', 'c',
-  version : '0.3.2',
+  version : '0.3.3',
   default_options : [
     'c_std=c17',
     'warning_level=2',
@@ -121,6 +121,7 @@ dep_xcb_xinput      = dependency('xcb-input',      required : false)
 dep_xcb_util        = dependency('xcb-util',       required : false)
 dep_xcb_ewmh        = dependency('xcb-ewmh',       required : false)
 dep_xcb_icccm       = dependency('xcb-icccm',      required : false)
+dep_xcb_composite   = dependency('xcb-composite',  required : false)
 dep_xrender         = dependency('xrender',        required : false)
 dep_xcomposite      = dependency('xcomposite',     required : false)
 dep_xdamage         = dependency('xdamage',        required : false)

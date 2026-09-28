@@ -43,6 +43,10 @@ typedef struct _wl_surf {
     bool     mapped;
     bool     minimized;               /* set_minimized: hidden but alive */
     bool     has_pending_xdg;         /* xdg toplevel exists */
+    bool     out_entered;             /* wl_surface.enter sent for the
+                                       current mapping (clients like
+                                       Xwayland's sw path wait for it
+                                       before they attach a buffer) */
     bool     attach_pending;         /* wl_surface.attach called since
                                        the last commit (a bare commit
                                        with NO attach keeps the current
@@ -214,6 +218,7 @@ typedef struct {
     _wl_surf_t *op_surf;
     int op_grab_x, op_grab_y;
     int op_start_w, op_start_h;
+    uint64_t op_last_geo_us;           /* geometry-event throttle stamp */
 } _wl_state_t;
 
 extern _wl_state_t *_wls;
@@ -305,6 +310,8 @@ const char *_xwl_auth_file(void);     /* Xauthority path or NULL */
 void _xwl_surface_destroyed(_wl_surf_t *s);   /* surface is dying */
 void _xwl_focus_changed(_wl_state_t *st, _wl_surf_t *s);
 void _xwl_win_geom(_wl_surf_t *s);
+void _xwl_announce_geom(_wl_surf_t *s);   /* first commit: publish real
+                                             geometry to the WM model */
 void _xwl_move_resize(_wl_surf_t *s, int x, int y, int w, int h);
 void _xwl_close(_wl_surf_t *s);
 void _xwl_maximize(_wl_surf_t *s, bool on);

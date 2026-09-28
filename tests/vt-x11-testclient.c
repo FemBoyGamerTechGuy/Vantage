@@ -141,6 +141,10 @@ int main(int argc, char **argv) {
     bool frame_only = false;
     bool motif_only = false;
     bool focus_only = false;
+    bool narrow_only = false;   /* the ellipsis-loop regression probe:
+                                 * a NARROW window with a LONG title —
+                                 * used to wedge the WM forever in the
+                                 * frame-paint truncation loop */
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--seconds") && i + 1 < argc) seconds = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--screenshot") && i + 1 < argc) shot = argv[++i];
@@ -153,6 +157,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--frame-probe")) frame_only = true;
         else if (!strcmp(argv[i], "--focus-probe")) focus_only = true;
         else if (!strcmp(argv[i], "--motif-probe")) motif_only = true;
+        else if (!strcmp(argv[i], "--narrow-probe")) narrow_only = true;
     }
     Display *d = XOpenDisplay(NULL);
     if (!d) { fprintf(stderr, "cannot open display\n"); return 1; }
@@ -376,7 +381,23 @@ int main(int argc, char **argv) {
     }
 
     Window w1 = None, w2 = None;
-    if (!no_windows) {
+    if (narrow_only) {
+        /* the ellipsis truncation path only engages when the title
+         * area is wider than 16px but narrower than the text: window
+         * width in [~150, title+130]. The old truncation loop grew
+         * its working string by 2 bytes per iteration and NEVER
+         * terminated — one such window wedged the whole WM. */
+        static const int widths[] = { 152, 176, 208 };
+        for (size_t i = 0; i < sizeof(widths) / sizeof(widths[0]); i++) {
+            Window wn = make_window(d,
+                "Narrow Title Probe 0123456789 abcdefghijklmnop",
+                60 + (int)i * 240, 200, widths[i], 120, 0x5f3a9a);
+            XMapWindow(d, wn);
+            XFlush(d);
+            printf("mapped 0x%lx (%d px)\n", (unsigned long)wn, widths[i]);
+            fflush(stdout);
+        }
+    } else if (!no_windows) {
         w1 = make_window(d, title, 100, 100, 400, 300, 0x3a5f9a);
         w2 = make_window(d, "Second Window", 500, 300, 300, 220, 0x9a3a5f);
         XMapWindow(d, w1);

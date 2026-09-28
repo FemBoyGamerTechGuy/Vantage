@@ -152,6 +152,11 @@ void tasklist_refresh(gpointer wm) {
     int shown = 0;
     for (guint i = 0; i < w->wins->len && shown < 24; i++) {
         vp_win_t *win = g_ptr_array_index(w->wins, i);
+        /* EWMH: docks and desktops are SHELL windows, not tasks — the
+         * panel itself and the wallpaper must never appear as
+         * "running apps" (they used to, complete with a taskbar
+         * button and a taskbar-focused highlight) */
+        if (win->dock || win->desktop) continue;
         /* every workspace: the taskbar is a window list, not a
          * per-desktop switcher; the PAGER shows per-desktop layout */
         GtkWidget *btn = gtk_button_new();

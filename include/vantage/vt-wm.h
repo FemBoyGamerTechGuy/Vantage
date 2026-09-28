@@ -66,6 +66,10 @@ typedef struct vt_window {
     bool            maximized;
     bool            fullscreen;
     bool            sticky;
+    bool            is_dock;     /* _NET_WM_WINDOW_TYPE_DOCK: shell chrome —
+                                   never a taskbar entry, never a pager
+                                   miniature, never takes keyboard focus */
+    bool            is_desktop;  /* _NET_WM_WINDOW_TYPE_DESKTOP (wallpaper) */
     int             workspace;
     void           *backend_priv;
     void           *user_data;

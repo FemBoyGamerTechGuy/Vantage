@@ -85,10 +85,18 @@ if dep_wayland_server.found() and dep_wayland_client.found() and \
     xwayland_shell_proto_c, xwayland_shell_proto_h,
     'vt-wl-layer.c', 'vt-wl-xwayland.c']
 
-  # Xwayland window management needs xcb (+icccm for property types)
+  # Xwayland window management needs xcb (+icccm for property types).
+  # xcb-composite: the WM-side CompositeRedirectSubwindows(root, MANUAL)
+  # is what makes Xwayland give each X window a wl_surface — without it
+  # X11 apps under the Wayland session render NOTHING (windows are
+  # X-side bookkeeping only, invisible on screen).
   if dep_xcb.found() and dep_xcb_icccm.found()
     backend_deps += [dep_xcb, dep_xcb_icccm]
     backend_cargs += ['-DVT_HAVE_XCB_XWAYLAND']
+    if dep_xcb_composite.found()
+      backend_deps += [dep_xcb_composite]
+      backend_cargs += ['-DVT_HAVE_XCB_COMPOSITE']
+    endif
   endif
 else
   lib_vantage_backends_extra_sources = []

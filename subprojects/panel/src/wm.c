@@ -6,6 +6,7 @@
 #include "wm.h"
 #include "ipc.h"
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,6 +54,8 @@ static gboolean _parse_query(vp_wm_t *wm, const char *payload) {
                     if (strchr(f[3], 'M')) w->minimized = TRUE;
                     if (strchr(f[3], 'X')) w->maximized = TRUE;
                     if (strchr(f[3], 'S')) w->fullscreen = TRUE;
+                    if (strchr(f[3], 'D')) w->dock = TRUE;
+                    if (strchr(f[3], 'K')) w->desktop = TRUE;
                 }
                 w->cls = g_strdup(f[4] ? f[4] : "");
                 w->app_id = g_strdup(f[5] ? f[5] : "");
@@ -73,6 +76,7 @@ static gboolean _parse_query(vp_wm_t *wm, const char *payload) {
 
 static gboolean _parse_ws(vp_wm_t *wm, const char *payload) {
     int count = 0, cur = 0;
+    bool have_count = false;
     const char *p = payload;
     while (p && *p) {
         const char *eol = strchr(p, '\n');
@@ -81,11 +85,20 @@ static gboolean _parse_ws(vp_wm_t *wm, const char *payload) {
         if (llen >= sizeof(buf)) llen = sizeof(buf) - 1;
         memcpy(buf, p, llen);
         buf[llen] = 0;
-        if (strncmp(buf, "count=", 6) == 0) count = atoi(buf + 6);
+        if (strncmp(buf, "count=", 6) == 0) {
+            count = atoi(buf + 6);
+            have_count = true;
+        }
         else if (strncmp(buf, "current=", 8) == 0) cur = atoi(buf + 8);
         p = eol ? eol + 1 : NULL;
     }
-    if (count < 1) count = 1;
+    /* A response WITHOUT a real count= field is NOT workspace data —
+     * it is a frame misalignment (a stale WM_QUERY window list read
+     * as a WS_QUERY answer after a timed-out call). Clamping that to
+     * 1 collapsed the pager to a single cell mid-drag until the next
+     * poll restored 4 ("bugs out the pager ... shows one pager").
+     * Ignore it entirely; the next poll resynchronizes. */
+    if (!have_count || count < 1) return FALSE;
     if (cur < 0 || cur >= count) cur = 0;
     if (count != wm->ws_count || cur != wm->ws_cur) {
         wm->ws_count = count;
@@ -109,8 +122,11 @@ gboolean vp_wm_refresh(vp_wm_t *wm) {
         }
         return changed;
     }
-    /* drain pending events first (they explain what changed) */
-    for (int i = 0; i < 64; i++) {
+    /* drain pending events first (they explain what changed). ALL of
+     * them: a fast window drag queues one event per throttled motion
+     * step — draining a fixed 64 left hundreds stacked up between
+     * 400 ms ticks, back-pressuring the WM's event socket forever. */
+    for (int i = 0; i < 4096; i++) {
         uint32_t id = 0;
         char *ev = vp_ipc_poll_event(wm->ipc, &id);
         if (!ev) break;
