@@ -126,6 +126,11 @@ enum {
     VT_IPC_MSG_WM_TEST_INPUT = 0x0031,   /* headless test hook: inject a
                                             pointer event through the real
                                             input path (see vt-backend.h) */
+    VT_IPC_MSG_WM_XWL_ENV   = 0x0032,   /* → display=...\nxauthority=... of
+                                            the Wayland session's Xwayland
+                                            (empty when not running): lets
+                                            panels/session give X11 apps
+                                            the DISPLAY they need */
     /* WM events (broadcast, payload: one text line) */
     VT_IPC_MSG_WM_EVENT    = 0x0040,   /* window-opened|closed|focused|... */
     VT_IPC_MSG_WM_WS_EVENT = 0x0041,   /* workspace-changed <n> */

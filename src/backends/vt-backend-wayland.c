@@ -138,6 +138,7 @@ _wl_state_t *_wls = NULL;
 static bool _hotkey_try(vt_backend_t *self, const char *combo);
 void _kbd_enter_focus(_wl_state_t *st, _wl_surf_t *s);
 static void _decor_notify(_wl_surf_t *s);
+static void _decor_orphan(_wl_surf_t *s);
 void _focus_top_on_ws(_wl_state_t *st);
 static bool _hotkey_try(vt_backend_t *self, const char *combo) {
     if (self && self->hotkey) return self->hotkey(self, combo);
@@ -245,6 +246,8 @@ static void _surf_commit(struct wl_client *cli, struct wl_resource *res) {
                     s->pixels = s->own;
                     s->w = w;
                     s->h = h;
+                    s->buf_w = w;
+                    s->buf_h = h;
                     s->stride = stride;
                 }
             }
@@ -272,6 +275,8 @@ static void _surf_commit(struct wl_client *cli, struct wl_resource *res) {
          * and must NOT touch the surface state.) */
         s->w = 0;
         s->h = 0;
+        s->buf_w = 0;
+        s->buf_h = 0;
         s->pixels = NULL;
         if (s->mapped) {
             s->mapped = false;
@@ -521,12 +526,28 @@ static void _surf_resource_destroy(struct wl_resource *res) {
         if (d) d->surf = NULL;
         s->xdg_res = NULL;
     }
+    if (s->decor_res) {
+        /* zxdg_toplevel_decoration_v1: same after-us destroy order
+         * as xdg_surface above (created later = destroyed later at
+         * client death). Its destructor read the freed surface
+         * through d->surf (ASan heap-use-after-free) — orphan it. */
+        _decor_orphan(s);
+    }
     if (s->mapped) {
         wl_list_remove(&s->link);
         if (_wls) {
             if (_wls->ptr_focus == s) _wls->ptr_focus = NULL;
             if (_wls->kbd_focus == s) _wls->kbd_focus = NULL;
             if (_wls->cursor_surf == s) _wls->cursor_surf = NULL;
+            /* a window that dies MID-DRAG/RESIZE (app crash, kill)
+             * leaves the interactive op holding a freed surface: the
+             * next motion event would write through op_surf into
+             * freed memory. End the op NOW — the same class of guard
+             * as the focus pointers above. */
+            if (_wls->op_surf == s) {
+                _wls->op_active = false;
+                _wls->op_surf = NULL;
+            }
         }
         if (s->toplevel)
             _emit_win(_wls, VT_BACKEND_WL_EVENT_WIN_UNMAP, s->toplevel);
@@ -996,9 +1017,12 @@ static void _toplevel_move(struct wl_client *cli,
     if (t && t->surf && _wls) {
         _wls->op_active = true;
         _wls->op_resize = false;
+        _wls->op_edges = 0;
         _wls->op_surf = t->surf;
         _wls->op_grab_x = _wls->cursor_x - t->surf->x;
         _wls->op_grab_y = _wls->cursor_y - t->surf->y;
+        _wls->op_start_x = t->surf->x;
+        _wls->op_start_y = t->surf->y;
     }
 }
 static void _toplevel_set_parent(struct wl_client *cli,
@@ -1017,27 +1041,53 @@ static void _toplevel_resize(struct wl_client *cli,
                              struct wl_resource *res,
                              struct wl_resource *seat, uint32_t serial,
                              uint32_t edges) {
-    (void)cli; (void)seat; (void)serial; (void)edges;
+    (void)cli; (void)seat; (void)serial;
     _xdg_toplevel_t *t = wl_resource_get_user_data(res);
     if (t && t->surf && _wls) {
+        /* the CLIENT names the edge it wants resized via
+         * XDG_TOPLEVEL_RESIZE_EDGE_* — translate to our E/S/W/N bits
+         * (1/2/4/8) instead of always resizing bottom-right */
+        static const uint8_t edge_map[9] = {
+            0,                 /* NONE          */
+            8,                 /* TOP           */
+            2,                 /* BOTTOM        */
+            4,                 /* LEFT          */
+            8 | 4,             /* TOP_LEFT      */
+            2 | 4,             /* BOTTOM_LEFT   */
+            1,                 /* RIGHT         */
+            8 | 1,             /* TOP_RIGHT     */
+            2 | 1,             /* BOTTOM_RIGHT  */
+        };
         _wls->op_active = true;
         _wls->op_resize = true;
+        _wls->op_edges = edges <= 8 ? edge_map[edges] : 0;
         _wls->op_surf = t->surf;
         _wls->op_grab_x = _wls->cursor_x;
         _wls->op_grab_y = _wls->cursor_y;
+        _wls->op_start_x = t->surf->x;
+        _wls->op_start_y = t->surf->y;
         _wls->op_start_w = t->surf->w;
         _wls->op_start_h = t->surf->h;
+        _wls->op_last_geo_us = 0;
+        t->resizing = true;
     }
 }
 static void _toplevel_set_max(struct wl_client *cli,
                               struct wl_resource *res,
                               int32_t w, int32_t h) {
-    (void)cli; (void)res; (void)w; (void)h;
+    (void)cli;
+    _xdg_toplevel_t *t = wl_resource_get_user_data(res);
+    if (t) { t->max_w = w > 0 ? w : 0; t->max_h = h > 0 ? h : 0; }
 }
 static void _toplevel_set_min(struct wl_client *cli,
                               struct wl_resource *res,
                               int32_t w, int32_t h) {
-    (void)cli; (void)res; (void)w; (void)h;
+    (void)cli;
+    /* REAL size hints: interactive edge-resize clamps to the client's
+     * minimum instead of shrinking windows to nothing (0 = unset, as
+     * the protocol defines) */
+    _xdg_toplevel_t *t = wl_resource_get_user_data(res);
+    if (t) { t->min_w = w > 0 ? w : 0; t->min_h = h > 0 ? h : 0; }
 }
 void _toplevel_configure(struct wl_resource *res, int32_t w, int32_t h,
                                 uint32_t state) {
@@ -1847,6 +1897,17 @@ static void _decor_res_destroy(struct wl_resource *res) {
     if (d->surf && d->surf->decor_res == res) d->surf->decor_res = NULL;
     vt_free(d);
 }
+
+/* detach a surface's decoration object: called from the SURFACE
+ * destructor, which runs BEFORE the decoration resource's own
+ * destructor at client death (libwayland destroys resources in
+ * creation order, and the decoration was created after the surface) */
+static void _decor_orphan(_wl_surf_t *s) {
+    if (!s || !s->decor_res) return;
+    _decor_t *d = wl_resource_get_user_data(s->decor_res);
+    if (d) d->surf = NULL;
+    s->decor_res = NULL;
+}
 static void _decor_mgr_get_decoration(struct wl_client *cli,
                                       struct wl_resource *res, uint32_t id,
                                       struct wl_resource *toplevel_res) {
@@ -2004,14 +2065,93 @@ static void _cursor_default_arrow(_wl_state_t *st) {
     st->cur_img_hy = 0;
 }
 
+/* Built-in fallback resize sprites: 16x16 double-headed arrows for the
+ * four edge orientations. Generated analytically (a shaft + two
+ * triangular heads in unit space, rotated per orientation) — hand
+ * -drawn bitmap diagonals are unmaintainable. White fill with a black
+ * one-pixel ring (classic cursor look). Used when the Xcursor theme
+ * lacks the shapes or VANTAGE_WL_CURSOR=builtin is forced: resize
+ * must stay discoverable everywhere. */
+static void _gen_double_arrow(uint32_t *img, int shape) {
+    memset(img, 0, 64 * 64 * sizeof(uint32_t));
+    const double rot[5][2] = {
+        {0, 0},                                  /* unused */
+        {1.0, 0.0},                              /* 1: E/W   */
+        {0.0, 1.0},                              /* 2: N/S   */
+        { 0.70710678,  0.70710678},              /* 3: NW-SE (\) */
+        { 0.70710678, -0.70710678},              /* 4: NE-SW (/) */
+    };
+    double ax = rot[shape][0], ay = rot[shape][1];
+    bool in[16][16] = {false};
+    for (int y = 0; y < 16; y++) {
+        for (int x = 0; x < 16; x++) {
+            double px = (x - 7.5) / 7.0;
+            double py = (y - 7.5) / 7.0;
+            /* u = along the arrow axis, v = perpendicular */
+            double u =  px * ax + py * ay;
+            double v = -px * ay + py * ax;
+            double au = fabs(u);
+            bool shaft = au <= 0.78 && fabs(v) <= 0.11;
+            double head_half = 0.45 * (0.99 - au) / 0.21;   /* au in [0.78, 0.99] */
+            bool head = au > 0.78 && au <= 0.99 && fabs(v) <= head_half;
+            in[y][x] = shaft || head;
+        }
+    }
+    for (int y = 0; y < 16; y++) {
+        for (int x = 0; x < 16; x++) {
+            if (in[y][x]) {
+                img[y * 64 + x] = 0xffffffff;    /* white body */
+            } else {
+                bool ring = (x > 0 && in[y][x - 1]) || (x < 15 && in[y][x + 1]) ||
+                            (y > 0 && in[y - 1][x]) || (y < 15 && in[y + 1][x]);
+                if (ring) img[y * 64 + x] = 0xff000000;   /* black outline */
+            }
+        }
+    }
+}
+
+/* Copy one shape set into the ACTIVE cursor and push it to the
+ * hardware plane. No-op when the shape is already active. */
+static void _cursor_apply_hw(_wl_state_t *st);
+
+static void _cursor_set_shape(_wl_state_t *st, int shape) {
+    if (shape < 0 || shape > 4) shape = 0;
+    if (st->cur_shape == shape) return;
+    st->cur_shape = shape;
+    memcpy(st->cursor_img, st->cur_shape_img[shape], sizeof(st->cursor_img));
+    st->cur_img_w  = st->cur_shape_w[shape];
+    st->cur_img_h  = st->cur_shape_h[shape];
+    st->cur_img_hx = st->cur_shape_hx[shape];
+    st->cur_img_hy = st->cur_shape_hy[shape];
+    _cursor_apply_hw(st);
+    st->dirty = true;   /* software sprite must re-blend this frame */
+}
+
 static void _cursor_init(_wl_state_t *st) {
     _cursor_default_arrow(st);
-    /* VANTAGE_WL_CURSOR=builtin forces the built-in 16x16 arrow —
+    /* remember the arrow as shape set 0 */
+    memcpy(st->cur_shape_img[0], st->cursor_img, sizeof(st->cursor_img));
+    st->cur_shape_w[0]  = st->cur_img_w;
+    st->cur_shape_h[0]  = st->cur_img_h;
+    st->cur_shape_hx[0] = st->cur_img_hx;
+    st->cur_shape_hy[0] = st->cur_img_hy;
+    st->cur_shape = 0;
+
+    /* built-in resize arrows as the always-available fallback */
+    for (int s = 1; s <= 4; s++) {
+        _gen_double_arrow(st->cur_shape_img[s], s);
+        st->cur_shape_w[s]  = 16;
+        st->cur_shape_h[s]  = 16;
+        st->cur_shape_hx[s] = 8;
+        st->cur_shape_hy[s] = 8;
+    }
+
+    /* VANTAGE_WL_CURSOR=builtin forces the built-in sprites —
      * used by tests (exact pixel assertions) and as an override when a
      * theme's cursors misbehave. */
     const char *force = getenv("VANTAGE_WL_CURSOR");
     if (force && vt_streq(force, "builtin")) {
-        vt_logi("wayland: cursor: built-in arrow forced "
+        vt_logi("wayland: cursor: built-in sprites forced "
                 "(VANTAGE_WL_CURSOR=builtin)");
         return;
     }
@@ -2020,35 +2160,63 @@ static void _cursor_init(_wl_state_t *st) {
     const char *szs = getenv("XCURSOR_SIZE");
     int size = szs && *szs ? atoi(szs) : 24;
     if (size <= 0 || size > 64) size = 24;
-    const char *shape = "left_ptr";
-    XcursorImages *imgs = XcursorLibraryLoadImages(shape,
-                                                   theme && *theme ?
-                                                   theme : "default",
-                                                   size);
-    if (!imgs && theme && *theme)
-        imgs = XcursorLibraryLoadImages(shape, "default", size);
-    if (imgs && imgs->nimage > 0) {
-        XcursorImage *im = imgs->images[0];
-        if (im && im->width <= 64 && im->height <= 64 && im->pixels) {
-            memset(st->cursor_img, 0, sizeof(st->cursor_img));
-            for (uint32_t y = 0; y < im->height; y++)
-                for (uint32_t x = 0; x < im->width; x++)
-                    st->cursor_img[y * 64 + x] =
-                        ((const uint32_t *)im->pixels)[y * im->width + x];
-            st->cur_img_w = (int)im->width;
-            st->cur_img_h = (int)im->height;
-            st->cur_img_hx = (int)im->xhot;
-            st->cur_img_hy = (int)im->yhot;
-            vt_logi("wayland: cursor: Xcursor '%s' theme '%s' %ux%u "
-                    "(hotspot %u,%u)", shape,
-                    theme && *theme ? theme : "default",
-                    im->width, im->height, im->xhot, im->yhot);
+    /* shape 0: the plain arrow */
+    static const char *const shapes[5] = {
+        "left_ptr",
+        "sb_h_double_arrow",       /* E/W */
+        "sb_v_double_arrow",       /* N/S */
+        "fd_double_arrow",         /* NW/SE (\) */
+        "bd_double_arrow",         /* NE/SW (/) */
+    };
+    for (int s = 0; s < 5; s++) {
+        XcursorImages *imgs = NULL;
+        /* try the theme, then the default theme, then common aliases
+         * (size_all/size_hor families exist in several themes) */
+        static const char *const alias[5][3] = {
+            { "left_ptr", "arrow", "default" },
+            { "sb_h_double_arrow", "size_hor", "h_double_arrow" },
+            { "sb_v_double_arrow", "size_ver", "v_double_arrow" },
+            { "fd_double_arrow", "size_fdiag", "top_left_corner" },
+            { "bd_double_arrow", "size_bdiag", "bottom_left_corner" },
+        };
+        for (int a = 0; a < 3 && !imgs; a++)
+            imgs = XcursorLibraryLoadImages(alias[s][a],
+                                            theme && *theme ? theme : "default",
+                                            size);
+        if (!imgs && theme && *theme)
+            for (int a = 0; a < 3 && !imgs; a++)
+                imgs = XcursorLibraryLoadImages(alias[s][a], "default", size);
+        if (imgs && imgs->nimage > 0) {
+            XcursorImage *im = imgs->images[0];
+            if (im && im->width <= 64 && im->height <= 64 && im->pixels) {
+                memset(st->cur_shape_img[s], 0, sizeof(st->cur_shape_img[s]));
+                for (uint32_t y = 0; y < im->height; y++)
+                    for (uint32_t x = 0; x < im->width; x++)
+                        st->cur_shape_img[s][y * 64 + x] =
+                            ((const uint32_t *)im->pixels)[y * im->width + x];
+                st->cur_shape_w[s]  = (int)im->width;
+                st->cur_shape_h[s]  = (int)im->height;
+                st->cur_shape_hx[s] = (int)im->xhot;
+                st->cur_shape_hy[s] = (int)im->yhot;
+                vt_logd("wayland: cursor: '%s' %ux%u hotspot %u,%u",
+                        shapes[s], im->width, im->height, im->xhot, im->yhot);
+            }
+            XcursorImagesDestroy(imgs);
         }
-        XcursorImagesDestroy(imgs);
-        return;
+        /* missing theme shape: the built-in fallback already in place */
     }
-    vt_logi("wayland: cursor: Xcursor images unavailable (theme '%s') — "
-            "built-in arrow sprite", theme && *theme ? theme : "default");
+    if (st->cur_shape_w[1] && st->cur_shape_w[1] != 16)
+        vt_logi("wayland: cursor: Xcursor resize shapes loaded "
+                "(theme '%s')", theme && *theme ? theme : "default");
+    else
+        vt_logi("wayland: cursor: resize shapes: built-in arrows "
+                "(theme '%s' lacks them)", theme && *theme ? theme : "default");
+    /* re-apply shape 0 from the (possibly themed) set */
+    memcpy(st->cursor_img, st->cur_shape_img[0], sizeof(st->cursor_img));
+    st->cur_img_w  = st->cur_shape_w[0];
+    st->cur_img_h  = st->cur_shape_h[0];
+    st->cur_img_hx = st->cur_shape_hx[0];
+    st->cur_img_hy = st->cur_shape_hy[0];
 #else
     vt_logi("wayland: cursor: built without Xcursor — built-in arrow "
             "sprite");
@@ -2058,7 +2226,10 @@ static void _cursor_init(_wl_state_t *st) {
 /* push the active cursor image to the hardware plane when available */
 static void _cursor_apply_hw(_wl_state_t *st) {
     if (!st || !st->kms) return;
-    if (st->cur_client_set && st->cursor_surf && st->cursor_surf->pixels) {
+    /* an active resize/edge shape ALWAYS wins over the client cursor:
+     * the frame band belongs to the compositor, not the app */
+    if (st->cur_shape == 0 &&
+        st->cur_client_set && st->cursor_surf && st->cursor_surf->pixels) {
         /* client cursor surface: software sprite */
         vt_kms_cursor_hide(st->kms);
         return;
@@ -2252,6 +2423,44 @@ static void _click_to_focus(_wl_state_t *st, _wl_surf_t *s) {
     _broadcast_selection(st);
 }
 
+/* Edge bits under the cursor for an SSD-framed toplevel:
+ * 1=E 2=S 4=W 8=N (same encoding the X11 WM uses). 0 = not on an
+ * edge. The grab zone is the visible 2px border plus a few pixels of
+ * the client edge; the TOP strip lives on the title band (rows 0..
+ * margin-1 of the frame) so a top-edge grab is actually reachable. */
+static uint8_t _ssd_edge_at(_wl_state_t *st, _wl_surf_t *s) {
+    if (!s || !s->ssd || !s->toplevel || s->minimized) return 0;
+    int fx, fy, fw, fh;
+    _ssd_frame_geom(s, &fx, &fy, &fw, &fh);
+    int lx = st->cursor_x - fx, ly = st->cursor_y - fy;
+    if (lx < 0 || lx >= fw || ly < 0 || ly >= fh) return 0;
+    int m = _WL_SSD_RESIZE_MARGIN;
+    bool t = ly < m;                       /* title band top strip */
+    bool b = ly >= fh - m;
+    /* side strips below the title band; at the very top they extend
+     * INTO the title band so the top CORNERS grab both edges */
+    bool l = lx < m && (ly > _WL_SSD_TITLE || t);
+    bool r = lx >= fw - m && (ly > _WL_SSD_TITLE || t);
+    uint8_t e = 0;
+    if (r) e |= 1;
+    if (b) e |= 2;
+    if (l) e |= 4;
+    if (t) e |= 8;
+    return e;
+}
+
+/* shape-set index for an edge bitmask (0 = default arrow) */
+static int _edge_shape(uint8_t edges) {
+    if (!edges) return 0;
+    bool e = edges & 1, s = edges & 2, w = edges & 4, n = edges & 8;
+    if ((e && w) || (n && s)) return 1;        /* E/W shaft   */
+    if ((n && e) || (s && w)) return 4;        /* NE/SW (/)   */
+    if ((n && w) || (s && e)) return 3;        /* NW/SE (\)   */
+    if (e || w) return 1;
+    if (n || s) return 2;
+    return 0;
+}
+
 static void _pointer_motion(_wl_state_t *st, double dx, double dy) {
     st->cursor_x += (int)dx;
     st->cursor_y += (int)dy;
@@ -2283,20 +2492,63 @@ static void _pointer_motion(_wl_state_t *st, double dx, double dy) {
             }
         }
     }
+    /* cursor shape: resize affordance over SSD edges, kept during the
+     * whole interactive op; plain arrow everywhere else. THIS is what
+     * makes the frame borders discoverable as resize handles (the
+     * reported "black bars look like a resize area but resizing does
+     * not seem to be implemented"). */
+    if (st->op_active && st->op_resize)
+        _cursor_set_shape(st, _edge_shape(st->op_edges));
+    else
+        _cursor_set_shape(st, _edge_shape(_ssd_edge_at(st, s)));
+
     /* interactive move/resize */
     if (st->op_active && st->op_surf) {
         if (st->op_resize) {
-            st->op_surf->w = st->op_start_w + st->cursor_x - st->op_grab_x;
-            st->op_surf->h = st->op_start_h + st->cursor_y - st->op_grab_y;
-            if (st->op_surf->w < 1) st->op_surf->w = 1;
-            if (st->op_surf->h < 1) st->op_surf->h = 1;
-            if (st->op_surf->xwl) {
-                _xwl_move_resize(st->op_surf, st->op_surf->x,
-                                 st->op_surf->y, st->op_surf->w,
-                                 st->op_surf->h);
-            } else if (st->op_surf->toplevel) {
-                _toplevel_configure(st->op_surf->toplevel->res,
-                                    st->op_surf->w, st->op_surf->h, 0);
+            /* EDGE-AWARE resize: dragging the WEST/NORTH edges moves
+             * the origin as the size changes (the old math always
+             * behaved as a bottom-right corner grab, so top/left edges
+             * resized "backwards" and felt broken). Client size hints
+             * (xdg_toplevel.set_min_size/set_max_size) are honored. */
+            _wl_surf_t *os = st->op_surf;
+            _xdg_toplevel_t *t = os->toplevel;
+            int rdx = st->cursor_x - st->op_grab_x;
+            int rdy = st->cursor_y - st->op_grab_y;
+            int w = st->op_start_w, h = st->op_start_h;
+            int x = st->op_start_x, y = st->op_start_y;
+            if (st->op_edges & 1) w = st->op_start_w + rdx;
+            if (st->op_edges & 2) h = st->op_start_h + rdy;
+            if (st->op_edges & 4) { w = st->op_start_w - rdx; x = st->op_start_x + rdx; }
+            if (st->op_edges & 8) { h = st->op_start_h - rdy; y = st->op_start_y + rdy; }
+            int minw = (t && t->min_w > 0) ? t->min_w : 20;
+            int minh = (t && t->min_h > 0) ? t->min_h : 20;
+            if (w < minw) { if (st->op_edges & 4) x -= minw - w; w = minw; }
+            if (h < minh) { if (st->op_edges & 8) y -= minh - h; h = minh; }
+            if (t && t->max_w > 0 && w > t->max_w) {
+                if (st->op_edges & 4) x += w - t->max_w;
+                w = t->max_w;
+            }
+            if (t && t->max_h > 0 && h > t->max_h) {
+                if (st->op_edges & 8) y += h - t->max_h;
+                h = t->max_h;
+            }
+            os->w = w;
+            os->h = h;
+            os->x = x;
+            os->y = y;
+            if (os->xwl) {
+                _xwl_move_resize(os, os->x, os->y, os->w, os->h);
+            } else if (t) {
+                _toplevel_configure(t->res, os->w, os->h, 0);
+            }
+            /* geometry events during the resize flow at the same
+             * continuous rate as moves — the pager tracks BOTH live */
+            if (t) {
+                uint64_t now = vt_time_now_us();
+                if (now - st->op_last_geo_us >= _WL_GEO_EVENT_INTERVAL_US) {
+                    st->op_last_geo_us = now;
+                    _emit_win(st, VT_BACKEND_WL_EVENT_WIN_GEOMETRY, t);
+                }
             }
         } else {
             st->op_surf->x = st->cursor_x - st->op_grab_x;
@@ -2316,15 +2568,15 @@ static void _pointer_motion(_wl_state_t *st, double dx, double dy) {
             int ymin = wy + (st->op_surf->ssd
                                  ? (_WL_SSD_TITLE + _WL_SSD_BORDER) : 0);
             if (st->op_surf->y < ymin) st->op_surf->y = ymin;
-            /* Geometry events during a drag are THROTTLED: a 125-1000 Hz
-             * pointer floods the panel's event socket with one event per
-             * motion step; the panel only re-queries every 400 ms, so the
-             * flood outpaces any consumer. Even with non-blocking
-             * broadcasts, a bounded rate keeps the panel's input queue
-             * sane. The FINAL geometry goes out on button release. */
+            /* Geometry events during a drag: CONTINUOUS at ~30 fps.
+             * The panel consumes them event-driven now (its GLib loop
+             * watches the WM socket), so the pager follows the drag
+             * frame by frame; the FINAL geometry still goes out on
+             * button release. The rate is bounded so a 1000 Hz pointer
+             * cannot flood the panel's input queue. */
             if (st->op_surf->toplevel) {
                 uint64_t now = vt_time_now_us();
-                if (now - st->op_last_geo_us >= 50000) {   /* 20 fps */
+                if (now - st->op_last_geo_us >= _WL_GEO_EVENT_INTERVAL_US) {
                     st->op_last_geo_us = now;
                     _emit_win(st, VT_BACKEND_WL_EVENT_WIN_GEOMETRY,
                               st->op_surf->toplevel);
@@ -2340,14 +2592,24 @@ static void _pointer_motion(_wl_state_t *st, double dx, double dy) {
 
 static void _pointer_button(_wl_state_t *st, uint32_t button,
                             bool pressed) {
-    if (button == 0x110 && !pressed) {
-        /* BTN_LEFT release ends interactive op — emit the FINAL geometry
-         * (drag motion is throttled; the last position must reach the
-         * WM model and the pager even when the last motion was skipped) */
-        if (st->op_active && st->op_surf && st->op_surf->toplevel)
-            _emit_win(st, VT_BACKEND_WL_EVENT_WIN_GEOMETRY,
-                      st->op_surf->toplevel);
+    if (!pressed && (button == 0x110 || button == 0x111 || button == 0x112)) {
+        /* ANY button release ends an interactive op: a Super+right-drag
+         * resize used to keep running until some later left click.
+         * Emit the FINAL geometry (motion is rate-limited; the last
+         * position must reach the WM model and the pager even when the
+         * last motion was skipped) and drop the xdg resizing state. */
+        if (st->op_active && st->op_surf && st->op_surf->toplevel) {
+            _xdg_toplevel_t *t = st->op_surf->toplevel;
+            _emit_win(st, VT_BACKEND_WL_EVENT_WIN_GEOMETRY, t);
+            if (t->resizing) {
+                t->resizing = false;
+                _toplevel_configure(t->res, st->op_surf->w, st->op_surf->h,
+                                    t->activated
+                                        ? XDG_TOPLEVEL_STATE_ACTIVATED : 0);
+            }
+        }
         st->op_active = false;
+        _cursor_set_shape(st, _edge_shape(_ssd_edge_at(st, st->ptr_focus)));
     }
     if (st->op_active && pressed) return;
     /* a grabbed popup is dismissed when the press is NOT inside it or
@@ -2380,25 +2642,38 @@ static void _pointer_button(_wl_state_t *st, uint32_t button,
             if (button == 0x110) {
                 st->op_active = true;
                 st->op_resize = false;
+                st->op_edges = 0;
                 st->op_surf = s;
                 st->op_grab_x = st->cursor_x - s->x;
                 st->op_grab_y = st->cursor_y - s->y;
+                st->op_start_x = s->x;
+                st->op_start_y = s->y;
                 return;
             } else if (button == 0x112) {
+                /* edge picked from which half of the window the pointer
+                 * is in — Super+right-drag in the left half resizes the
+                 * LEFT edge, not always the bottom-right corner */
+                uint8_t e = 0;
+                if (st->cursor_x < s->x + s->w / 2) e |= 4; else e |= 1;
+                if (st->cursor_y < s->y + s->h / 2) e |= 8; else e |= 2;
                 st->op_active = true;
                 st->op_resize = true;
+                st->op_edges = e;
                 st->op_surf = s;
                 st->op_grab_x = st->cursor_x;
                 st->op_grab_y = st->cursor_y;
+                st->op_start_x = s->x;
+                st->op_start_y = s->y;
                 st->op_start_w = s->w;
                 st->op_start_h = s->h;
+                st->op_last_geo_us = 0;
                 return;
             }
         }
         /* click-to-focus on PRESS (the keyboard never follows motion) */
         if (pressed)
             _click_to_focus(st, s);
-        /* SSD frame interactions (titlebar drag, buttons, edges) */
+        /* SSD frame interactions (buttons, edges, titlebar drag) */
         if (s->ssd && s->toplevel && pressed && button == 0x110) {
             int fx, fy, fw, fh;
             _ssd_frame_geom(s, &fx, &fy, &fw, &fh);
@@ -2406,6 +2681,9 @@ static void _pointer_button(_wl_state_t *st, uint32_t button,
             if (lx >= 0 && lx < fw && ly >= 0 && ly < fh) {
                 int bx = fw - _WL_SSD_BORDER - _WL_SSD_BTN;
                 if (ly <= _WL_SSD_TITLE + _WL_SSD_BORDER) {
+                    /* window buttons come FIRST: their hit boxes sit in
+                     * the title band and must never be eaten by the
+                     * top-edge resize strip */
                     if (lx >= bx) {
                         /* close */
                         xdg_toplevel_send_close(s->toplevel->res);
@@ -2423,27 +2701,42 @@ static void _pointer_button(_wl_state_t *st, uint32_t button,
                         st->dirty = true;
                         return;
                     }
-                    /* titlebar drag → move */
-                    st->op_active = true;
-                    st->op_resize = false;
-                    st->op_surf = s;
-                    st->op_grab_x = st->cursor_x - s->x;
-                    st->op_grab_y = st->cursor_y - s->y;
-                    return;
                 }
-                /* edges/corners → resize */
-                int m = _WL_SSD_BORDER + 4;
-                bool l = lx < m, r = lx > fw - m,
-                     t = ly < _WL_SSD_TITLE + m,
-                     b = ly > fh - m;
-                if (l || r || t || b) {
+                /* EDGES/CORNERS → resize. Checked BEFORE the plain
+                 * titlebar drag: the top strip lives on the title band
+                 * (rows 0..margin-1) and must win over "drag the
+                 * titlebar". This is the resize handle users see (the
+                 * cursor changes over it). */
+                uint8_t edges = _ssd_edge_at(st, s);
+                if (edges) {
                     st->op_active = true;
                     st->op_resize = true;
+                    st->op_edges = edges;
                     st->op_surf = s;
                     st->op_grab_x = st->cursor_x;
                     st->op_grab_y = st->cursor_y;
+                    st->op_start_x = s->x;
+                    st->op_start_y = s->y;
                     st->op_start_w = s->w;
                     st->op_start_h = s->h;
+                    st->op_last_geo_us = 0;
+                    if (s->toplevel) {
+                        s->toplevel->resizing = true;
+                        _toplevel_configure(s->toplevel->res, s->w, s->h,
+                                            XDG_TOPLEVEL_STATE_RESIZING);
+                    }
+                    return;
+                }
+                /* titlebar drag → move */
+                if (ly <= _WL_SSD_TITLE + _WL_SSD_BORDER) {
+                    st->op_active = true;
+                    st->op_resize = false;
+                    st->op_edges = 0;
+                    st->op_surf = s;
+                    st->op_grab_x = st->cursor_x - s->x;
+                    st->op_grab_y = st->cursor_y - s->y;
+                    st->op_start_x = s->x;
+                    st->op_start_y = s->y;
                     return;
                 }
             }
@@ -2850,6 +3143,17 @@ typedef struct _title_cache {
 } _title_cache_t;
 static _title_cache_t *_title_cache;
 
+/* the one shared title font (FreeType face resolved through
+ * fontconfig "sans" at first use). File-scope so shutdown can
+ * release it — plus fontconfig's library cache via FcFini — and a
+ * clean exit is leak-free under LSan too (the ~320 B FcConfig
+ * cache used to be the only report left at WM exit). */
+#if defined(VT_HAVE_FREETYPE)
+static FT_Library _title_ft = NULL;
+static FT_Face _title_face = NULL;
+static bool _title_face_tried = false;
+#endif
+
 static void _title_cache_free_all(void) {
     _title_cache_t *t = _title_cache;
     while (t) {
@@ -2861,6 +3165,19 @@ static void _title_cache_free_all(void) {
     }
     _title_cache = NULL;
 }
+
+/* release the shared title font + fontconfig's library cache at
+ * shutdown — a clean exit is then fully leak-free under LSan (the
+ * FcConfig cache would otherwise be the only report left). Called
+ * from _wl_fini AFTER the title cache (the glyphs reference nothing
+ * in the face, but release order is still face → library → fc). */
+#if defined(VT_HAVE_FREETYPE)
+static void _ssd_title_font_fini(void) {
+    if (_title_face) { FT_Done_Face(_title_face); _title_face = NULL; }
+    if (_title_ft) { FT_Done_FreeType(_title_ft); _title_ft = NULL; }
+    FcFini();
+}
+#endif
 
 static void _ssd_title_paint(uint32_t *fb, int W, int H,
                              int x, int y, int max_w, const char *utf8,
@@ -2874,12 +3191,9 @@ static void _ssd_title_paint(uint32_t *fb, int W, int H,
     for (_title_cache_t *t = _title_cache; t; t = t->next)
         if (strcmp(t->key, key) == 0) { hit = t; break; }
     if (!hit) {
-        static FT_Library ft = NULL;
-        static FT_Face face = NULL;
-        static bool face_tried = false;
-        if (!face && !face_tried) {
-            face_tried = true;
-            if (FT_Init_FreeType(&ft) == 0) {
+        if (!_title_face && !_title_face_tried) {
+            _title_face_tried = true;
+            if (FT_Init_FreeType(&_title_ft) == 0) {
                 FcPattern *pat = FcNameParse((const FcChar8 *)"sans");
                 FcConfigSubstitute(NULL, pat, FcMatchPattern);
                 FcDefaultSubstitute(pat);
@@ -2889,16 +3203,17 @@ static void _ssd_title_paint(uint32_t *fb, int W, int H,
                     FcChar8 *file = NULL;
                     if (FcPatternGetString(mat, FC_FILE, 0, &file) ==
                         FcResultMatch) {
-                        FT_New_Face(ft, (const char *)file, 0, &face);
-                        if (face)
-                            FT_Set_Pixel_Sizes(face, 0, 13);
+                        FT_New_Face(_title_ft, (const char *)file, 0,
+                                    &_title_face);
+                        if (_title_face)
+                            FT_Set_Pixel_Sizes(_title_face, 0, 13);
                     }
                     FcPatternDestroy(mat);
                 }
                 FcPatternDestroy(pat);
             }
         }
-        if (!face) return;
+        if (!_title_face) return;
         hit = vt_malloc0(sizeof(*hit));
         if (!hit) return;
         hit->key = vt_strdup(key);
@@ -2913,14 +3228,14 @@ static void _ssd_title_paint(uint32_t *fb, int W, int H,
             else if ((*p & 0xF0) == 0xE0 && p[1] && p[2]) { cp = ((*p & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F); len = 3; }
             else if ((*p & 0xF8) == 0xF0 && p[1] && p[2] && p[3]) { cp = ((*p & 0x07) << 18) | ((p[1] & 0x3F) << 12) | ((p[2] & 0x3F) << 6) | (p[3] & 0x3F); len = 4; }
             else { cp = '?'; len = 1; }
-            if (FT_Load_Char(face, cp, FT_LOAD_RENDER) == 0) {
-                adv += (int)face->glyph->advance.x >> 6;
+            if (FT_Load_Char(_title_face, cp, FT_LOAD_RENDER) == 0) {
+                adv += (int)_title_face->glyph->advance.x >> 6;
                 if (adv > max_w) { adv = max_w; break; }
             }
             p += len;
         }
-        int asc = (int)(face->size->metrics.ascender >> 6);
-        int desc = (int)(-face->size->metrics.descender >> 6);
+        int asc = (int)(_title_face->size->metrics.ascender >> 6);
+        int desc = (int)(-_title_face->size->metrics.descender >> 6);
         hit->w = adv;
         hit->h = asc + desc + 2;
         if (hit->w < 1) hit->w = 1;
@@ -2937,10 +3252,10 @@ static void _ssd_title_paint(uint32_t *fb, int W, int H,
             else if ((*p & 0xF0) == 0xE0 && p[1] && p[2]) { cp = ((*p & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F); len = 3; }
             else if ((*p & 0xF8) == 0xF0 && p[1] && p[2] && p[3]) { cp = ((*p & 0x07) << 18) | ((p[1] & 0x3F) << 12) | ((p[2] & 0x3F) << 6) | (p[3] & 0x3F); len = 4; }
             else { cp = '?'; len = 1; }
-            if (FT_Load_Char(face, cp, FT_LOAD_RENDER) == 0) {
-                FT_Bitmap *bm = &face->glyph->bitmap;
-                int gx = cx + (int)face->glyph->bitmap_left;
-                int gy = asc - (int)face->glyph->bitmap_top;
+            if (FT_Load_Char(_title_face, cp, FT_LOAD_RENDER) == 0) {
+                FT_Bitmap *bm = &_title_face->glyph->bitmap;
+                int gx = cx + (int)_title_face->glyph->bitmap_left;
+                int gy = asc - (int)_title_face->glyph->bitmap_top;
                 for (unsigned yy = 0; yy < bm->rows; yy++) {
                     int dy = gy + (int)yy;
                     if (dy < 0 || dy >= hit->h) continue;
@@ -2958,7 +3273,7 @@ static void _ssd_title_paint(uint32_t *fb, int W, int H,
                             (mix << 24) | (argb & 0xffffff);
                     }
                 }
-                cx += (int)face->glyph->advance.x >> 6;
+                cx += (int)_title_face->glyph->advance.x >> 6;
             }
             p += len;
         }
@@ -3035,6 +3350,24 @@ void _ssd_paint(_wl_state_t *st, _wl_surf_t *s) {
         int yb = fy + fh - _WL_SSD_BORDER;
         if (yb < 0 || yb >= H || x < 0 || x >= W) continue;
         fb[yb * W + x] = border;
+    }
+    /* Pending-resize backdrop: while the client has not committed a
+     * buffer matching the configured size yet (interactive resize in
+     * flight), the interior would otherwise show the PREVIOUS frame's
+     * pixels shifted around (smear). Fill the client area with the
+     * title-bar color; the buffer-bounded client blit then covers the
+     * top-left region of it. Zero cost in the steady state, where the
+     * committed buffer already matches the configured size. */
+    if (s->buf_w < s->w || s->buf_h < s->h) {
+        for (int y = fy + _WL_SSD_TITLE + _WL_SSD_BORDER;
+             y < fy + fh - _WL_SSD_BORDER; y++) {
+            if (y < 0 || y >= H) continue;
+            for (int x = fx + _WL_SSD_BORDER; x < fx + fw - _WL_SSD_BORDER;
+                 x++) {
+                if (x < 0 || x >= W) continue;
+                fb[y * W + x] = bar;
+            }
+        }
     }
     /* window buttons: [–][▢][×] at the right end (drawn as shapes) */
     int bx = fx + fw - _WL_SSD_BORDER - _WL_SSD_BTN;
@@ -3256,10 +3589,14 @@ static void _paint(void) {
             wl_list_for_each(sub, &s->subs, sub_link) {
                 if (!sub->mapped || !sub->pixels || sub->minimized) continue;
                 int cx2 = s->x + sub->dx, cy2 = s->y + sub->dy;
-                for (int sy = 0; sy < sub->h; sy++) {
+                /* buffer-bounded blit: sub->w/h may race a pending
+                 * resize — never read past the committed buffer */
+                int cw = sub->buf_w < sub->w ? sub->buf_w : sub->w;
+                int ch = sub->buf_h < sub->h ? sub->buf_h : sub->h;
+                for (int sy = 0; sy < ch; sy++) {
                     int dy = cy2 + sy;
                     if (dy < 0 || dy >= st->out_h) continue;
-                    for (int sx = 0; sx < sub->w; sx++) {
+                    for (int sx = 0; sx < cw; sx++) {
                         int dx = cx2 + sx;
                         if (dx < 0 || dx >= st->out_w) continue;
                         st->fb[dy * st->out_w + dx] =
@@ -3281,10 +3618,13 @@ static void _paint(void) {
             wl_list_for_each(sub, &s->subs, sub_link) {
                 if (!sub->mapped || !sub->pixels) continue;
                 int cx2 = x + sub->dx, cy2 = y + sub->dy;
-                for (int sy = 0; sy < sub->h; sy++) {
+                /* buffer-bounded blit (same pending-resize clamp) */
+                int cw = sub->buf_w < sub->w ? sub->buf_w : sub->w;
+                int ch = sub->buf_h < sub->h ? sub->buf_h : sub->h;
+                for (int sy = 0; sy < ch; sy++) {
                     int dy = cy2 + sy;
                     if (dy < 0 || dy >= st->out_h) continue;
-                    for (int sx = 0; sx < sub->w; sx++) {
+                    for (int sx = 0; sx < cw; sx++) {
                         int dx = cx2 + sx;
                         if (dx < 0 || dx >= st->out_w) continue;
                         st->fb[dy * st->out_w + dx] =
@@ -3293,14 +3633,24 @@ static void _paint(void) {
                 }
             }
         }
-        for (int sy = 0; sy < s->h; sy++) {
-            int dy = y + sy;
-            if (dy < 0 || dy >= st->out_h) continue;
-            for (int sx = 0; sx < s->w; sx++) {
-                int dx = x + sx;
-                if (dx < 0 || dx >= st->out_w) continue;
-                st->fb[dy * st->out_w + dx] =
-                    s->pixels[sy * s->stride + sx];
+        /* Client content: blit min(buffer, configured). During a
+         * pending resize s->w/h are already the NEW size while pixels
+         * is the OLD buffer (the client has not committed the acked
+         * geometry yet) — bounds from w/h read past the buffer; bounds
+         * from buf alone could paint outside the frame on a pending
+         * shrink. min() is safe in both directions. */
+        {
+            int cw = s->buf_w < s->w ? s->buf_w : s->w;
+            int ch = s->buf_h < s->h ? s->buf_h : s->h;
+            for (int sy = 0; sy < ch; sy++) {
+                int dy = y + sy;
+                if (dy < 0 || dy >= st->out_h) continue;
+                for (int sx = 0; sx < cw; sx++) {
+                    int dx = x + sx;
+                    if (dx < 0 || dx >= st->out_w) continue;
+                    st->fb[dy * st->out_w + dx] =
+                        s->pixels[sy * s->stride + sx];
+                }
             }
         }
     }
@@ -3320,12 +3670,17 @@ static void _paint(void) {
     /* Software cursor sprite — ALWAYS drawn. The hardware cursor plane
      * is a bonus (used when the driver actually supports it); making the
      * sprite the source of truth guarantees a visible cursor on every
-     * GPU, including NVIDIA where drmModeSetCursor can silently fail. */
-    if (st->cur_client_set && st->cursor_surf && st->cursor_surf->pixels) {
+     * GPU, including NVIDIA where drmModeSetCursor can silently fail.
+     * An active resize/edge shape wins over the client's cursor. */
+    if (st->cur_shape == 0 &&
+        st->cur_client_set && st->cursor_surf && st->cursor_surf->pixels) {
+        /* buffer-bounded dims (identical in the steady state; keeps
+         * the sprite read on the committed allocation if a cursor
+         * surface is ever re-configured before its next commit) */
         _blend_sprite(st, st->cursor_surf->pixels,
                       st->cursor_surf->stride ? st->cursor_surf->stride
-                                              : st->cursor_surf->w,
-                      st->cursor_surf->w, st->cursor_surf->h,
+                                              : st->cursor_surf->buf_w,
+                      st->cursor_surf->buf_w, st->cursor_surf->buf_h,
                       st->cursor_surf->hotspot_x,
                       st->cursor_surf->hotspot_y);
     } else {
@@ -3838,6 +4193,9 @@ static void _wl_fini(vt_backend_t *self) {
     _xwl_stop(st);
     _layer_shell_global_destroy(st);
     _title_cache_free_all();
+#if defined(VT_HAVE_FREETYPE)
+    _ssd_title_font_fini();
+#endif
     _input_fini(st);
     _xkb_fini(st);
     if (st->drm_src) { wl_event_source_remove(st->drm_src); st->drm_src = NULL; }
@@ -3959,6 +4317,33 @@ static int _wl_test_input(vt_backend_t *self, const char *spec) {
      * _kbd_key handler libinput feeds), so integration harnesses can
      * type into panel search bars and drive menus. Uppercase names
      * (e.g. "A", "F1") auto-apply Shift. */
+    if (strncmp(spec, "keydown ", 8) == 0 ||
+        strncmp(spec, "keyup ", 6) == 0) {
+        /* hold/release a modifier for multi-event gestures (e.g.
+         * Super+right-drag resize): "key" taps, these stay held */
+        bool down = spec[0] == 'k' && spec[3] == 'd';
+        const char *name = spec + (down ? 8 : 6);
+        while (*name == ' ') name++;
+        if (!*name) return -1;
+#if defined(VT_HAVE_XKBCOMMON)
+        xkb_keysym_t sym = xkb_keysym_from_name(name, 0);
+        if (sym == XKB_KEY_NoSymbol) {
+            vt_logw("wayland: test-input: unknown key '%s'", name);
+            return -1;
+        }
+        for (xkb_keycode_t kc = 8; kc < 256; kc++) {
+            if (xkb_state_key_get_one_sym(st->xkb_st, kc) == sym) {
+                _kbd_key(st, (uint32_t)(kc - 8), down);
+                return 0;
+            }
+        }
+        vt_logw("wayland: test-input: no keycode for '%s'", name);
+        return -1;
+#else
+        (void)name;
+        return -1;
+#endif
+    }
     if (strncmp(spec, "key ", 4) == 0) {
         const char *name = spec + 4;
         while (*name == ' ') name++;
@@ -4094,3 +4479,17 @@ vt_backend_t *_vt_backend_wayland_new(void) {
 }
 
 #endif
+
+/* XWayland display environment for IPC consumers (panel launcher,
+ * session autostart): the compositor's own setenv(DISPLAY) cannot
+ * cross process boundaries — siblings that spawn X11 apps must ASK. */
+bool _vt_backend_wl_xwl_env_impl(char *d, size_t dn, char *a, size_t an) {
+    _wl_state_t *st = _wls;
+    if (!st || !st->xwl_enabled) return false;
+    int disp = _xwl_display();
+    if (disp < 0) return false;
+    if (d && dn) snprintf(d, dn, ":%d", disp);
+    const char *af = _xwl_auth_file();
+    if (a && an) snprintf(a, an, "%s", af ? af : "");
+    return true;
+}

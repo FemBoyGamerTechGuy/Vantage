@@ -36,6 +36,14 @@ typedef struct _wl_surf {
     uint32_t *own;                    /* backing store for pixels */
     size_t   own_cap;                 /* capacity in uint32 units */
     int32_t  w, h;
+    /* Committed BUFFER dimensions — the only safe bounds for reading
+     * ->pixels. During a pending interactive resize (and any configure
+     * the client has not acked with a matching buffer yet) w/h are
+     * already the NEW configured size while pixels is still the OLD,
+     * smaller buffer: blitting w*h would read past the allocation
+     * (heap-buffer-overflow, caught by ASan in the SSD edge-resize
+     * harness probe). Paint loops use min(buf, configured). */
+    int32_t  buf_w, buf_h;
     int32_t  stride;                  /* row stride in uint32 units */
     int32_t  dx, dy;                  /* attach offset */
     int      x, y;                    /* composited position */
@@ -91,6 +99,7 @@ typedef struct _xdg_toplevel {
     bool maximized, fullscreen, resizing, activated, minimized;
     char *title;
     char *app_id;
+    int32_t min_w, min_h, max_w, max_h;   /* xdg size hints; 0 = unset */
 } _xdg_toplevel_t;
 
 /* xdg_positioner state (popup placement) — parsed for real, so GTK
@@ -210,13 +219,22 @@ typedef struct {
     int cur_img_w, cur_img_h, cur_img_hx, cur_img_hy;
     bool cur_client_set;               /* client provided a cursor */
     _wl_surf_t *cursor_surf;
+    /* shape sets: 0=default arrow, 1=E/W resize, 2=N/S, 3=NW/SE, 4=NE/SW.
+     * The ACTIVE image stays in cursor_img (the blit/KMS paths do not
+     * change); switching shapes copies the set in and re-applies. */
+    int cur_shape;                     /* current shape index 0..4 */
+    uint32_t cur_shape_img[5][64 * 64];
+    int cur_shape_w[5], cur_shape_h[5], cur_shape_hx[5], cur_shape_hy[5];
     uint32_t mods_depressed;           /* current keyboard modifiers */
 
     /* interactive move/resize (xdg toplevel requests + Super+drag) */
     bool op_active;                    /* interactive op in progress */
     bool op_resize;
+    uint8_t op_edges;                  /* grabbed edge bits: 1=E 2=S 4=W 8=N
+                                          (same encoding as the X11 WM) */
     _wl_surf_t *op_surf;
     int op_grab_x, op_grab_y;
+    int op_start_x, op_start_y;        /* surface origin at grab (edge math) */
     int op_start_w, op_start_h;
     uint64_t op_last_geo_us;           /* geometry-event throttle stamp */
 } _wl_state_t;
@@ -227,6 +245,16 @@ extern _wl_state_t *_wls;
 #define _WL_SSD_BORDER 2
 #define _WL_SSD_TITLE  26
 #define _WL_SSD_BTN    22
+/* interactive edge-grab margin: the visible 2px border plus a few
+ * pixels of the client edge (invisible resize borders overlapping
+ * the content, as every mainstream WM does). Enough to grab reliably,
+ * thin enough not to eat scrollbar arrows. */
+#define _WL_SSD_RESIZE_MARGIN 8
+
+/* geometry broadcast rate during interactive move/resize: the pager
+ * must track the drag CONTINUOUSLY (~30 fps), not catch up on release
+ * (the reported "pager visibly lags behind the window"). */
+#define _WL_GEO_EVENT_INTERVAL_US 33000
 
 /* ------------------------------------------------- backend-core exports */
 /* Defined in vt-backend-wayland.c; used by the protocol modules. */

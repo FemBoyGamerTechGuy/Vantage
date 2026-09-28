@@ -103,6 +103,12 @@ void vt_ipc_free(vt_ipc_t *ipc) {
     for (size_t i = 0; i < ipc->n_clients; i++) {
         if (ipc->clients[i].fd >= 0) close(ipc->clients[i].fd);
         vt_free(ipc->clients[i].rbuf);
+        /* the deferred event queue: a client that disconnected (or
+         * shut down with the WM) while its socket was full leaves
+         * whole frames queued here — _drop_client frees it on the
+         * error path, but the final teardown path forgot it (32 KB
+         * LSan leak after the drag-burst flood). */
+        vt_free(ipc->clients[i].obuf);
     }
     if (ipc->is_server && ipc->path) unlink(ipc->path);
     vt_free(ipc->path);
@@ -468,6 +474,16 @@ static int _serve_client(vt_ipc_t *ipc, _client_t *c) {
     if (m.id == VT_IPC_MSG_SUBSCRIBE) {
         c->subscribed = true;
         vt_free(m.payload);
+        /* answer the subscription like any other request: the panel's
+         * client (and any future one) waits for a response — the old
+         * early return made every subscriber time out after 2 s while
+         * still being subscribed */
+        vt_ipc_msg_t ack = { .id = m.id, .type = VT_IPC_MSG_RESPONSE,
+                             .len = 0 };
+        uint8_t *wbuf; size_t wlen;
+        vt_ipc_encode(&ack, &wbuf, &wlen);
+        _send_all(c->fd, wbuf, wlen);
+        vt_free(wbuf);
         return VT_IPC_OK;
     }
     vt_ipc_msg_t resp = {0};

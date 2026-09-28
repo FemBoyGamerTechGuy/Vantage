@@ -409,6 +409,51 @@ int main(int argc, char **argv) {
 
     /* 4. XDG autostart (system + user) */
     vt_session_autostart_load(s);
+    if (kind == VT_BACKEND_WAYLAND) {
+        /* X11 autostart apps need the compositor's Xwayland DISPLAY —
+         * which the WM exports on its IPC socket (its own setenv
+         * cannot cross process boundaries). Wait for the WM socket,
+         * ask once, and set DISPLAY/XAUTHORITY for the autostart
+         * children; the panel launcher does the same dance per launch. */
+        for (int i = 0; i < 100; i++) {
+            char sock[512];
+            snprintf(sock, sizeof(sock), "%s/vantage.sock",
+                     vt_runtime_dir());
+            if (access(sock, F_OK) == 0) break;
+            vt_session_supervise(s);
+            vt_time_sleep_ms(100);
+        }
+        char sock[512];
+        snprintf(sock, sizeof(sock), "%s/vantage.sock", vt_runtime_dir());
+        vt_ipc_t *ipc = vt_ipc_new_client(sock);
+        if (ipc) {
+            vt_ipc_msg_t resp = {0};
+            for (int i = 0; i < 80; i++) {   /* Xwayland may still start */
+                if (vt_ipc_call(ipc, VT_IPC_MSG_WM_XWL_ENV, "", 0,
+                                &resp, 500) == VT_IPC_OK &&
+                    resp.payload && resp.len) {
+                    const char *p = (const char *)resp.payload;
+                    const char *dl = strstr(p, "display=");
+                    const char *al = strstr(p, "xauthority=");
+                    if (dl && *(dl + 8)) {
+                        char disp[64] = "", auth[512] = "";
+                        sscanf(dl, "display=%63s", disp);
+                        if (al) sscanf(al, "xauthority=%511s", auth);
+                        setenv("DISPLAY", disp, 1);
+                        if (auth[0]) setenv("XAUTHORITY", auth, 1);
+                        vt_logi("session: Xwayland for autostart apps: "
+                                "DISPLAY=%s", disp);
+                        vt_ipc_msg_free(&resp);
+                        break;
+                    }
+                    vt_ipc_msg_free(&resp);
+                }
+                vt_session_supervise(s);
+                vt_time_sleep_ms(100);
+            }
+            vt_ipc_free(ipc);
+        }
+    }
     vt_session_autostart_run(s);
 
     /* 5. session IPC server */

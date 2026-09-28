@@ -31,16 +31,27 @@ typedef struct {
 
 typedef void (*vp_wm_changed_cb)(gpointer user);
 
+/* geometry-only callback: fires on window-geometry events (drag/
+ * resize live updates) WITHOUT a full model re-query — the pager
+ * redraws from the in-place update at the event rate (~30 fps). */
+typedef void (*vp_wm_geometry_cb)(gpointer user);
+
 typedef struct {
     GPtrArray   *wins;         /* vp_win_t*, ownership */
     gint         ws_count;
     gint         ws_cur;
     vp_wm_changed_cb on_change;
     gpointer     user;
+    vp_wm_geometry_cb on_geometry;
+    gpointer     geo_user;
     guint        poll_id;      /* g_timeout source */
+    guint        coalesce_id;  /* one-shot structural refresh */
+    gpointer     watch_id;     /* GSource watching the WM event socket */
     vp_ipc_t    *ipc;
     guint        misses;       /* consecutive dead WM calls */
     guint        have_ipc : 1;
+    guint        watch_attached : 1;
+    guint        xwl_confirmed : 1;
 } vp_wm_t;
 
 vp_wm_t *vp_wm_new(vp_wm_changed_cb cb, gpointer user);
@@ -48,6 +59,16 @@ void     vp_wm_free(vp_wm_t *wm);
 
 /* full refresh (query + events drain); TRUE when something changed */
 gboolean vp_wm_refresh(vp_wm_t *wm);
+
+/* live geometry updates without a round-trip: the WM's geometry
+ * events carry x/y/w/h. Installs the callback for them. */
+void vp_wm_set_geometry_cb(vp_wm_t *wm, vp_wm_geometry_cb cb, gpointer user);
+
+/* XWayland support: ask the WM for the Xwayland DISPLAY/XAUTHORITY
+ * and export them into this process, so apps launched by the panel
+ * (GAppInfo children inherit our env) can open X11 windows. Idempotent;
+ * retries until Xwayland is up. TRUE when a display is available. */
+gboolean vp_wm_xwl_env_apply(vp_wm_t *wm);
 
 /* actions */
 void vp_wm_focus(vp_wm_t *wm, guint32 id);

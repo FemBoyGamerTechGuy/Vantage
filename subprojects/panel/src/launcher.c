@@ -60,6 +60,7 @@ typedef struct {
     GPtrArray  *apps;       /* _app_t* */
     int         cur_cat;
     char        filter[64];
+    gpointer    wm;         /* vp_wm_t — XWayland env queries at launch */
 } _launcher_t;
 
 static _launcher_t L = {0};
@@ -181,6 +182,13 @@ static GtkWidget *_icon_for_app(GAppInfo *info, int px) {
 
 static void _launch(_app_t *a) {
     if (!a) return;
+    /* XWayland apps: this process cannot inherit the compositor's
+     * DISPLAY/XAUTHORITY (setenv does not cross process boundaries) —
+     * ask the WM for the live Xwayland display and export it BEFORE
+     * spawning, so X11 apps launched from the Programs menu actually
+     * start under the Wayland session. Native Wayland apps are
+     * unaffected: WAYLAND_DISPLAY is already ours and GTK prefers it. */
+    vp_wm_xwl_env_apply(L.wm);
     GError *err = NULL;
     if (!g_app_info_launch(a->info, NULL, NULL, &err)) {
         g_warning("launcher: cannot launch %s: %s",
@@ -383,6 +391,5 @@ GtkWidget *launcher_button_new(void) {
 }
 
 void launcher_set_model(gpointer wm) {
-    (void)wm;   /* launching is GAppInfo-based; the WM model is unused
-                   here but kept in the interface for symmetry */
+    L.wm = wm;   /* for XWayland DISPLAY queries at launch time */
 }

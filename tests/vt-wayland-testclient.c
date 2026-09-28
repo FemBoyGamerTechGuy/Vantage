@@ -14,6 +14,9 @@
 #endif
 #include <wayland-client.h>
 #include "xdg-shell-client-protocol.h"
+#if defined(VT_HAVE_XDG_DECORATION)
+#include "xdg-decoration-client-protocol.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +30,9 @@ static struct wl_compositor *compositor = NULL;
 static struct wl_shm *shm = NULL;
 static struct xdg_wm_base *wm_base = NULL;
 static struct wl_seat *seat = NULL;
+#if defined(VT_HAVE_XDG_DECORATION)
+static struct zxdg_decoration_manager_v1 *decor_mgr = NULL;
+#endif
 static int have_globals = 0;
 
 static void _registry_global(void *data, struct wl_registry *r, uint32_t name,
@@ -40,6 +46,11 @@ static void _registry_global(void *data, struct wl_registry *r, uint32_t name,
         wm_base = wl_registry_bind(r, name, &xdg_wm_base_interface, 2);
     else if (!strcmp(iface, "wl_seat"))
         seat = wl_registry_bind(r, name, &wl_seat_interface, 4);
+#if defined(VT_HAVE_XDG_DECORATION)
+    else if (!strcmp(iface, "zxdg_decoration_manager_v1"))
+        decor_mgr = wl_registry_bind(r, name,
+                                     &zxdg_decoration_manager_v1_interface, 1);
+#endif
 }
 
 static void _registry_global_remove(void *data, struct wl_registry *r,
@@ -187,16 +198,30 @@ int main(int argc, char **argv) {
     bool popup_mode = false;      /* xdg_popup lifecycle (menus) */
     bool multipool_mode = false;  /* two shm pools alternating buffers —
                                     * the exact crash that killed real apps */
+    bool ssd_mode = false;        /* request SERVER-side decorations via
+                                    * xdg-decoration: exercises the compositor's
+                                    * SSD frame + interactive edge resize */
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--keymap-only")) keymap_only = true;
         else if (!strcmp(argv[i], "--popup")) popup_mode = true;
         else if (!strcmp(argv[i], "--multipool")) multipool_mode = true;
-        else if (argc > 1 && i == 1) color = (unsigned)strtoul(argv[1], NULL, 0) | 0xff000000;
+        else if (!strcmp(argv[i], "--ssd")) ssd_mode = true;
     }
-    if (argc > 2 && !popup_mode && !multipool_mode && !keymap_only)
-        width = atoi(argv[2]);
-    if (argc > 3 && !popup_mode && !multipool_mode && !keymap_only)
-        height = atoi(argv[3]);
+    /* positional arguments (color [w [h]]) — counted across flags so
+     * "--ssd 0x112233 300 200" and "0x112233 300 200" both work */
+    {
+        const char *pos[3] = { NULL, NULL, NULL };
+        int np = 0;
+        for (int i = 1; i < argc && np < 3; i++) {
+            if (argv[i][0] == '-') continue;
+            pos[np++] = argv[i];
+        }
+        if (pos[0]) color = (unsigned)strtoul(pos[0], NULL, 0) | 0xff000000;
+        if (pos[1] && !popup_mode && !multipool_mode && !keymap_only)
+            width = atoi(pos[1]);
+        if (pos[2] && !popup_mode && !multipool_mode && !keymap_only)
+            height = atoi(pos[2]);
+    }
     if (popup_mode) { width = 240; height = 120; }
     if (multipool_mode) { width = 200; height = 100; }
 
@@ -246,6 +271,20 @@ int main(int argc, char **argv) {
     xdg_toplevel_add_listener(tl, &_toplevel_listener, NULL);
     xdg_toplevel_set_title(tl, "Vantage Wayland Test");
     xdg_toplevel_set_app_id(tl, "vantage.wltest");
+#if defined(VT_HAVE_XDG_DECORATION)
+    if (ssd_mode && decor_mgr) {
+        /* ask the compositor for SERVER-side decorations — the frame
+         * with the interactive edge-resize borders. The mode the
+         * compositor grants arrives as a configure event; we print it
+         * so tests can assert the frame is actually drawn. */
+        struct zxdg_toplevel_decoration_v1 *dec =
+            zxdg_decoration_manager_v1_get_toplevel_decoration(decor_mgr, tl);
+        zxdg_toplevel_decoration_v1_set_mode(
+            dec, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+        printf("ssd requested\n");
+        fflush(stdout);
+    }
+#endif
     wl_surface_commit(surf);
     /* wait for the initial configure (bail out on a dead connection) */
     while (!configured) {

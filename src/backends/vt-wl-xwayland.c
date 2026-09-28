@@ -1130,9 +1130,22 @@ bool _xwl_start(_wl_state_t *st) {
             continue;
         }
         if (pr < 0 && errno != EINTR) break;
-        if (waitpid(pid, NULL, WNOHANG) != 0) {
-            vt_logw("xwayland: process exited before reporting a "
-                    "display number");
+        int wst = 0;
+        if (waitpid(pid, &wst, WNOHANG) != 0) {
+            if (WIFEXITED(wst) && WEXITSTATUS(wst) == 127) {
+                vt_logw("xwayland: executable not found in PATH "
+                        "(execvp failed) — X11 apps stay unavailable. "
+                        "Install Xwayland (xorg-xwayland / "
+                        "xwayland / xserver-xorg-xwayland)");
+            } else if (WIFSIGNALED(wst)) {
+                vt_logw("xwayland: killed by signal %d before "
+                        "reporting a display number",
+                        WTERMSIG(wst));
+            } else {
+                vt_logw("xwayland: process exited (status %d) before "
+                        "reporting a display number",
+                        WIFEXITED(wst) ? WEXITSTATUS(wst) : wst);
+            }
             close(dispfd[0]);
             X.started = false;
             return false;

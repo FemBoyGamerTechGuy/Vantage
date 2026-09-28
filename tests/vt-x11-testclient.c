@@ -38,6 +38,14 @@
  *     (hover must not steal keyboard focus), then CLICKS window B via
  *     XTest and asserts focus moved. Prints hover-steals=no click-focus=yes
  *     on success.
+ *
+ *   vt-x11-testclient --drag-flow-probe
+ *     Continuous geometry feed during a title-bar drag: maps a framed
+ *     window, announces the title-band grab point ("grab X Y"), sleeps
+ *     1 s so the harness can attach its IPC event subscriber, then
+ *     XTest-drags the window for ~2 s at ~80 motions/s and prints
+ *     "motions=N done". The harness's subscriber counts window-geometry
+ *     events (the panel pager's live feed, throttled to ~30 fps).
  */
 
 #include <X11/Xlib.h>
@@ -145,6 +153,12 @@ int main(int argc, char **argv) {
                                  * a NARROW window with a LONG title —
                                  * used to wedge the WM forever in the
                                  * frame-paint truncation loop */
+    bool nofreeze_only = false; /* the pointer-freeze regression probe:
+                                 * plain clicks + Alt+click on a fullscreen
+                                 * window must never freeze the pointer */
+    bool dragflow_only = false; /* the pager live-feed probe: XTest-drags
+                                 * the title bar while the harness counts
+                                 * throttled window-geometry events */
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--seconds") && i + 1 < argc) seconds = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--screenshot") && i + 1 < argc) shot = argv[++i];
@@ -158,6 +172,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--focus-probe")) focus_only = true;
         else if (!strcmp(argv[i], "--motif-probe")) motif_only = true;
         else if (!strcmp(argv[i], "--narrow-probe")) narrow_only = true;
+        else if (!strcmp(argv[i], "--nofreeze-probe")) nofreeze_only = true;
+        else if (!strcmp(argv[i], "--drag-flow-probe")) dragflow_only = true;
     }
     Display *d = XOpenDisplay(NULL);
     if (!d) { fprintf(stderr, "cannot open display\n"); return 1; }
@@ -378,6 +394,220 @@ int main(int argc, char **argv) {
         XDestroyWindow(d, b);
         XCloseDisplay(d);
         return (hover_ok && click_ok) ? 0 : 1;
+    }
+
+    if (nofreeze_only) {
+        /* REGRESSION PROBE — "opening any app locks the whole DE".
+         *
+         * A GrabModeSync passive grab on plain Button1 once stole the
+         * very first click into every framed window and froze the
+         * entire pointer event stream until the WM called XAllowEvents
+         * — which the plain-click focus path never did. One click into
+         * a fresh app = no mouse anywhere, ever again.
+         *
+         * This probe maps a normal window, clicks it TWICE through
+         * XTest, moves the pointer, then Alt+clicks a FULLSCREEN
+         * window (the other path where a passive grab fires but no
+         * interactive op follows) and verifies the event stream is
+         * still alive afterwards. Healthy = exit 0. */
+        int s = DefaultScreen(d);
+        Window root = RootWindow(d, s);
+        Window w = XCreateSimpleWindow(d, root, 200, 200, 400, 300,
+                                       0, 0, 0x303440);
+        XStoreName(d, w, "NoFreeze probe");
+        XSelectInput(d, w, StructureNotifyMask | ButtonPressMask |
+                          PointerMotionMask);
+        XMapWindow(d, w);
+        /* wait for management (reparent) */
+        for (int i = 0; i < 60; i++) {
+            Window r_ret, p_ret, *kids = NULL; unsigned int nk = 0;
+            XQueryTree(d, w, &r_ret, &p_ret, &kids, &nk);
+            if (kids) XFree(kids);
+            if (p_ret != root) break;
+            msleep(50);
+        }
+        msleep(300);
+        /* drain management events */
+        XSync(d, False);
+        while (XPending(d)) { XEvent ev; XNextEvent(d, &ev); }
+
+        int delivered = 0, motion = 0;
+#if defined(VT_HAVE_XTST)
+        int evb, errb, vmaj, vmin;
+        if (XTestQueryExtension(d, &evb, &errb, &vmaj, &vmin)) {
+            Window child;
+            int ax, ay;
+            XTranslateCoordinates(d, w, root, 60, 60, &ax, &ay, &child);
+            XTestFakeMotionEvent(d, -1, ax, ay, CurrentTime);
+            XFlush(d); msleep(80);
+            XTestFakeButtonEvent(d, 1, True, CurrentTime);
+            XFlush(d); msleep(50);
+            XTestFakeButtonEvent(d, 1, False, CurrentTime);
+            XFlush(d); msleep(150);
+            XTranslateCoordinates(d, w, root, 300, 200, &ax, &ay, &child);
+            XTestFakeMotionEvent(d, -1, ax, ay, CurrentTime);
+            XFlush(d); msleep(80);
+            XTestFakeButtonEvent(d, 1, True, CurrentTime);
+            XFlush(d); msleep(50);
+            XTestFakeButtonEvent(d, 1, False, CurrentTime);
+            XFlush(d); msleep(200);
+            XSync(d, False);
+            while (XPending(d)) {
+                XEvent ev; XNextEvent(d, &ev);
+                if (ev.type == ButtonPress && ev.xbutton.window == w) delivered++;
+                if (ev.type == MotionNotify) motion++;
+            }
+            printf("plain-clicks-delivered=%d motion-events=%d\n",
+                   delivered, motion);
+
+            /* PATH 2: Alt+click on a FULLSCREEN window — the passive
+             * grab fires but the WM refuses the interactive op; it
+             * must still thaw the pointer or everything freezes. */
+            XSelectInput(d, w, StructureNotifyMask | PropertyChangeMask);
+            Atom net_state = XInternAtom(d, "_NET_WM_STATE", False);
+            Atom net_fs = XInternAtom(d, "_NET_WM_STATE_FULLSCREEN", False);
+            XEvent msg = { .type = ClientMessage };
+            msg.xclient.window = w;
+            msg.xclient.message_type = net_state;
+            msg.xclient.format = 32;
+            msg.xclient.data.l[0] = 1;      /* _NET_WM_STATE_ADD */
+            msg.xclient.data.l[1] = (long)net_fs;
+            msg.xclient.data.l[2] = 0;
+            XSendEvent(d, root, False,
+                       SubstructureRedirectMask | SubstructureNotifyMask, &msg);
+            XFlush(d);
+            bool fs_ok = false;
+            for (int i = 0; i < 40; i++) {
+                msleep(50);
+                Atom act_type; int fmt; unsigned long n, left;
+                unsigned char *data = NULL;
+                if (XGetWindowProperty(d, w, net_state, 0, 64, False,
+                                       XA_ATOM, &act_type, &fmt, &n, &left,
+                                       &data) == Success && data) {
+                    Atom *states = (Atom *)data;
+                    for (unsigned long k = 0; k < n; k++)
+                        if (states[k] == net_fs) fs_ok = true;
+                    XFree(data);
+                }
+                if (fs_ok) break;
+            }
+            printf("fullscreen-granted=%s\n", fs_ok ? "yes" : "no");
+            msleep(200);
+
+            /* Alt+click into the fullscreen window */
+            XSelectInput(d, w, ButtonPressMask | PointerMotionMask);
+            XSync(d, False);
+            while (XPending(d)) { XEvent ev; XNextEvent(d, &ev); }
+            KeyCode alt = XKeysymToKeycode(d, XK_Alt_L);
+            XTranslateCoordinates(d, w, root, 200, 150, &ax, &ay, &child);
+            XTestFakeMotionEvent(d, -1, ax, ay, CurrentTime);
+            XFlush(d); msleep(80);
+            XTestFakeKeyEvent(d, alt, True, CurrentTime);
+            XFlush(d); msleep(60);
+            XTestFakeButtonEvent(d, 1, True, CurrentTime);
+            XFlush(d); msleep(80);
+            XTestFakeButtonEvent(d, 1, False, CurrentTime);
+            XFlush(d); msleep(60);
+            XTestFakeKeyEvent(d, alt, False, CurrentTime);
+            XFlush(d); msleep(200);
+
+            /* is the pointer event stream still alive? probe with
+             * motion into the window */
+            int alive = 0;
+            for (int i = 0; i < 6; i++) {
+                XTestFakeMotionEvent(d, -1, ax + i * 9, ay + i * 6, CurrentTime);
+                XFlush(d); msleep(50);
+            }
+            XSync(d, False);
+            while (XPending(d)) {
+                XEvent ev; XNextEvent(d, &ev);
+                if (ev.type == MotionNotify) alive++;
+            }
+            printf("post-altclick-motion=%d\n", alive);
+            bool ok = (delivered >= 2) && (alive >= 1);
+            printf("verdict=%s\n", ok ? "healthy" : "FROZEN");
+            fflush(stdout);
+            XDestroyWindow(d, w);
+            XCloseDisplay(d);
+            return ok ? 0 : 1;
+        }
+#endif
+        printf("verdict=SKIP (no XTest)\n");
+        XDestroyWindow(d, w);
+        XCloseDisplay(d);
+        return 0;
+    }
+
+    if (dragflow_only) {
+        /* PAGER LIVE-FEED PROBE — "the pager/preview updates too slowly
+         * while moving a window". Drags the title bar through REAL
+         * XTest events (the same user path as a mouse drag) for ~2 s at
+         * ~80 motions/s while the harness's IPC subscriber counts
+         * window-geometry broadcasts — throttled to ~30 fps by the WM
+         * (op_last_geo_us / 33 ms), the feed the panel's pager redraws
+         * from. Prints "grab X Y" first so the harness can attach its
+         * subscriber BEFORE the press, then "motions=N done". */
+        int s = DefaultScreen(d);
+        Window root = RootWindow(d, s);
+        Window w = make_window(d, "Drag Flow Probe", 200, 240, 300, 200,
+                               0x9a3a5f);
+        XMapWindow(d, w);
+        XFlush(d);
+        /* wait for the WM to manage it (reparent into a frame) */
+        Window parent = None;
+        for (int t = 0; t < 50; t++) {
+            Window r, *kids = NULL;
+            unsigned int nk = 0;
+            if (XQueryTree(d, w, &r, &parent, &kids, &nk)) {
+                if (kids) XFree(kids);
+                if (parent != root && parent != None) break;
+            }
+            msleep(50);
+        }
+        if (parent == root || parent == None) {
+            printf("framed=no\n");
+            fflush(stdout);
+            XCloseDisplay(d);
+            return 1;
+        }
+        /* true client origin after WM placement (workarea clamp) */
+        int wx = 0, wy = 0;
+        Window cret;
+        XTranslateCoordinates(d, w, root, 0, 0, &wx, &wy, &cret);
+        /* SSD title band: 26 px title + 2 px border ABOVE the client —
+         * grab its middle, exactly like the Wayland geo-flow probe */
+        int gx = wx + 150, gy = wy - 14;
+        printf("grab %d %d\n", gx, gy);
+        fflush(stdout);
+        msleep(1000);   /* the harness attaches its subscriber now */
+#if defined(VT_HAVE_XTST)
+        XTestFakeMotionEvent(d, -1, gx, gy, CurrentTime);
+        XFlush(d); msleep(80);
+        XTestFakeButtonEvent(d, 1, True, CurrentTime);
+        XFlush(d); msleep(80);
+        int motions = 0;
+        for (double t = 0.0; t < 2.0; t += 0.012) {
+            int dx = (int)(220 * t / 2.0);
+            int dy = (int)(60 * t / 2.0);
+            XTestFakeMotionEvent(d, -1, gx + dx, gy + dy, CurrentTime);
+            XFlush(d);
+            motions++;
+            msleep(12);
+        }
+        XTestFakeButtonEvent(d, 1, False, CurrentTime);
+        XFlush(d); msleep(150);
+        printf("motions=%d done\n", motions);
+        fflush(stdout);
+        XDestroyWindow(d, w);
+        XCloseDisplay(d);
+        return 0;
+#else
+        printf("motions=0 done (no XTest)\n");
+        fflush(stdout);
+        XDestroyWindow(d, w);
+        XCloseDisplay(d);
+        return 0;
+#endif
     }
 
     Window w1 = None, w2 = None;

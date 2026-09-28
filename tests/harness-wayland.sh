@@ -137,7 +137,7 @@ cat > "$WORK/data/applications/vt-harness-probe.desktop" <<'DESK'
 [Desktop Entry]
 Type=Application
 Name=Zz Harness Probe
-Exec=/bin/sh -c 'echo launched > $WORK/wl-launch-marker'
+Exec=/bin/sh -c 'echo "launched DISPLAY=$DISPLAY XAUTHORITY=$XAUTHORITY WAYLAND=$WAYLAND_DISPLAY" > $WORK/wl-launch-marker'
 Icon=vt-harness-probe
 Categories=Utility;
 DESK
@@ -722,6 +722,33 @@ else
   bad "application did not launch from the menu"
 fi
 
+# --- XWayland env through the REAL user path: the panel exports the
+# --- Xwayland DISPLAY/XAUTHORITY to launched apps (the reported
+# --- "X11 apps cannot be launched through XWayland": the panel's own
+# --- env has no DISPLAY — setenv cannot cross process boundaries).
+# --- The marker records what the launched app actually SAW. This is
+# --- the STANDALONE-compositor phase: Xwayland + panel both run under
+# --- the headless WM above.
+if [ -n "$LAUNCHED" ]; then
+  XWL_DISPLAY1=$(grep -o 'xwayland: ready — DISPLAY=:[0-9]*' "$WORK/wm.log" \
+                 2>/dev/null | head -1 | grep -o ':[0-9]*$')
+  if [ -n "$XWL_DISPLAY1" ]; then
+    grep -q "DISPLAY=$XWL_DISPLAY1" "$WORK/wl-launch-marker" \
+      && ok "panel-launched app got the Xwayland DISPLAY ($XWL_DISPLAY1) — X11 apps launch" \
+      || bad "panel-launched app lacked DISPLAY=$XWL_DISPLAY1: $(cat "$WORK/wl-launch-marker")"
+    grep -q "WAYLAND=$SOCKET" "$WORK/wl-launch-marker" \
+      && ok "panel-launched app keeps WAYLAND_DISPLAY (native apps unaffected)" \
+      || bad "panel-launched app lost WAYLAND_DISPLAY: $(cat "$WORK/wl-launch-marker")"
+    # and the xwl-env IPC answers the same truth the panel used
+    XWLENV_OUT=$(WAYLAND_DISPLAY="$SOCKET" "$(vb vantage-remote)" xwl-env 2>/dev/null || true)
+    echo "$XWLENV_OUT" | grep -q "display=$XWL_DISPLAY1" \
+      && ok "vantage-remote xwl-env reports the live display" \
+      || bad "xwl-env IPC wrong: '$XWLENV_OUT'"
+  else
+    bad "standalone compositor never started Xwayland (no ready line)"
+  fi
+fi
+
 # --- menu must close after launching (click went through) ---
 # The cursor is moved OUT of the scanned band first: it sits at the
 # last click position, dead inside the menu area, and a visible
@@ -1031,6 +1058,184 @@ else
   bad "X11 drag window never rendered under Xwayland (composite path?)"
 fi
 wait "${DRAG_PID:-}" 2>/dev/null
+
+# ------------------------------------------------- SSD edge resize
+# "Native Wayland applications have black bars around their windows ...
+# they appear to provide some form of window-resizing area, but the
+# actual resize functionality does not seem to be implemented": the
+# bars ARE the SSD frame; resizing them was bottom-right-only math
+# with no cursor affordance. Pins: every edge resizes with EDGE-AWARE
+# geometry (W/N move the origin), corners work, the model tracks
+# mid-drag, and the resize cursor shows over the edge.
+echo "== harness-wayland: SSD frame edge-resize (native Wayland windows) =="
+RSZ_LOG="$WORK/ssd-resize.log"
+# long-lived: the whole section (6 resizes + cursor + flow probe) takes
+# ~9 s — the client's default 6 s lifetime would kill the window mid-
+# section and every later read would see garbage
+VT_TESTCLIENT_SECONDS=30 "$(tc vt-wayland-testclient)" --ssd 0xff5a9a3a 300 200 > "$RSZ_LOG" 2>&1 &
+RSZ_PID=$!
+sleep 1.2
+wgeo() { "$(vb vantage-remote)" list 2>/dev/null | grep "Vantage Wayland Test" \
+           | head -1 | sed -E 's/.*\t(-?[0-9]+)\t(-?[0-9]+)\t([0-9]+)\t([0-9]+)$/\1 \2 \3 \4/'; }
+rsz_case() {  # name edge dx dy exp_dx exp_dy exp_dw exp_dh
+  local name="$1" edge="$2" dx="$3" dy="$4" \
+        edx="$5" edy="$6" edw="$7" edh="$8"
+  local g; g=$(wgeo); read -r X Y WD H <<< "$g"
+  local fx=$((X - 2)) fy=$((Y - 28)) fw=$((WD + 4)) fh=$((H + 28)) px py
+  case "$edge" in
+    E)  px=$((fx + fw - 4)); py=$((fy + 28 + H / 2)) ;;
+    W)  px=$((fx + 4));      py=$((fy + 28 + H / 2)) ;;
+    N)  px=$((fx + fw / 2)); py=$((fy + 4)) ;;
+    S)  px=$((fx + fw / 2)); py=$((fy + fh - 4)) ;;
+    SE) px=$((fx + fw - 4)); py=$((fy + fh - 4)) ;;
+    NW) px=$((fx + 4));      py=$((fy + 4)) ;;
+  esac
+  ti "motion x=$px y=$py"
+  sleep 0.15
+  ti "press b=1"
+  sleep 0.1
+  ti "motion x=$((px + dx)) y=$((py + dy))"
+  sleep 0.15
+  ti "release b=1"
+  sleep 0.25
+  local g2; g2=$(wgeo); read -r X2 Y2 W2 H2 <<< "$g2"
+  if [ $((X2 - X)) -eq $edx ] && [ $((Y2 - Y)) -eq $edy ] && \
+     [ $((W2 - WD)) -eq $edw ] && [ $((H2 - H)) -eq $edh ]; then
+    ok "SSD resize: $name"
+  else
+    bad "SSD resize $name: want d=($edx,$edy,$edw,$edh) got ($((X2-X)),$((Y2-Y)),$((W2-WD)),$((H2-H)))"
+  fi
+}
+rsz_case "EAST edge grows width, origin fixed"    E  60  0   0  0  60  0
+rsz_case "WEST edge grows width, origin moves"    W -40  0 -40  0  40  0
+rsz_case "NORTH edge grows height, origin moves"  N   0 -30   0 -30  0  30
+rsz_case "SOUTH edge grows height"                S   0  50   0  0   0  50
+rsz_case "SE corner both axes"                    SE 30  30   0  0  30  30
+rsz_case "NW corner both axes + origin"           NW -25 -25 -25 -25 25  25
+
+# resize cursor over the east edge: the double-arrow sprite (white
+# shaft pixels) replaces the arrow while hovering the resize zone
+RG=$(wgeo); read -r X Y WD H <<< "$RG"
+ti "motion x=$((X + WD - 1)) y=$((Y + H / 2))"
+sleep 0.3
+rm -f /tmp/vantage-wayland.ppm
+kill -USR1 "$WM_PID" 2>/dev/null
+wait_ppm || true
+if [ -s /tmp/vantage-wayland.ppm ]; then
+  python3 - /tmp/vantage-wayland.ppm "$X" "$Y" "$WD" "$H" <<'PYCUR'
+import sys
+ppm, X, Y, W, H = sys.argv[1], *map(int, sys.argv[2:6])
+data = open(ppm, 'rb').read()
+vals, pos = [], data.find(b'P6') + 2
+while len(vals) < 3:
+    while data[pos:pos+1].isspace(): pos += 1
+    j = pos
+    while not data[j:j+1].isspace(): j += 1
+    vals.append(int(data[pos:j])); pos = j
+pos += 1
+w, h, _ = vals
+pix = data[pos:]
+cx, cy = X + W - 1, Y + H // 2
+white = 0
+for y in range(max(0, cy - 10), min(h, cy + 10)):
+    for x in range(max(0, cx - 10), min(w, cx + 10)):
+        i = (y * w + x) * 3
+        if pix[i] > 230 and pix[i+1] > 230 and pix[i+2] > 230:
+            white += 1
+sys.exit(0 if white >= 25 else 1)
+PYCUR
+  [ $? -eq 0 ] && ok "resize cursor visible over the frame edge (discoverable affordance)" \
+    || bad "no resize cursor over the frame edge"
+else
+  bad "no frame dump for the resize-cursor check"
+fi
+
+# continuous geometry feed during a drag (~30 fps throttle): the pager
+# follows the drag live instead of catching up on release
+RG=$(wgeo); read -r X Y WD H <<< "$RG"
+GEOFLOW=$(python3 - "$X" "$Y" "$WD" <<'PYFLOW'
+import os, socket, struct, sys, time
+# The WM's IPC socket (VT_IPC_DEFAULT_SOCKET, the same endpoint
+# vantage-remote connects to) — NOT a wayland-N display socket.
+# Speaking the VT-IPC protocol to the compositor's display socket gets
+# the connection killed as a broken Wayland client, and a closed
+# socket then hot-spins in recv()==b'' below (observed as a 60 s
+# harness timeout with the WM idle and healthy).
+sock = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"),
+                    "vantage.sock")
+if not os.path.exists(sock):
+    print("geo-flow: no vantage.sock IPC socket")
+    sys.exit(1)
+MAGIC, SUB, TIN = 0x56544352, 0x0005, 0x0031
+TYPE_REQ, TYPE_RESP = 1, 2
+X, Y, W = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sock)
+events = b""
+def req(msg_id, payload=b""):
+    """send a request; return the response, STASHING every event that
+    interleaves ahead of it (they are the thing we are counting)"""
+    global events
+    s.sendall(struct.pack("<IIII", MAGIC, msg_id, TYPE_REQ,
+                          len(payload)) + payload)
+    buf = b""
+    s.settimeout(5)
+    while True:
+        while len(buf) >= 16:
+            magic, mid, mtype, plen = struct.unpack("<IIII", buf[:16])
+            if magic != MAGIC:
+                buf = buf[1:]
+                continue
+            if len(buf) < 16 + plen:
+                break
+            msg = buf[16:16 + plen]
+            buf = buf[16 + plen:]
+            if mtype == TYPE_RESP:
+                return msg
+            events += msg
+        chunk = s.recv(65536)
+        if not chunk:
+            # EOF: the server closed the connection. recv() returning
+            # b'' is NOT an error and would otherwise hot-spin here
+            # forever — the 5 s socket timeout never fires on it.
+            raise RuntimeError("IPC server closed the connection")
+        buf += chunk
+req(SUB)                      # subscribe (ack consumed by req)
+req(TIN, b"spec=motion x=%d y=%d" % (X + W // 2, Y - 14))
+req(TIN, b"spec=press b=1")
+t0 = time.time()
+motions = 0
+nextm = t0
+try:
+    while time.time() - t0 < 2.0:
+        now = time.time()
+        if now < nextm:
+            time.sleep(0.002)
+            continue
+        nextm = now + 0.012
+        t = (time.time() - t0) / 2.0
+        req(TIN, ("spec=motion x=%d y=%d" %
+                  (X + W // 2 + int(220 * t), Y - 14 + int(60 * t))).encode())
+        motions += 1
+finally:
+    # ALWAYS release: a wedged compositor with a stuck grab would
+    # wedge every later check too
+    try:
+        req(TIN, b"spec=release b=1")
+    except Exception:
+        pass
+geo = events.count(b"window-geometry")
+print(f"geo-flow: motions={motions} geometry={geo}")
+sys.exit(0 if motions > 60 and 35 <= geo <= 75 else 1)
+PYFLOW
+)
+if [ $? -eq 0 ]; then
+  ok "geometry events flow continuously during a drag ($GEOFLOW — the pager's live feed)"
+else
+  bad "geometry feed not continuous during drag: $GEOFLOW"
+fi
+kill "$RSZ_PID" 2>/dev/null
+wait "$RSZ_PID" 2>/dev/null
 
 # ------------------------------------------------------------- shutdown
 # Ctrl+C (SIGINT) takes the same clean-unwind path as SIGTERM: restore,

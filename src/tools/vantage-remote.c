@@ -172,6 +172,18 @@ int main(int argc, char **argv) {
         vt_ipc_free(ipc);
         return rc;
     }
+    if (vt_streq(cmd, "xwl-env")) {
+        /* the XWayland display environment as the WM sees it — the
+         * same answer the panel launcher and session autostart use to
+         * give X11 apps their DISPLAY/XAUTHORITY */
+        vt_ipc_msg_t resp = {0};
+        int rc = _do_call(ipc, VT_IPC_MSG_WM_XWL_ENV, "", &resp);
+        if (rc == 0 && resp.payload && resp.len)
+            printf("%.*s\n", (int)resp.len, (char *)resp.payload);
+        vt_ipc_msg_free(&resp);
+        vt_ipc_free(ipc);
+        return rc;
+    }
     if (vt_streq(cmd, "launch") && argc >= 3) {
         /* join remaining args into one command line (the WM handler
          * parses key=value payloads: cmd=<line>) */

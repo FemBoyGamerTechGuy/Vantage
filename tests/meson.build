@@ -64,10 +64,29 @@ if wl_client_ok
     output: 'xdg-shell-client-protocol.h',
     command: [prog_wl_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
 
+  # xdg-decoration (SSD request mode for the resize tests)
+  xdg_decoration_xml = join_paths(wl_protocols_dir, 'unstable',
+                                  'xdg-decoration', 'xdg-decoration-unstable-v1.xml')
+  have_xdg_decoration = run_command('test', '-f', xdg_decoration_xml,
+                                    check: false).returncode() == 0
+  if have_xdg_decoration
+    xdg_decoration_client_h = custom_target('xdg-decoration-client-protocol.h',
+      input: xdg_decoration_xml,
+      output: 'xdg-decoration-client-protocol.h',
+      command: [prog_wl_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+    wl_testclient_sources = ['vt-wayland-testclient.c', xdg_shell_client_h,
+                             xdg_decoration_client_h]
+    wl_testclient_cargs = ['-DVT_HAVE_XDG_DECORATION']
+  else
+    wl_testclient_sources = ['vt-wayland-testclient.c', xdg_shell_client_h]
+    wl_testclient_cargs = []
+  endif
+
   wayland_testclient = executable('vt-wayland-testclient',
-    sources : ['vt-wayland-testclient.c', xdg_shell_client_h],
+    sources : wl_testclient_sources,
     include_directories : [vantage_includes, include_directories('.')],
     dependencies : tests_deps + [dep_wayland_client],
+    c_args : wl_testclient_cargs,
     install : true,
     install_dir : join_paths(vt_libdir, 'vantage', 'tests'),
     install_rpath : vt_extra_rpath,

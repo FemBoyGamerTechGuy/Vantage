@@ -41,6 +41,8 @@ enum {
     VP_IPC_WM_LOGOUT   = 0x002c,
     VP_IPC_WM_RESTORE  = 0x002d,
     VP_IPC_WM_WS_MOVE  = 0x0030,
+    VP_IPC_WM_TEST_INPUT = 0x0031,
+    VP_IPC_WM_XWL_ENV    = 0x0032,   /* → display=...\nxauthority=... */
     VP_IPC_WM_EVENT    = 0x0040,
     VP_IPC_WM_WS_EVENT = 0x0041,
 };

@@ -103,8 +103,20 @@ static const char *_payload_str(const vt_ipc_msg_t *m, const char *key) {
 /* ---------------------------------------------------------- events */
 static void _broadcast_win(_ctx_t *ctx, vt_window_t *w, const char *evname) {
     if (!ctx->ipc || !w) return;
-    char *line = vt_strprintf("window-%s id=%u title=%s", evname, w->id,
-                              w->title ? w->title : "");
+    char *line;
+    if (!strcmp(evname, "geometry")) {
+        /* geometry events carry the numbers so the panel can update
+         * its model WITHOUT a WM_QUERY round-trip: at the ~30 fps drag
+         * rate a full window-list query per event would hammer both
+         * sides, and the latency of that round-trip was exactly the
+         * pager lag the user saw ("updates too slowly while moving") */
+        line = vt_strprintf(
+            "window-geometry id=%u x=%d y=%d w=%d h=%d ws=%d",
+            w->id, w->x, w->y, w->w, w->h, w->workspace);
+    } else {
+        line = vt_strprintf("window-%s id=%u title=%s", evname, w->id,
+                            w->title ? w->title : "");
+    }
     vt_ipc_broadcast(ctx->ipc, VT_IPC_MSG_WM_EVENT, line,
                      (uint32_t)strlen(line));
     vt_free(line);
@@ -445,6 +457,36 @@ static int _h_ping(vt_ipc_t *ipc, const vt_ipc_msg_t *req,
     return 0;
 }
 
+/* XWayland display environment: the panel launcher and the session's
+ * autostart run in processes that CANNOT inherit the compositor's
+ * setenv(DISPLAY) — X11 apps launched from them died with "cannot
+ * open display". They ask the WM instead: on Wayland this is the
+ * compositor's own Xwayland; on X11 the WM's own DISPLAY. */
+static int _h_xwl_env(vt_ipc_t *ipc, const vt_ipc_msg_t *req,
+                      vt_ipc_msg_t *resp, void *ud) {
+    (void)ipc; (void)req;
+    _ctx_t *ctx = ud;
+    vt_wm_t *wm = ctx ? ctx->wm : NULL;
+    char out[600];
+    out[0] = 0;
+    if (wm && wm->backend) {
+        char disp[64] = "", auth[512] = "";
+        if (vt_backend_wl_xwl_env(wm->backend, disp, sizeof(disp),
+                                  auth, sizeof(auth))) {
+            snprintf(out, sizeof(out), "display=%s\nxauthority=%s\n",
+                     disp, auth);
+        } else if (wm->backend->kind == VT_BACKEND_X11) {
+            const char *d = getenv("DISPLAY");
+            const char *a = getenv("XAUTHORITY");
+            snprintf(out, sizeof(out), "display=%s\nxauthority=%s\n",
+                     d && *d ? d : "", a && *a ? a : "");
+        }
+    }
+    resp->payload = (uint8_t *)vt_strdup(out);
+    resp->len = (uint32_t)strlen(out) + 1;
+    return 0;
+}
+
 /* Clean logout for a standalone compositor run (no session manager):
  * stop the main loop — teardown restores the CRTC, returns the VT to
  * text mode and exits 0. No SIGKILL anywhere. */
@@ -725,6 +767,7 @@ int main(int argc, char **argv) {
     vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_WS_MOVE,  _h_ws_move, &ctx);
     vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_LAUNCH,   _h_launch, &ctx);
     vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_TEST_INPUT, _h_test_input, &ctx);
+    vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_XWL_ENV,  _h_xwl_env, &ctx);
     vt_ipc_register(ctx.ipc, VT_IPC_MSG_WM_LOGOUT,  _h_logout, &ctx);
     vt_logi("wm: ipc server at %s", vt_ipc_get_path(ctx.ipc));
 

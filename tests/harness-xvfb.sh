@@ -420,7 +420,11 @@ NARROW_LOG="$WORK/narrow.log"
 NARROW_PID=$!
 NMAPPED=0
 for i in $(seq 1 100); do
-  NMAPPED=$(grep -c "^mapped" "$NARROW_LOG" 2>/dev/null || echo 0)
+  # grep -c ALWAYS prints a count (0 included) — a `|| echo 0` fallback
+  # would append a second 0 on the zero case and later [ ] comparisons
+  # would see "0\n0" (integer expression expected)
+  NMAPPED=$(grep -c "^mapped" "$NARROW_LOG" 2>/dev/null)
+  NMAPPED=${NMAPPED:-0}
   [ "${NMAPPED:-0}" -ge 3 ] && break
   kill -0 "$NARROW_PID" 2>/dev/null || break
   sleep 0.05
@@ -474,6 +478,114 @@ grep -q "hover-steals=no" "$FOCUS_LOG" && ok "hover does NOT steal keyboard focu
 grep -q "click-focus=yes" "$FOCUS_LOG" && ok "click focuses the window" \
   || bad "click did not focus: $(cat "$FOCUS_LOG")"
 [ $FRC -eq 0 ] && ok "focus probe exit status 0" || bad "focus probe rc=$FRC"
+
+echo "== harness-xvfb: pointer-freeze regression (the 'any app locks the DE' bug) =="
+FREEZE_LOG="$WORK/nofreeze.log"
+"$(tc vt-x11-testclient)" --nofreeze-probe > "$FREEZE_LOG" 2>&1
+FRZRC=$?
+grep -q "plain-clicks-delivered=2" "$FREEZE_LOG" \
+  && ok "plain clicks reach the app (no sync-grab theft)" \
+  || bad "plain clicks stolen/frozen: $(cat "$FREEZE_LOG")"
+grep -q "post-altclick-motion=[1-9]" "$FREEZE_LOG" \
+  && ok "pointer alive after Alt+click on a fullscreen window" \
+  || bad "pointer FROZEN after Alt+click on fullscreen: $(cat "$FREEZE_LOG")"
+[ $FRZRC -eq 0 ] && ok "nofreeze probe exit status 0" || bad "nofreeze probe rc=$FRZRC"
+
+echo "== harness-xvfb: continuous geometry feed during a drag (~30 fps) =="
+# The pager's live feed — the X11 twin of the Wayland geo-flow probe,
+# driven through REAL XTest events (the exact user path of a mouse
+# title-bar drag). The WM throttles window-geometry broadcasts to
+# ~30 fps during drags (op_last_geo_us / 33 ms, both backends); the
+# panel's pager redraws from that feed instead of catching up on
+# release. The test client announces its grab point and settles for
+# 1 s — the subscriber below attaches in that window — then drags for
+# ~2 s at ~80 motions/s; expect ~60 events (35..75) from ~160 motions.
+DFLOW_LOG="$WORK/dragflow.log"
+"$(tc vt-x11-testclient)" --drag-flow-probe > "$DFLOW_LOG" 2>&1 &
+DFLOW_PID=$!
+DFLOW_GRAB=""
+for i in $(seq 1 100); do
+  DFLOW_GRAB=$(grep -o '^grab [0-9-]* [0-9-]*$' "$DFLOW_LOG" 2>/dev/null | head -1)
+  [ -n "$DFLOW_GRAB" ] && break
+  kill -0 "$DFLOW_PID" 2>/dev/null || break
+  sleep 0.05
+done
+XGEO=""
+if [ -n "$DFLOW_GRAB" ]; then
+  XGEO=$(python3 - <<'PYXG'
+import os, socket, struct, sys, time
+# subscribe to the WM's IPC event socket (VT_IPC_DEFAULT_SOCKET —
+# vantage.sock, the same endpoint vantage-remote connects to) and
+# count window-geometry broadcasts while the XTest drag runs
+sock = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "vantage.sock")
+if not os.path.exists(sock):
+    print("no-socket"); sys.exit(1)
+MAGIC, SUB = 0x56544352, 0x0005
+TYPE_REQ, TYPE_RESP = 1, 2
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sock)
+events = b""
+def req(msg_id, payload=b""):
+    global events
+    s.sendall(struct.pack("<IIII", MAGIC, msg_id, TYPE_REQ,
+                          len(payload)) + payload)
+    buf = b""
+    s.settimeout(5)
+    while True:
+        while len(buf) >= 16:
+            magic, mid, mtype, plen = struct.unpack("<IIII", buf[:16])
+            if magic != MAGIC:
+                buf = buf[1:]; continue
+            if len(buf) < 16 + plen:
+                break
+            msg = buf[16:16 + plen]; buf = buf[16 + plen:]
+            if mtype == TYPE_RESP:
+                return msg
+            events += msg
+        chunk = s.recv(65536)
+        if not chunk:
+            # EOF must fail fast: recv()==b'' is not an error and
+            # would otherwise hot-spin forever (no timeout fires on it)
+            raise RuntimeError("IPC server closed the connection")
+        buf += chunk
+req(SUB)          # subscribe; the ack confirms the WM is listening
+# ~1 s settle + ~2.1 s drag + tail, all inside a 3.6 s window.
+# Frames are parsed properly (a raw byte-append could split the
+# "window-geometry" string across a recv boundary and undercount).
+s.settimeout(0.25)
+buf = b""
+t0 = time.time()
+while time.time() - t0 < 3.6:
+    try:
+        chunk = s.recv(65536)
+    except socket.timeout:
+        continue
+    if not chunk:
+        break
+    buf += chunk
+    while len(buf) >= 16:
+        magic, mid, mtype, plen = struct.unpack("<IIII", buf[:16])
+        if magic != MAGIC:
+            buf = buf[1:]; continue
+        if len(buf) < 16 + plen:
+            break
+        events += buf[16:16 + plen]
+        buf = buf[16 + plen:]
+geo = events.count(b"window-geometry")
+print(f"geometry={geo}")
+sys.exit(0 if 35 <= geo <= 75 else 1)
+PYXG
+)
+fi
+wait "$DFLOW_PID" 2>/dev/null
+DFLOW_MOTIONS=$(grep -o '^motions=[0-9]*' "$DFLOW_LOG" 2>/dev/null | cut -d= -f2)
+DFLOW_GEO=$(echo "$XGEO" | grep -o 'geometry=[0-9]*' | cut -d= -f2)
+if [ -n "$DFLOW_GRAB" ] && [ "${DFLOW_MOTIONS:-0}" -gt 60 ] \
+   && [ -n "$DFLOW_GEO" ] && [ "$DFLOW_GEO" -ge 35 ] && [ "$DFLOW_GEO" -le 75 ]; then
+  ok "geometry events flow during the drag ($DFLOW_MOTIONS motions -> $DFLOW_GEO events at ~30 fps — the pager's live feed)"
+else
+  bad "geometry feed wrong during drag: motions=${DFLOW_MOTIONS:-0} geo=${DFLOW_GEO:-none} (${XGEO:-no subscriber})"
+fi
 
 echo "== harness-xvfb: pixel verification =="
 # screenshot while the second test window is still alive

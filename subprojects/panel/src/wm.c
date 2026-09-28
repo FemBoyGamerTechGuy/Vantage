@@ -3,6 +3,9 @@
  *
  * SPDX-License-Identifier: LicenseRef-Vantage-Proprietary
  */
+/* setenv() needs POSIX 2001 visibility */
+#define _POSIX_C_SOURCE 200112L
+
 #include "wm.h"
 #include "ipc.h"
 
@@ -10,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* WM_QUERY line format (stable, documented in vantage-wm.c):
  *   id \t title \t ws \t flags \t class \t app_id \t x \t y \t w \t h
@@ -108,6 +112,67 @@ static gboolean _parse_ws(vp_wm_t *wm, const char *payload) {
     return FALSE;
 }
 
+/* event-driven model updates: geometry events carry the numbers, so
+ * the model updates in place (no WM_QUERY round-trip) and the pager
+ * redraws at the event rate. Returns TRUE when a geometry event was
+ * applied. */
+static gboolean _apply_geometry_event(vp_wm_t *wm, const char *payload) {
+    /* "window-geometry id=%u x=%d y=%d w=%d h=%d ws=%d" */
+    if (strncmp(payload, "window-geometry ", 16) != 0) return FALSE;
+    guint32 id = 0;
+    gint x = 0, y = 0, w = 0, h = 0, ws = 0;
+    const char *p = payload + 16;
+    while (*p) {
+        if (sscanf(p, "id=%u", &id) == 1) {}
+        else if (sscanf(p, "x=%d", &x) == 1) {}
+        else if (sscanf(p, "y=%d", &y) == 1) {}
+        else if (sscanf(p, "w=%d", &w) == 1) {}
+        else if (sscanf(p, "h=%d", &h) == 1) {}
+        else if (sscanf(p, "ws=%d", &ws) == 1) {}
+        while (*p && *p != ' ') p++;
+        while (*p == ' ') p++;
+    }
+    if (!id) return FALSE;
+    for (guint i = 0; i < wm->wins->len; i++) {
+        vp_win_t *win = g_ptr_array_index(wm->wins, i);
+        if (win->id != id) continue;
+        win->x = x; win->y = y;
+        if (w > 0) win->w = w;
+        if (h > 0) win->h = h;
+        win->ws = ws;
+        return TRUE;
+    }
+    return FALSE;   /* unknown window: full refresh will adopt it */
+}
+
+/* Drain event socket ONLY: geometry events update the model in place
+ * and redraw the pager at the event rate (the fd watch calls this the
+ * moment the WM writes); any OTHER event merely schedules one
+ * coalesced full refresh — a drag at 30 fps must not cost 30
+ * window-list round-trips per second. */
+static void _schedule_full_refresh(vp_wm_t *wm);
+static void _attach_event_watch(vp_wm_t *wm);
+static void _detach_event_watch(vp_wm_t *wm);
+
+static void _drain_events(vp_wm_t *wm) {
+    if (!wm->have_ipc) return;
+    gboolean geo = FALSE, other = FALSE;
+    for (int i = 0; i < 4096; i++) {
+        uint32_t id = 0;
+        char *ev = vp_ipc_poll_event(wm->ipc, &id);
+        if (!ev) break;
+        if (_apply_geometry_event(wm, ev))
+            geo = TRUE;
+        else
+            other = TRUE;
+        free(ev);
+    }
+    if (geo && wm->on_geometry)
+        wm->on_geometry(wm->geo_user);
+    if (other)
+        _schedule_full_refresh(wm);
+}
+
 gboolean vp_wm_refresh(vp_wm_t *wm) {
     gboolean changed = FALSE;
     if (!wm->have_ipc) {
@@ -118,21 +183,14 @@ gboolean vp_wm_refresh(vp_wm_t *wm) {
         if (wm->ipc) {
             wm->have_ipc = TRUE;
             vp_ipc_subscribe(wm->ipc);
+            _attach_event_watch(wm);
             changed = TRUE;
         }
         return changed;
     }
-    /* drain pending events first (they explain what changed). ALL of
-     * them: a fast window drag queues one event per throttled motion
-     * step — draining a fixed 64 left hundreds stacked up between
-     * 400 ms ticks, back-pressuring the WM's event socket forever. */
-    for (int i = 0; i < 4096; i++) {
-        uint32_t id = 0;
-        char *ev = vp_ipc_poll_event(wm->ipc, &id);
-        if (!ev) break;
-        changed = TRUE;   /* any event → re-query below */
-        free(ev);
-    }
+    /* pending events first — they explain what changed (and geometry
+     * events already landed in the model above via the fd watch) */
+    _drain_events(wm);
     char *q = vp_ipc_call(wm->ipc, VP_IPC_WM_QUERY, "", 1500);
     if (q) {
         _parse_query(wm, q);
@@ -143,6 +201,7 @@ gboolean vp_wm_refresh(vp_wm_t *wm) {
         /* three consecutive dead calls: the WM is gone (logout), not
          * merely busy — drop the connection and go back to retry mode
          * in case the session restarts it */
+        _detach_event_watch(wm);
         vp_ipc_free(wm->ipc);
         wm->ipc = NULL;
         wm->have_ipc = FALSE;
@@ -164,6 +223,118 @@ static gboolean _on_poll(gpointer user) {
     return G_SOURCE_CONTINUE;
 }
 
+/* ---------------------------------------- event socket fd watch */
+
+typedef struct {
+    GSource src;
+    GPollFD fd;
+} _wm_watch_t;
+
+static gboolean _watch_prepare(GSource *src, gint *timeout) {
+    (void)src;
+    *timeout = -1;
+    return FALSE;
+}
+static gboolean _watch_check(GSource *src) {
+    _wm_watch_t *w = (_wm_watch_t *)src;
+    return (w->fd.revents & (G_IO_IN | G_IO_HUP)) != 0;
+}
+static gboolean _watch_dispatch(GSource *src, GSourceFunc cb, gpointer ud) {
+    vp_wm_t *wm = ud;
+    (void)cb;
+    _wm_watch_t *w = (_wm_watch_t *)src;
+    if (w->fd.revents & (G_IO_HUP | G_IO_ERR)) {
+        /* the WM died (logout): drop the watch so the main loop does
+         * not spin on a permanent HUP; the poll timer's retry path
+         * rebuilds the connection if a session restarts the WM */
+        _detach_event_watch(wm);
+        return G_SOURCE_REMOVE;
+    }
+    _drain_events(wm);
+    return G_SOURCE_CONTINUE;
+}
+
+static GSourceFuncs _watch_funcs = {
+    _watch_prepare, _watch_check, _watch_dispatch, NULL, NULL, NULL
+};
+
+static void _attach_event_watch(vp_wm_t *wm) {
+    if (wm->watch_attached || !wm->have_ipc || !wm->ipc) return;
+    _wm_watch_t *w = (_wm_watch_t *)g_source_new(
+        (GSourceFuncs *)&_watch_funcs, sizeof(_wm_watch_t));
+    w->fd.fd = vp_ipc_fd(wm->ipc);
+    w->fd.events = G_IO_IN | G_IO_HUP;
+    w->fd.revents = 0;
+    g_source_add_poll((GSource *)w, &w->fd);
+    g_source_set_callback((GSource *)w, NULL, wm, NULL);
+    g_source_attach((GSource *)w, NULL);   /* default main context */
+    wm->watch_id = (gpointer)(GSource *)w;
+    wm->watch_attached = 1;
+}
+
+static void _detach_event_watch(vp_wm_t *wm) {
+    if (!wm->watch_attached || !wm->watch_id) return;
+    g_source_destroy((GSource *)wm->watch_id);
+    g_source_unref((GSource *)wm->watch_id);
+    wm->watch_id = NULL;
+    wm->watch_attached = 0;
+}
+
+void vp_wm_set_geometry_cb(vp_wm_t *wm, vp_wm_geometry_cb cb,
+                            gpointer user) {
+    if (!wm) return;
+    wm->on_geometry = cb;
+    wm->geo_user = user;
+}
+
+/* coalesced full refresh: one WM_QUERY per burst of structural
+ * events, never one per event */
+static gboolean _on_coalesced_refresh(gpointer user) {
+    vp_wm_t *wm = user;
+    wm->coalesce_id = 0;
+    if (vp_wm_refresh(wm) && wm->on_change)
+        wm->on_change(wm->user);
+    return G_SOURCE_REMOVE;
+}
+
+static void _schedule_full_refresh(vp_wm_t *wm) {
+    if (!wm->coalesce_id)
+        wm->coalesce_id = g_timeout_add(60, _on_coalesced_refresh, wm);
+}
+
+/* --------------------------------------------- XWayland env */
+
+gboolean vp_wm_xwl_env_apply(vp_wm_t *wm) {
+    if (!wm || !wm->have_ipc || !wm->ipc) return FALSE;
+    /* cheap guard: once a display is exported AND confirmed working we
+     * never ask again; until then every launch re-checks (Xwayland may
+     * still be starting when the first app is launched) */
+    if (wm->xwl_confirmed) return TRUE;
+    char *r = vp_ipc_call(wm->ipc, VP_IPC_WM_XWL_ENV, "", 800);
+    if (!r) return FALSE;
+    char disp[64] = "", auth[512] = "";
+    for (const char *line = r; line && *line;) {
+        const char *eol = strchr(line, '\n');
+        size_t n = eol ? (size_t)(eol - line) : strlen(line);
+        char buf[512];
+        if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+        memcpy(buf, line, n);
+        buf[n] = 0;
+        if (!strncmp(buf, "display=", 8) && buf[8])
+            snprintf(disp, sizeof(disp), "%s", buf + 8);
+        else if (!strncmp(buf, "xauthority=", 11) && buf[11])
+            snprintf(auth, sizeof(auth), "%s", buf + 11);
+        line = eol ? eol + 1 : NULL;
+    }
+    free(r);
+    if (!disp[0]) return FALSE;
+    setenv("DISPLAY", disp, 1);
+    if (auth[0]) setenv("XAUTHORITY", auth, 1);
+    wm->xwl_confirmed = 1;
+    g_debug("launcher: Xwayland env applied: DISPLAY=%s", disp);
+    return TRUE;
+}
+
 vp_wm_t *vp_wm_new(vp_wm_changed_cb cb, gpointer user) {
     vp_wm_t *wm = g_new0(vp_wm_t, 1);
     wm->wins = g_ptr_array_new_with_free_func(_free_win);
@@ -173,8 +344,10 @@ vp_wm_t *vp_wm_new(vp_wm_changed_cb cb, gpointer user) {
     wm->user = user;
     wm->ipc = vp_ipc_connect(NULL);
     wm->have_ipc = wm->ipc != NULL;
-    if (wm->have_ipc)
+    if (wm->have_ipc) {
         vp_ipc_subscribe(wm->ipc);
+        _attach_event_watch(wm);
+    }
     vp_wm_refresh(wm);
     wm->poll_id = g_timeout_add(400, _on_poll, wm);
     return wm;
@@ -183,6 +356,8 @@ vp_wm_t *vp_wm_new(vp_wm_changed_cb cb, gpointer user) {
 void vp_wm_free(vp_wm_t *wm) {
     if (!wm) return;
     if (wm->poll_id) g_source_remove(wm->poll_id);
+    if (wm->coalesce_id) g_source_remove(wm->coalesce_id);
+    _detach_event_watch(wm);
     if (wm->ipc) vp_ipc_free(wm->ipc);
     g_ptr_array_free(wm->wins, TRUE);
     g_free(wm);

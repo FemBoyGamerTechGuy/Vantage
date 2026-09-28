@@ -150,6 +150,16 @@ const char   *vt_backend_name(const vt_backend_t *b);
 const char   *vt_backend_kind_str(vt_backend_kind_t k);
 vt_backend_kind_t vt_backend_kind_from_str(const char *s);
 
+/* XWayland display environment of a Wayland backend instance:
+ * fills disp/auth (":"-prefixed display name and the Xauthority file)
+ * and returns true when Xwayland is up in that backend. Panels and
+ * session managers use this to give launched X11 apps the DISPLAY and
+ * XAUTHORITY they cannot inherit (the compositor's setenv stays inside
+ * its own process). Always false for non-Wayland backends. */
+bool          vt_backend_wl_xwl_env(const vt_backend_t *b,
+                                    char *disp, size_t disp_n,
+                                    char *auth, size_t auth_n);
+
 /* Event sink registration. Returns sink id >= 0, or -VT_ERR_INVAL. */
 int           vt_backend_add_event_sink(vt_backend_t *b,
                                         vt_backend_event_fn fn, void *ud);

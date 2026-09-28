@@ -45,6 +45,14 @@ static void _on_wm_changed(gpointer user) {
     pager_refresh(wm);
 }
 
+/* geometry-only update: the pager miniatures redraw from the already
+ * -updated model; the tasklist is untouched (no per-motion flicker,
+ * no per-motion list rebuild). Called at the WM's drag event rate. */
+static void _on_wm_geometry(gpointer user) {
+    (void)user;
+    pager_refresh(wm);
+}
+
 static const char _css[] =
 /* the panel WINDOW: dark to the very edges — without this the GTK
  * default light background showed as bright strips in the layout
@@ -196,8 +204,15 @@ static void _on_activate(GtkApplication *app, gpointer user) {
     int stage = getenv("VANTAGE_PANEL_STAGE")
                     ? atoi(getenv("VANTAGE_PANEL_STAGE")) : 99;
     wm = vp_wm_new(_on_wm_changed, NULL);
-    if (stage >= 2)
+    /* live geometry updates: the WM's ~30 fps window-geometry events
+     * update the model in place and redraw ONLY the pager (a drag
+     * must move the miniature frame by frame; the taskbar does not
+     * render geometry and needs no redraw per motion step) */
+    vp_wm_set_geometry_cb(wm, _on_wm_geometry, NULL);
+    if (stage >= 2) {
         gtk_box_append(GTK_BOX(bar), launcher_button_new());
+        launcher_set_model(wm);   /* XWayland env lookup at launch */
+    }
     if (stage >= 3)
         gtk_box_append(GTK_BOX(bar), pager_new(wm));
     if (stage >= 4)

@@ -188,3 +188,20 @@ const char *vt_backend_server_implementation(const vt_backend_t *b) {
         return NULL;
     }
 }
+
+bool vt_backend_wl_xwl_env(const vt_backend_t *b,
+                            char *disp, size_t disp_n,
+                            char *auth, size_t auth_n) {
+    if (disp && disp_n) disp[0] = 0;
+    if (auth && auth_n) auth[0] = 0;
+    if (!b || b->kind != VT_BACKEND_WAYLAND) return false;
+#if defined(VT_HAVE_WAYLAND)
+    /* implemented against the singleton compositor state in the
+     * wayland backend module (it owns the Xwayland child) */
+    extern bool _vt_backend_wl_xwl_env_impl(char *d, size_t dn,
+                                             char *a, size_t an);
+    return _vt_backend_wl_xwl_env_impl(disp, disp_n, auth, auth_n);
+#else
+    return false;
+#endif
+}

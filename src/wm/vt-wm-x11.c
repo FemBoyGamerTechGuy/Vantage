@@ -97,6 +97,8 @@ typedef struct vt_wm_x11 {
     _client_t       *op_client;
     int              op_start_x, op_start_y;
     int              op_win_x, op_win_y, op_win_w, op_win_h;
+    uint64_t         op_last_geo_us;  /* geometry-event throttle stamp
+                                         (~30 fps, same as Wayland) */
     _rect_t          workarea;
 } vt_wm_x11_t;
 
@@ -781,6 +783,33 @@ static _fr_hit_t _frame_hit(_client_t *c, int x, int y, int fw_, int fh_) {
     return _FR_HIT_NONE;
 }
 
+/* Install the Alt-drag passive grabs on a client window: Alt+Button1
+ * moves, Alt+Button3 resizes. ALT-MASKED ONLY, in every
+ * Lock/Mod2/Mod5 variant a real keyboard can be in.
+ *
+ * NEVER register an unmasked (plain-click) passive grab: these grabs
+ * are GrabModeSync, and a passive grab that activates FREEZES the
+ * entire pointer event stream until the WM calls XAllowEvents. A
+ * plain-Button1 grab here once froze the pointer on the very first
+ * click into any application — the reported "opening any app locks
+ * the whole DE" — because the plain-click focus path never called
+ * XAllowEvents. Plain clicks must stay OBSERVED (event selection),
+ * which also keeps them flowing to XI2-only clients. */
+static void _install_alt_grabs(Display *dpy, Window w) {
+    unsigned int mods[] = {
+        0, LockMask, Mod2Mask, Mod5Mask, LockMask | Mod2Mask,
+        LockMask | Mod5Mask, Mod2Mask | Mod5Mask,
+        LockMask | Mod2Mask | Mod5Mask };
+    for (size_t i = 0; i < VT_ARRAY_SIZE(mods); i++) {
+        XGrabButton(dpy, Button1, Mod1Mask | mods[i], w, False,
+                    ButtonPressMask | ButtonMotionMask | ButtonReleaseMask,
+                    GrabModeSync, GrabModeSync, None, None);
+        XGrabButton(dpy, Button3, Mod1Mask | mods[i], w, False,
+                    ButtonPressMask | ButtonMotionMask | ButtonReleaseMask,
+                    GrabModeSync, GrabModeSync, None, None);
+    }
+}
+
 /* Create the frame and reparent the client into it. */
 static void _frame_create(vt_wm_x11_t *e, _client_t *c) {
     Display *dpy = e->dpy;
@@ -806,19 +835,12 @@ static void _frame_create(vt_wm_x11_t *e, _client_t *c) {
     XReparentWindow(dpy, c->win, c->frame, _FR_BORDER,
                     c->fr_title + _FR_BORDER);
     XMapWindow(dpy, c->win);
-    /* keep the alt-drag grabs working on the client window itself */
-    unsigned int mods[] = { 0, LockMask, Mod2Mask, Mod5Mask };
-    for (size_t i = 0; i < VT_ARRAY_SIZE(mods); i++) {
-        XGrabButton(dpy, Button1, Mod1Mask | mods[i], c->win, False,
-                    ButtonPressMask | ButtonMotionMask | ButtonReleaseMask,
-                    GrabModeSync, GrabModeSync, None, None);
-        XGrabButton(dpy, Button3, Mod1Mask | mods[i], c->win, False,
-                    ButtonPressMask | ButtonMotionMask | ButtonReleaseMask,
-                    GrabModeSync, GrabModeSync, None, None);
-        XGrabButton(dpy, Button1, mods[i], c->win, False,
-                    ButtonPressMask | ButtonMotionMask | ButtonReleaseMask,
-                    GrabModeSync, GrabModeSync, None, None);
-    }
+    /* keep the alt-drag grabs working on the client window itself.
+     * ALT-MASKED ONLY — see _install_alt_grabs(). The unmasked plain
+     * Button1 sync grab that used to live here froze the pointer on
+     * the first click into ANY app (GrabModeSync + no XAllowEvents):
+     * one click locked the whole desktop. */
+    _install_alt_grabs(dpy, c->win);
 }
 
 /* Destroy the frame, restoring the client to the root. */
@@ -1224,18 +1246,7 @@ static void _manage(vt_wm_x11_t *e, Window w) {
      * XI2 clients alike. Docks/desktops get no grabs: moving the
      * wallpaper by alt-drag was never a feature. */
     if (!c->is_dock && !c->is_desktop) {
-        unsigned int mods[] = {
-            0, LockMask, Mod2Mask, Mod5Mask, LockMask | Mod2Mask,
-            LockMask | Mod5Mask, Mod2Mask | Mod5Mask,
-            LockMask | Mod2Mask | Mod5Mask };
-        for (size_t i = 0; i < VT_ARRAY_SIZE(mods); i++) {
-            XGrabButton(e->dpy, Button1, Mod1Mask | mods[i], c->win, False,
-                        ButtonPressMask | ButtonMotionMask | ButtonReleaseMask,
-                        GrabModeSync, GrabModeSync, None, None);
-            XGrabButton(e->dpy, Button3, Mod1Mask | mods[i], c->win, False,
-                        ButtonPressMask | ButtonMotionMask | ButtonReleaseMask,
-                        GrabModeSync, GrabModeSync, None, None);
-        }
+        _install_alt_grabs(e->dpy, c->win);
     }
     XSelectInput(e->dpy, c->win, EnterWindowMask | FocusChangeMask |
                  PropertyChangeMask | StructureNotifyMask |
@@ -1446,6 +1457,7 @@ static void _op_start(vt_wm_x11_t *e, _client_t *c, int mode, int edge,
     e->op_start_x = px; e->op_start_y = py;
     e->op_win_x = c->model.x; e->op_win_y = c->model.y;
     e->op_win_w = c->model.w; e->op_win_h = c->model.h;
+    e->op_last_geo_us = 0;   /* first motion emits immediately */
     XGrabPointer(e->dpy, e->root, True,
                  PointerMotionMask | ButtonReleaseMask,
                  GrabModeAsync, GrabModeAsync, None,
@@ -1479,6 +1491,18 @@ static void _op_motion(vt_wm_x11_t *e, int px, int py) {
         if (e->op_edge & 4) { x = e->op_win_x + dx; w = e->op_win_w - dx; }
         if (e->op_edge & 8) { y = e->op_win_y + dy; h = e->op_win_h - dy; }
         _apply_configure(e, c, x, y, w, h);
+    }
+    /* Continuous geometry events during the drag (~30 fps, the same
+     * rate the Wayland compositor uses): the panel's pager follows the
+     * window frame by frame instead of catching up on release — the
+     * reported "pager/preview updates too slowly while moving". The
+     * final event still goes out in _op_end. */
+    {
+        uint64_t now = vt_time_now_us();
+        if (now - e->op_last_geo_us >= 33000) {
+            e->op_last_geo_us = now;
+            _emit_win(e, c, VT_WM_EVENT_GEOMETRY);
+        }
     }
 }
 
@@ -1806,6 +1830,7 @@ static void _on_backend_event(void *ud, void *event) {
         _client_t *c = _find(e, be->window);
         if (!c) c = _find_frame(e, be->window);
         if (c && _framed(c) && be->window == c->frame) {
+            /* frame windows carry no passive grabs: observed press */
             _frame_button(e, c, be);
             break;
         }
@@ -1819,24 +1844,35 @@ static void _on_backend_event(void *ud, void *event) {
             else if (be->button == Button3)
                 _op_start(e, c, 1, 1 | 2, be->x_root, be->y_root);
             XAllowEvents(e->dpy, AsyncPointer, CurrentTime);
-        } else if (c && be->button == Button1) {
-            /* OBSERVED press (event selection, no grab, pointer NOT
-             * frozen): the client is receiving this same press through
-             * its own protocol (core or XI2) — focus and raise only.
-             *
-             * Docks and desktops NEVER take keyboard focus (EWMH): a
-             * panel is not a focusable window. Focusing it rips the
-             * keyboard focus out of a popover the very same click just
-             * opened — GTK popovers close themselves on focus-out, so
-             * the start menu would flash shut whenever another window
-             * held focus. Raise only: the panel stays where it is and
-             * its popovers keep the grab they need. */
-            if (c->is_dock || c->is_desktop) {
-                _raise(e, c);
-            } else if (!c->model.focused) {
-                _focus(e, c);
-            } else {
-                _raise(e, c);
+        } else {
+            /* A passive Alt grab may STILL have fired without leading
+             * to an interactive op: fullscreen window, dying client,
+             * Button2, dock/desktop. GrabModeSync means the pointer
+             * event stream stays FROZEN until we allow it — thaw in
+             * every such case or the whole desktop stops responding to
+             * the mouse. (AsyncPointer on a non-frozen pointer is a
+             * harmless no-op.) */
+            if (be->state & Mod1Mask)
+                XAllowEvents(e->dpy, AsyncPointer, CurrentTime);
+            if (c && be->button == Button1) {
+                /* OBSERVED press (event selection, no grab, pointer NOT
+                 * frozen): the client is receiving this same press through
+                 * its own protocol (core or XI2) — focus and raise only.
+                 *
+                 * Docks and desktops NEVER take keyboard focus (EWMH): a
+                 * panel is not a focusable window. Focusing it rips the
+                 * keyboard focus out of a popover the very same click just
+                 * opened — GTK popovers close themselves on focus-out, so
+                 * the start menu would flash shut whenever another window
+                 * held focus. Raise only: the panel stays where it is and
+                 * its popovers keep the grab they need. */
+                if (c->is_dock || c->is_desktop) {
+                    _raise(e, c);
+                } else if (!c->model.focused) {
+                    _focus(e, c);
+                } else {
+                    _raise(e, c);
+                }
             }
         }
         break;
