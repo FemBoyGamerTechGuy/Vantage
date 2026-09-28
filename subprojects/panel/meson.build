@@ -12,7 +12,7 @@
 # consumes the `vantage_panel_dep` dependency below).
 
 project('vantage-panel', 'c',
-  version : '0.3.4',
+  version : '0.3.5',
   default_options : [
     'c_std=c17',
     'warning_level=2',

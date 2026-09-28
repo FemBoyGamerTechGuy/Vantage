@@ -59,7 +59,13 @@ typedef struct _xwl_win {
     xcb_window_t xwin;
     _wl_surf_t *surf;               /* associated wl_surface (may lag) */
     _xdg_toplevel_t *toplevel;      /* synthetic toplevel for the WM */
-    uint32_t create_serial;         /* X sequence for set_serial match */
+    uint64_t win_serial;            /* the window's association serial
+                                     * (WL_SURFACE_SERIAL client message) */
+    bool have_win_serial;
+    uint64_t surf_serial;           /* the surface's association serial
+                                     * (xwayland_surface_v1.set_serial) */
+    bool have_surf_serial;
+    uint32_t create_serial;         /* X sequence (legacy diagnostics) */
     bool mapped;                    /* X window is mapped+managed */
     bool override_redirect;         /* OR windows: popups, never framed */
     bool motif_csd;                 /* _MOTIF_WM_HINTS decorations=0 */
@@ -92,7 +98,7 @@ static struct {
                 a_net_client_list, a_net_supporting_check, a_net_supported,
                 a_net_workarea, a_net_wm_desktop, a_utf8_string,
                 a_net_wm_ping, a_wm_change_state, a_net_wm_visible_name,
-                a_wl_surface_id;
+                a_wl_surface_id, a_wl_surface_serial;
     int wm_screen_width, wm_screen_height;
     /* legacy pairing: WL_SURFACE_ID messages that arrived BEFORE the
      * window's CreateNotify crossed the X socket */
@@ -244,17 +250,55 @@ static void _xwl_read_motif(_xwl_win_t *w) {
 
 static void _xwl_configure(_xwl_win_t *w, int x, int y, int wd, int ht) {
     if (!X.xc || !w) return;
+    /* Move-only when wd/ht are 0: the interactive DRAG path calls
+     * _xwl_move_resize(x, y, 0, 0) for every motion step, and the old
+     * unconditional WIDTH|HEIGHT mask sent width=1 height=1 (the
+     * "wd > 0 ? wd : 1" fallback) — ONE title-bar drag collapsed the
+     * X window to 1x1 and its content vanished ("the application is
+     * extremely small or effectively invisible"). Sizes join the mask
+     * only when the caller actually passes them. */
     uint16_t mask = XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y |
-                    XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT |
                     XCB_CONFIG_WINDOW_BORDER_WIDTH;
-    uint32_t vals[5] = { (uint32_t)x, (uint32_t)y,
-                         (uint32_t)(wd > 0 ? wd : 1),
-                         (uint32_t)(ht > 0 ? ht : 1), 0 };
+    uint32_t vals[5] = { (uint32_t)x, (uint32_t)y, 0, 0, 0 };
+    int vi = 2;
+    if (wd > 0) {
+        mask |= XCB_CONFIG_WINDOW_WIDTH;
+        vals[vi++] = (uint32_t)wd;
+        w->w = wd;
+    }
+    if (ht > 0) {
+        mask |= XCB_CONFIG_WINDOW_HEIGHT;
+        vals[vi++] = (uint32_t)ht;
+        w->h = ht;
+    }
     xcb_configure_window(X.xc, w->xwin, mask, vals);
     w->x = x;
     w->y = y;
-    if (wd > 0) w->w = wd;
-    if (ht > 0) w->h = ht;
+    /* Reposition the surface IMMEDIATELY: Xwayland does not commit a
+     * buffer for WM-initiated moves (nothing changed client-side), so
+     * the commit-driven _xwl_win_geom sync may never run — the surface
+     * kept painting at its pre-drag position and the window appeared
+     * stranded until the client happened to redraw. The X window's
+     * position IS the surface's position by design ("the surface
+     * paints exactly where the X window is"). Sizes follow the same
+     * rule: the MODEL must show the configured geometry right away
+     * (the pager/taskbar read it); the paint bounds stay min(buffer,
+     * configured) so a not-yet-redrawn client simply paints its old
+     * content in the top-left of the new frame. */
+    if (w->surf) {
+        w->surf->x = x;
+        w->surf->y = y;
+        if (wd > 0) w->surf->w = wd;
+        if (ht > 0) w->surf->h = ht;
+    }
+    /* keep the toplevel's geometry mirror current (used by events
+     * while the window has no surface yet) */
+    if (w->toplevel) {
+        w->toplevel->x = w->x;
+        w->toplevel->y = w->y;
+        w->toplevel->w = w->w;
+        w->toplevel->h = w->h;
+    }
 }
 
 static void _xwl_focus(_xwl_win_t *w) {
@@ -311,6 +355,7 @@ static void _xwl_close_win(_xwl_win_t *w) {
 /* -------------------------------------------------------- shell v1 */
 
 static void _xwl_sever(_xwl_win_t *w);
+static void _xwl_serial_reconcile(void);
 
 static void _xwl_surface_destroy_req(struct wl_client *cli,
                                      struct wl_resource *res) {
@@ -322,15 +367,21 @@ static void _xwl_surface_destroy_req(struct wl_client *cli,
 
 static void _xwl_surface_set_serial(struct wl_client *cli,
                                     struct wl_resource *res,
-                                    uint32_t serial_hi,
-                                    uint32_t serial_lo) {
+                                    uint32_t serial_lo,
+                                    uint32_t serial_hi) {
+    /* NOTE the arg order: the protocol request is set_serial(lo, hi)
+     * — libwayland passes wire order, so the FIRST parameter is the
+     * low word. (The old code named them (hi, lo) and composed
+     * (hi<<32)|lo from swapped halves — serial 1 read as 2^32.) */
     (void)cli;
     _xwl_win_t *w = wl_resource_get_user_data(res);
     if (!w) return;
     uint64_t serial = ((uint64_t)serial_hi << 32) | serial_lo;
-    w->create_serial = (uint32_t)serial;
-    vt_logd("xwayland: surface serial %llu for X window 0x%x",
+    w->surf_serial = serial;
+    w->have_surf_serial = true;
+    vt_logd("xwayland: surface serial %llu (record 0x%x)",
             (unsigned long long)serial, (unsigned)w->xwin);
+    _xwl_serial_reconcile();
 }
 
 static const struct xwayland_surface_v1_interface _xwl_surface_impl = {
@@ -407,6 +458,126 @@ static void _xwl_late_pair(_xwl_win_t *w, _wl_surf_t *s) {
     }
 }
 
+/* ------------------------------------------------- serial association
+ * xwayland_shell_v1's EXACT window↔surface match. The same unique
+ * serial arrives on the wl_surface (set_serial) and on the X window
+ * (WL_SURFACE_SERIAL client message, l[0]=lo l[1]=hi). This runs after
+ * every serial event and:
+ *
+ *   1. pairs unpaired PLACEHOLDERS (xwin == 0) with the window whose
+ *      win_serial equals the placeholder's surf_serial;
+ *   2. CORRECTS a wrong pairing: if a window's surf_serial (learned
+ *      from set_serial on the surface it currently holds) differs
+ *      from its own win_serial, the surface belongs to the window
+ *      with the matching serial — swap/move it there. This repairs
+ *      pairings made by the legacy guess before the serials arrived.
+ */
+static _xwl_win_t *_xwl_win_by_serial(uint64_t serial) {
+    for (_xwl_win_t *w = X.wins; w; w = w->next)
+        if (w->have_win_serial && w->win_serial == serial)
+            return w;
+    return NULL;
+}
+
+static void _xwl_serial_reconcile(void) {
+    if (!X.st) return;
+    /* 1) pair placeholders by exact serial */
+    _wl_surf_t *s;
+    wl_list_for_each(s, &X.st->surfaces, link) {
+        _xwl_win_t *ph = s->xwl;
+        if (!ph || ph->xwin != 0 || !ph->have_surf_serial)
+            continue;
+        _xwl_win_t *w = _xwl_win_by_serial(ph->surf_serial);
+        if (w && !w->surf) {
+            /* adopt the placeholder into the real window and attach.
+             * Detach s->xwl BEFORE the free: _xwl_late_pair reads it
+             * (its own placeholder-merge step) — leaving the dangling
+             * pointer was a heap-use-after-free under ASan. */
+            if (ph->xwl_res) {
+                w->xwl_res = ph->xwl_res;
+                wl_resource_set_user_data(w->xwl_res, w);
+                ph->xwl_res = NULL;
+            }
+            w->have_surf_serial = true;
+            w->surf_serial = ph->surf_serial;
+            ph->surf = NULL;
+            s->xwl = NULL;
+            vt_free(ph);          /* placeholders never sit in X.wins */
+            _xwl_late_pair(w, s);
+            vt_logd("xwayland: serial %llu paired surface with 0x%x",
+                    (unsigned long long)w->surf_serial, (unsigned)w->xwin);
+        }
+    }
+    /* 2) repair wrong pairings (win_serial vs surf_serial mismatch) */
+    for (_xwl_win_t *w = X.wins; w; w = w->next) {
+        if (!w->surf || !w->have_win_serial || !w->have_surf_serial)
+            continue;
+        if (w->win_serial == w->surf_serial)
+            continue;              /* consistent */
+        _xwl_win_t *w2 = _xwl_win_by_serial(w->surf_serial);
+        if (!w2 || w2 == w)
+            continue;              /* unknown owner: wait for more serials */
+        /* the surface W holds belongs to W2. SWAP the surfaces so both
+         * windows get their own content back, keeping each toplevel
+         * (taskbar identity) with its X window. */
+        _wl_surf_t *sa = w->surf, *sb = w2->surf;
+        struct wl_resource *ra = w->xwl_res, *rb = w2->xwl_res;
+        vt_logd("xwayland: serial mismatch on 0x%x (win=%llu surf=%llu)"
+                " — repairing pairing with 0x%x",
+                (unsigned)w->xwin,
+                (unsigned long long)w->win_serial,
+                (unsigned long long)w->surf_serial, (unsigned)w2->xwin);
+        w->surf = sb;  w2->surf = sa;
+        w->xwl_res = rb; w2->xwl_res = ra;
+        if (ra) wl_resource_set_user_data(ra, w2);
+        if (rb) wl_resource_set_user_data(rb, w);
+        if (sa) {
+            sa->xwl = w2;
+            if (sa->toplevel && sa->toplevel == w->toplevel)
+                sa->toplevel = NULL;
+            if (w->toplevel && w->toplevel->surf == sa)
+                w->toplevel->surf = NULL;
+            if (w2->toplevel && !w2->toplevel->surf) {
+                w2->toplevel->surf = sa;
+                sa->toplevel = w2->toplevel;
+            }
+            sa->x = w2->x; sa->y = w2->y;
+            if (w2->w > 0) sa->w = w2->w;
+            if (w2->h > 0) sa->h = w2->h;
+        }
+        if (sb) {
+            sb->xwl = w;
+            if (sb->toplevel && sb->toplevel == w2->toplevel)
+                sb->toplevel = NULL;
+            if (w2->toplevel && w2->toplevel->surf == sb)
+                w2->toplevel->surf = NULL;
+            if (w->toplevel && !w->toplevel->surf) {
+                w->toplevel->surf = sb;
+                sb->toplevel = w->toplevel;
+            }
+            sb->x = w->x; sb->y = w->y;
+            if (w->w > 0) sb->w = w->w;
+            if (w->h > 0) sb->h = w->h;
+        }
+        /* re-learn the surface serials: each window now holds a
+         * surface whose serial equals its own win_serial (that is
+         * what the repair guarantees when both sides have serials) */
+        if (sa && w2->have_win_serial) {
+            w2->have_surf_serial = true;
+            w2->surf_serial = w2->win_serial;
+        }
+        if (sb && w->have_win_serial) {
+            w->have_surf_serial = true;
+            w->surf_serial = w->win_serial;
+        }
+        if (w->toplevel)
+            _emit_win(X.st, VT_BACKEND_WL_EVENT_WIN_GEOMETRY, w->toplevel);
+        if (w2->toplevel)
+            _emit_win(X.st, VT_BACKEND_WL_EVENT_WIN_GEOMETRY, w2->toplevel);
+        if (X.st) X.st->dirty = true;
+    }
+}
+
 static void _xwl_get_xwayland_surface(struct wl_client *cli,
                                       struct wl_resource *res,
                                       uint32_t id,
@@ -417,9 +588,17 @@ static void _xwl_get_xwayland_surface(struct wl_client *cli,
                                     "surface");
         return;
     }
-    /* Xwayland creates the surface BEFORE the X window is fully wired;
-     * we record the pairing and wait for the window to appear (either
-     * it already exists from CreateNotify, or it arrives later). */
+    /* Xwayland creates the surface BEFORE the X window is fully wired.
+     * Record a PLACEHOLDER (xwin == 0, never linked into X.wins) and
+     * let the SERIAL reconcile it with the right window —
+     * xwayland_shell_v1 delivers the same unique serial on the
+     * wl_surface (set_serial) and on the X window (WL_SURFACE_SERIAL
+     * client message), so the pairing is EXACT. The old
+     * adopt-the-newest-waiting-window GUESS swapped surfaces between
+     * racing windows (a group leader + several toplevels mapping in
+     * one burst): each window then rendered at ANOTHER window's
+     * geometry — "the app is effectively invisible" with the pager
+     * showing a tiny misplaced window. */
     _xwl_win_t *w = vt_malloc0(sizeof(*w));
     if (!w) { wl_client_post_no_memory(cli); return; }
     w->surf = s;
@@ -431,26 +610,11 @@ static void _xwl_get_xwayland_surface(struct wl_client *cli,
                                    _xwl_surface_res_destroy);
     w->xwl_res = r;
     vt_logd("xwayland: get_xwayland_surface request arrived");
-    /* try to find the X window that was created just before this
-     * surface: newest waiting window without a surface */
-    for (_xwl_win_t *cand = X.wins; cand; cand = cand->next) {
-        if (cand->waiting_surface && !cand->xwl_res) {
-            /* adopt it: move surface pointer */
-            cand->surf = s;
-            s->xwl = cand;
-            w->surf = NULL;
-            s->xwl->xwl_res = r;
-            /* fix user data of the resource to the adopted window */
-            wl_resource_set_user_data(r, cand);
-            vt_free(w);
-            w = cand;
-            cand->waiting_surface = false;
-            /* the window may have been MAPPED before this surface
-             * existed — re-announce its real geometry to the model */
-            _xwl_late_pair(cand, s);
-            break;
-        }
-    }
+    /* maybe the serials are already here (both sides raced ahead) */
+    _xwl_serial_reconcile();
+    /* Legacy Xwayland (no serials at all, ever): the placeholder is
+     * reconciled by _xwl_win_geom's commit-time fallback below. */
+    (void)w;
 }
 
 static void _xwl_shell_destroy(struct wl_client *cli,
@@ -483,7 +647,34 @@ static void _bind_xwl_shell(struct wl_client *cli, void *data,
  * surface commits a new buffer) */
 void _xwl_win_geom(_wl_surf_t *s) {
     _xwl_win_t *w = _xwl_find_by_surf(s);
-    if (!w || !s) return;
+    if (!w || !s) {
+        /* An UNPAIRED placeholder reaching its first commit: the
+         * association serials never arrived (legacy Xwayland without
+         * xwayland_shell_v1 serial support). Fall back to the recency
+         * guess — adopt the newest waiting window. Modern Xwayland is
+         * reconciled by serial long before this point. */
+        _xwl_win_t *ph = s ? s->xwl : NULL;
+        if (ph && ph->xwin == 0 && !ph->have_surf_serial) {
+            for (_xwl_win_t *cand = X.wins; cand; cand = cand->next) {
+                if (cand->waiting_surface && !cand->surf) {
+                    if (ph->xwl_res) {
+                        cand->xwl_res = ph->xwl_res;
+                        wl_resource_set_user_data(cand->xwl_res, cand);
+                        ph->xwl_res = NULL;
+                    }
+                    ph->surf = NULL;
+                    s->xwl = NULL;   /* detach before free (UAF guard) */
+                    vt_free(ph);
+                    _xwl_late_pair(cand, s);
+                    vt_logd("xwayland: commit-time fallback pairing for "
+                            "0x%x (no serials)", (unsigned)cand->xwin);
+                    w = cand;
+                    break;
+                }
+            }
+        }
+        if (!w) return;
+    }
     int ox = s->x, oy = s->y, ow = s->w, oh = s->h;
     s->x = w->x;
     s->y = w->y;
@@ -549,13 +740,19 @@ static void _xwl_handle_create(xcb_create_notify_event_t *e) {
      * renders at +0+0 (title bar BEHIND the top panel — "apps open
      * with the bar above the panel"), never learns its geometry, and
      * the WM model shows a 1x1 window at 0,0. Adopt the placeholder's
-     * surface + resource into this real record. */
+     * surface + resource into this real record — but ONLY when the
+     * serials agree (or no serial is known on either side yet): with
+     * racing windows a recency guess swaps surfaces between windows.
+     * When serials are pending, _xwl_serial_reconcile() does the
+     * exact pairing as soon as they arrive. */
     if (X.st) {
         _wl_surf_t *s;
         wl_list_for_each(s, &X.st->surfaces, link) {
             _xwl_win_t *ph = s->xwl;
             if (!ph || ph->xwin != 0 || !ph->xwl_res)
                 continue;   /* not an unadopted pairing placeholder */
+            if (ph->have_surf_serial)
+                continue;   /* serial known: wait for the exact match */
             w->surf = s;
             w->xwl_res = ph->xwl_res;
             wl_resource_set_user_data(w->xwl_res, w);
@@ -577,6 +774,9 @@ static void _xwl_handle_create(xcb_create_notify_event_t *e) {
     vt_logd("xwayland: X window 0x%x created %dx%d +%d+%d (OR=%d)",
             (unsigned)w->xwin, w->w, w->h, w->x, w->y,
             (int)w->override_redirect);
+    /* a WL_SURFACE_SERIAL message may have arrived before this
+     * CreateNotify crossed the X socket — pair by serial now */
+    _xwl_serial_reconcile();
 }
 
 static void _xwl_map(_xwl_win_t *w) {
@@ -650,6 +850,16 @@ static void _xwl_map(_xwl_win_t *w) {
                 s->y = w->y;
                 s->ws = st->ws_cur;
             }
+            /* geometry mirror + focus state: the WIN_MAP event fires
+             * BEFORE any surface exists — without the mirror the WM
+             * model sees a 0x0 window at +0+0 ("tiny window in the
+             * corner" in the pager); without activated the taskbar
+             * never shows the new window as focused. */
+            w->toplevel->x = w->x;
+            w->toplevel->y = w->y;
+            w->toplevel->w = w->w;
+            w->toplevel->h = w->h;
+            w->toplevel->activated = true;
             _emit_win(st, VT_BACKEND_WL_EVENT_WIN_MAP, w->toplevel);
             vt_logi("xwayland: window 0x%x '%s' mapped %dx%d at +%d+%d",
                     (unsigned)w->xwin, w->title ? w->title : "(untitled)",
@@ -755,6 +965,21 @@ static void _xwl_handle_config_req(xcb_configure_request_event_t *e) {
 static void _xwl_handle_client_msg(xcb_client_message_event_t *e) {
     _wl_state_t *st = X.st;
 
+    if (e->type == X.a_wl_surface_serial && st) {
+        /* xwayland_shell_v1's X-side association: the SAME unique
+         * serial the wl_surface announced via set_serial, delivered on
+         * the X window (l[0] = lo bits, l[1] = hi bits). This is what
+         * makes the window↔surface pairing EXACT — see
+         * _xwl_serial_reconcile(). */
+        _xwl_win_t *w = _xwl_find(e->window);
+        if (w) {
+            w->win_serial = ((uint64_t)e->data.data32[1] << 32) |
+                            (uint64_t)e->data.data32[0];
+            w->have_win_serial = true;
+            _xwl_serial_reconcile();
+        }
+        return;
+    }
     if (e->type == X.a_wl_surface_id && st && X.client) {
         /* LEGACY association: Xwayland announces the wl_surface
          * resource id that belongs to an X window (the pre-shell
@@ -886,9 +1111,25 @@ void _xwl_maximize(_wl_surf_t *s, bool on) {
     int wx, wy, ww, wh;
     _layer_workarea(X.st, &wx, &wy, &ww, &wh);
     if (on) {
-        w->h = 0; /* remember nothing: X11 WMs usually save geometry;
-                     we keep it simple: restore = recenter */
-        _xwl_configure(w, wx, wy, ww, wh);
+        /* the FRAME must fill the workarea (not the client): our SSD
+         * title band sits ABOVE the X window, so a client at the bare
+         * workarea origin parks its grab bar behind the top panel and
+         * the maximized window "goes over the panel". Inset the client
+         * by the SSD extents for framed windows. */
+        if (w->toplevel) {
+            w->toplevel->prev_x = w->x;
+            w->toplevel->prev_y = w->y;
+            w->toplevel->prev_w = w->w;
+            w->toplevel->prev_h = w->h;
+        }
+        bool ssd = !w->motif_csd && !w->override_redirect;
+        int tbar = ssd ? (_WL_SSD_TITLE + _WL_SSD_BORDER) : 0;
+        int brd = ssd ? _WL_SSD_BORDER : 0;
+        _xwl_configure(w, wx + brd, wy + tbar,
+                       ww - 2 * brd, wh - tbar - brd);
+    } else if (w->toplevel && w->toplevel->prev_w > 0) {
+        _xwl_configure(w, w->toplevel->prev_x, w->toplevel->prev_y,
+                       w->toplevel->prev_w, w->toplevel->prev_h);
     } else {
         _xwl_configure(w, wx + (ww - w->w) / 2, wy + (wh - w->h) / 2,
                        w->w, w->h);
@@ -896,6 +1137,7 @@ void _xwl_maximize(_wl_surf_t *s, bool on) {
     if (w->toplevel) {
         w->toplevel->maximized = on;
         _emit_win(X.st, VT_BACKEND_WL_EVENT_WIN_STATE, w->toplevel);
+        _emit_win(X.st, VT_BACKEND_WL_EVENT_WIN_GEOMETRY, w->toplevel);
     }
     X.st->dirty = true;
 }
@@ -903,9 +1145,18 @@ void _xwl_maximize(_wl_surf_t *s, bool on) {
 void _xwl_fullscreen(_wl_surf_t *s, bool on) {
     _xwl_win_t *w = _xwl_find_by_surf(s);
     if (!w || !w->mapped || !X.st) return;
-    if (on)
+    if (on) {
+        if (w->toplevel) {
+            w->toplevel->prev_x = w->x;
+            w->toplevel->prev_y = w->y;
+            w->toplevel->prev_w = w->w;
+            w->toplevel->prev_h = w->h;
+        }
         _xwl_configure(w, 0, 0, X.st->out_w, X.st->out_h);
-    else {
+    } else if (w->toplevel && w->toplevel->prev_w > 0) {
+        _xwl_configure(w, w->toplevel->prev_x, w->toplevel->prev_y,
+                       w->toplevel->prev_w, w->toplevel->prev_h);
+    } else {
         int wx, wy, ww, wh;
         _layer_workarea(X.st, &wx, &wy, &ww, &wh);
         _xwl_configure(w, wx + (ww - w->w) / 2, wy + (wh - w->h) / 2,
@@ -914,6 +1165,7 @@ void _xwl_fullscreen(_wl_surf_t *s, bool on) {
     if (w->toplevel) {
         w->toplevel->fullscreen = on;
         _emit_win(X.st, VT_BACKEND_WL_EVENT_WIN_STATE, w->toplevel);
+        _emit_win(X.st, VT_BACKEND_WL_EVENT_WIN_GEOMETRY, w->toplevel);
     }
     X.st->dirty = true;
 }
@@ -1207,6 +1459,7 @@ bool _xwl_start(_wl_state_t *st) {
     X.a_wm_change_state = _atom(xc, "WM_CHANGE_STATE");
     X.a_net_wm_visible_name = _atom(xc, "_NET_WM_VISIBLE_NAME");
     X.a_wl_surface_id = _atom(xc, "WL_SURFACE_ID");
+    X.a_wl_surface_serial = _atom(xc, "WL_SURFACE_SERIAL");
 
     /* 6. become the WM: SubstructureRedirect on the root */
     xcb_screen_t *scr = xcb_setup_roots_iterator(xcb_get_setup(xc)).data;

@@ -372,7 +372,24 @@ if [ -n "$WID" ]; then
   sleep 0.3
   "$(vb vantage-remote)" maximize "$WID" >/dev/null 2>&1 \
     && ok "IPC maximize works" || bad "IPC maximize failed"
-  sleep 0.3
+  sleep 0.5
+  # maximize geometry: the FRAME fills the WORKAREA, not the raw
+  # output — the client must start BELOW the docked panel (struts)
+  # with the title bar on screen. The old raw-output maximize covered
+  # the panel and pushed the × button off the top of the screen.
+  MAXGEO=$("$(vb vantage-remote)" list 2>/dev/null | grep "Vantage Test" \
+             | head -1)
+  read -r MX MY MW MH <<< "$(echo "$MAXGEO" | sed -E 's/.*\t(-?[0-9]+)\t(-?[0-9]+)\t([0-9]+)\t([0-9]+)$/\1 \2 \3 \4/')"
+  XDIM=$(xdpyinfo 2>/dev/null | grep -m1 dimensions | grep -oE '[0-9]+x[0-9]+' | head -1)
+  SW=${XDIM%x*}; SH=${XDIM#*x}
+  if [ "${MY:-999}" -ge 60 ] && [ "${MW:-0}" -gt 500 ] && \
+     [ "${MW:-0}" -le "${SW:-9999}" ] && [ "$((MY + MH))" -le "${SH:-9999}" ]; then
+    ok "maximized client below the panel, frame on screen (${MW}x${MH} at +${MX}+${MY})"
+  else
+    bad "maximize geometry wrong: ${MW:-?}x${MH:-?} at +${MX:-?}+${MY:-?} (screen ${SW:-?}x${SH:-?})"
+  fi
+  "$(vb vantage-remote)" unmaximize "$WID" >/dev/null 2>&1
+  sleep 0.4
   "$(vb vantage-remote)" close "$WID" >/dev/null 2>&1 \
     && ok "IPC close works" || bad "IPC close failed"
   sleep 0.3

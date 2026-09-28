@@ -159,6 +159,16 @@ int main(int argc, char **argv) {
     bool dragflow_only = false; /* the pager live-feed probe: XTest-drags
                                  * the title bar while the harness counts
                                  * throttled window-geometry events */
+    bool late_resize = false;   /* GTK-style startup: create the window
+                                 * 1x1 at (0,0), MAP it, then resize to the
+                                 * real size afterwards (apps that size
+                                 * themselves after mapping — the reported
+                                 * "XWayland apps open tiny in the corner") */
+    bool race_probe = false;    /* leader + two racing windows mapped in
+                                 * one burst: Xwayland creates their
+                                 * wl_surfaces back-to-back, and the WM's
+                                 * surface↔window association must NOT
+                                 * swap them (the serial-based match) */
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--seconds") && i + 1 < argc) seconds = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--screenshot") && i + 1 < argc) shot = argv[++i];
@@ -174,6 +184,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--narrow-probe")) narrow_only = true;
         else if (!strcmp(argv[i], "--nofreeze-probe")) nofreeze_only = true;
         else if (!strcmp(argv[i], "--drag-flow-probe")) dragflow_only = true;
+        else if (!strcmp(argv[i], "--late-resize")) late_resize = true;
+        else if (!strcmp(argv[i], "--race-probe")) race_probe = true;
     }
     Display *d = XOpenDisplay(NULL);
     if (!d) { fprintf(stderr, "cannot open display\n"); return 1; }
@@ -627,6 +639,46 @@ int main(int argc, char **argv) {
             printf("mapped 0x%lx (%d px)\n", (unsigned long)wn, widths[i]);
             fflush(stdout);
         }
+    } else if (race_probe) {
+        /* SURFACE-ASSOCIATION RACE: real apps (browsers, Steam, Java)
+         * create a group leader + several windows and map them in one
+         * burst; Xwayland then creates their wl_surfaces back-to-back.
+         * The WM's window↔surface association must land on the RIGHT
+         * window — a swap renders the big window at the helper's size
+         * ("app effectively invisible") and the model shows the wrong
+         * geometry. Windows:
+         *   leader: 1x1 at (0,0), NEVER mapped (the classic group
+         *           leader — stays "waiting" in the WM forever)
+         *   RaceA:  500x400 at (100,100), color 0x3a5f9a
+         *   RaceB:  300x200 at (620,150), color 0x9a3a5f
+         * Both mapped in one XFlush burst. */
+        Window leader = make_window(d, "RaceLeader", 0, 0, 1, 1, 0);
+        w1 = make_window(d, "RaceA", 100, 100, 500, 400, 0x3a5f9a);
+        w2 = make_window(d, "RaceB", 620, 150, 300, 200, 0x9a3a5f);
+        (void)leader;
+        XMapWindow(d, w1);
+        XMapWindow(d, w2);
+        XFlush(d);
+        printf("mapped 0x%lx 0x%lx (+leader 0x%lx)\n",
+               (unsigned long)w1, (unsigned long)w2, (unsigned long)leader);
+        fflush(stdout);
+    } else if (late_resize) {
+        /* REAL-toolkit startup: the window is created 1x1 at (0,0) and
+         * mapped BEFORE the app knows its real size; the resize comes
+         * afterwards as a ConfigureRequest (SubstructureRedirect sends
+         * it to the WM). The WM must apply it: the final model has to
+         * be the REAL size at a sane position, and the surface must
+         * paint the real content. */
+        w1 = make_window(d, title, 0, 0, 1, 1, 0x3a5f9a);
+        XMapWindow(d, w1);
+        XFlush(d);
+        printf("mapped-1x1 0x%lx\n", (unsigned long)w1);
+        fflush(stdout);
+        msleep(400);   /* map + first 1x1 draw + WM manage settle */
+        XResizeWindow(d, w1, 480, 360);
+        XFlush(d);
+        printf("resized-to 480x360\n");
+        fflush(stdout);
     } else if (!no_windows) {
         w1 = make_window(d, title, 100, 100, 400, 300, 0x3a5f9a);
         w2 = make_window(d, "Second Window", 500, 300, 300, 220, 0x9a3a5f);

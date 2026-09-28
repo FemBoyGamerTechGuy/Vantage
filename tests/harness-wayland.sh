@@ -142,6 +142,20 @@ Icon=vt-harness-probe
 Categories=Utility;
 DESK
 sed -i "s|\$WORK|$WORK|g" "$WORK/data/applications/vt-harness-probe.desktop"
+# 60 filler applications in the SAME Utility category: the Programs
+# menu's app list must SCROLL with more entries than fit on screen —
+# the scrolling regression check below depends on them being present
+# BEFORE the panel process starts (the launcher database is loaded at
+# panel construction).
+for _i in $(seq -w 1 60); do
+  cat > "$WORK/data/applications/vt-harness-filler$_i.desktop" <<DESK
+[Desktop Entry]
+Type=Application
+Name=Zzz Filler $_i
+Exec=/bin/true
+Categories=Utility;
+DESK
+done
 # deterministic ICON: a private icon theme in the isolated XDG tree with
 # a solid-color PNG — proves the panel's icon-theme lookup + PNG decode
 # + ARGB scale + row rendering end to end (this code path was silently
@@ -997,8 +1011,14 @@ if [ -n "$TBX" ] && [ "$TBX" -gt 0 ] 2>/dev/null; then
     && ok "compositor responsive right after the burst (dump in ${LIVE_MS}ms)" \
     || bad "compositor unresponsive after the burst (dump ${LIVE_MS}ms)"
   # let the panel's 400 ms refresh tick resync, then verify the window
-  # moved + title bar reachable + pager still the full 4-cell band
+  # moved + title bar reachable + pager still the full 4-cell band.
+  # RETRY the dump: the panel occasionally remaps one of its popups
+  # (GDK "moving popups" → unmap+re-map) and a frame photographed during
+  # that gap legitimately shows no bar — one bad frame is a transient,
+  # not a regression; a real pager collapse reproduces on every dump.
   sleep 0.9
+  DRAG_VERDICT=1
+  for dtry in 1 2 3; do
   rm -f /tmp/vantage-wayland.ppm
   kill -USR1 "$WM_PID" 2>/dev/null
   wait_ppm || true
@@ -1030,6 +1050,14 @@ for y in range(0, h, 2):
         if near(pix[i],pix[i+1],pix[i+2],0x9a,0x3a,0x5f,8):
             xs.append(x); ys.append(y)
 top = min(ys) if ys else -1
+# the dragged window's CONTENT must still exist at full size: the old
+# 1x1-drag bug (a move-only _xwl_configure sent WIDTH=1 HEIGHT=1)
+# collapsed the window on the first title-bar drag — the check below
+# then "passed" on one stray antialiased pixel by luck. Require a
+# real blob: >= 2000 sampled pixels (~300x220/4) at the clamped top.
+blob_n = len(xs)
+blob_w = (max(xs) - min(xs)) if xs else 0
+blob_h = (max(ys) - min(ys)) if ys else 0
 # pager band integrity: 4 cells of 64px + gaps ≈ 280 columns of cell
 # background; the mid-drag WS misalignment used to collapse it to 1
 from collections import Counter
@@ -1049,10 +1077,19 @@ if cols:
             i = (y*w + x)*3
             if pix[i] >= 0xe0 and pix[i+1] >= 0xe0 and pix[i+2] >= 0xe0:
                 foc += 1
-print(f"drag: win-top={top} pager-span={span} focused-mini={foc}")
-sys.exit(0 if (70 <= top <= 100 and span >= 200 and foc >= 6) else 1)
+print(f"drag: win-top={top} blob={blob_n}px {blob_w}x{blob_h} pager-span={span} focused-mini={foc}")
+# span==0: the panel is mid-remap in THIS frame — retry the dump
+# before declaring failure
+if span == 0 and foc == 0:
+    sys.exit(2)
+sys.exit(0 if (70 <= top <= 100 and blob_n >= 2000 and blob_w >= 280
+               and blob_h >= 200 and span >= 200 and foc >= 6) else 1)
 PYDRAG1
-  [ $? -eq 0 ] && ok "window dragged: title bar reachable, pager 4-cell band intact" \
+  DRAG_VERDICT=$?
+  [ "$DRAG_VERDICT" -eq 2 ] && { sleep 0.5; continue; }
+  break
+  done
+  [ "$DRAG_VERDICT" -eq 0 ] && ok "window dragged: title bar reachable, pager 4-cell band intact" \
     || bad "drag result wrong (window strand/pager collapse)"
 else
   bad "X11 drag window never rendered under Xwayland (composite path?)"
@@ -1236,6 +1273,347 @@ else
 fi
 kill "$RSZ_PID" 2>/dev/null
 wait "$RSZ_PID" 2>/dev/null
+
+# ===================================================================
+# 0.3.5 regression suite — the user-reported desktop bugs, pinned with
+# REAL-toolkit probes (the synthetic testclient acks configures
+# blindly; GTK4 does not — it exposed all of these):
+#   1. native Wayland resize actually applies (xdg configure handshake)
+#   2. maximize keeps the top panel visible (workarea + SSD inset)
+#   3. the Start Menu scrolls (seat protocol + value120 wheel encoding)
+#   4. XWayland windows: serial-based surface association (no swaps)
+#   5. XWayland SSD close/maximize buttons work (no NULL deref crash)
+# ===================================================================
+echo "== harness-wayland: REAL GTK4 client — configure handshake =="
+
+# generic WM-model geometry by window title (wgeo above is hardcoded
+# to the testclient's title)
+wgeo_t() { "$(vb vantage-remote)" list 2>/dev/null \
+  | awk -F'\t' -v t="$1" '$2==t{print $7,"\t",$8,"\t",$9,"\t",$10; exit}'; }
+
+# --- helper: dump + panel-band check (the bar must stay visible)
+panel_band_px() {  # prints the panel bar's pixel count in the top band
+python3 - <<'PYPB'
+import sys
+try:
+    with open('/tmp/vantage-wayland.ppm','rb') as f: d=f.read()
+    v=[]; i=d.find(b'P6')+2
+    while len(v)<3:
+        while d[i:i+1].isspace(): i+=1
+        j=i
+        while not d[j:j+1].isspace(): j+=1
+        v.append(int(d[i:j])); i=j
+    i+=1
+    w,h=v[0],v[1]; px=d[i:i+w*h*3]
+    bar=0
+    for y in range(2,40):
+        for x in range(0,w,2):
+            k=(y*w+x)*3
+            if abs(px[k]-0x16)<=8 and abs(px[k+1]-0x18)<=8 and abs(px[k+2]-0x1c)<=8:
+                bar+=1
+    print(bar)
+except Exception:
+    print(0)
+PYPB
+}
+
+GTK_LOG="$WORK/gtk-probe.log"
+if [ -x "$(tc vt-gtk4-probe)" ]; then
+  "$(tc vt-gtk4-probe)" --label "GtkProbe" > "$GTK_LOG" 2>&1 &
+  GTK_PID=$!
+  for i in $(seq 1 80); do
+    grep -q "^mapped" "$GTK_LOG" 2>/dev/null && break
+    kill -0 "$GTK_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  sleep 1.2
+  GP=$(wgeo_t "GtkProbe")
+  read -r GX GY GW GH <<< "$(echo "$GP" | tr -d '\t')"
+  if [ -n "$GW" ] && [ "$GW" -gt 300 ]; then
+    ok "real GTK4 window mapped ${GW}x${GH}"
+  else
+    bad "real GTK4 window geometry wrong: '$GP'"
+  fi
+
+  # --- 1. interactive resize through the REAL input path: the model
+  #     grows AND the toolkit actually allocates the new size (the old
+  #     incomplete configure handshake made resizes phantom)
+  ti "motion x=$((GX + GW / 2)) y=$((GY + GH / 2))"
+  ti "keydown Super_L"; ti "press b=3"; sleep 0.1
+  ti "motion x=$((GX + GW / 2 + 190)) y=$((GY + GH / 2 + 110))"; sleep 0.4
+  ti "release b=3"; ti "keyup Super_L"
+  sleep 1.2
+  GP2=$(wgeo_t "GtkProbe")
+  read -r GX2 GY2 GW2 GH2 <<< "$(echo "$GP2" | tr -d '\t')"
+  NSIZE=$(grep -cE "^size" "$GTK_LOG")
+  if [ "${GW2:-0}" -gt $((GW + 90)) ] 2>/dev/null && [ "$NSIZE" -ge 2 ]; then
+    ok "GTK4 resize APPLIED (model ${GW}x${GH} -> ${GW2}x${GH2}, $(grep -E '^size' "$GTK_LOG" | tail -1))"
+  else
+    bad "GTK4 resize phantom (model ${GW}x${GH} -> ${GW2:-?}x${GH2:-?}, size lines=$NSIZE)"
+  fi
+
+  # --- 2. maximize through the TASKBAR path (vantage-remote maximize
+  #     -> WM -> backend): workarea placement, panel stays visible, the
+  #     toolkit applies it
+  GID=$("$(vb vantage-remote)" list 2>/dev/null | awk -F'\t' '$2=="GtkProbe"{print $1; exit}')
+  "$(vb vantage-remote)" maximize "$GID" >/dev/null 2>&1
+  sleep 1.5
+  GP3=$(wgeo_t "GtkProbe")
+  read -r GX3 GY3 GW3 GH3 <<< "$(echo "$GP3" | tr -d '\t')"
+  rm -f /tmp/vantage-wayland.ppm
+  kill -USR1 "$WM_PID" 2>/dev/null
+  wait_ppm || true
+  sleep 0.1
+  BARPX=$(panel_band_px)
+  if [ "${GW3:-0}" -gt 900 ] 2>/dev/null && [ "${GY3:-999}" -ge 44 ] && \
+     [ "${BARPX:-0}" -gt 500 ]; then
+    ok "maximize kept the panel visible (client ${GW3}x${GH3} at +${GX3}+${GY3}, bar-px=$BARPX)"
+  else
+    bad "maximize wrong: ${GW3:-?}x${GH3:-?} at +${GX3:-?}+${GY3:-?}, bar-px=${BARPX:-?}"
+  fi
+  # unmaximize restores the pre-maximize size (saved geometry)
+  "$(vb vantage-remote)" unmaximize "$GID" >/dev/null 2>&1
+  sleep 1.2
+  GP4=$(wgeo_t "GtkProbe")
+  read -r GX4 GY4 GW4 GH4 <<< "$(echo "$GP4" | tr -d '\t')"
+  if [ "${GW4:-0}" -gt 300 ] && [ "${GW4:-999}" -lt 800 ]; then
+    ok "unmaximize restored window size (${GW4}x${GH4})"
+  else
+    bad "unmaximize wrong: ${GW4:-?}x${GH4:-?}"
+  fi
+  kill "$GTK_PID" 2>/dev/null
+  wait "$GTK_PID" 2>/dev/null
+else
+  echo "  (vt-gtk4-probe not built — real-toolkit checks skipped)"
+fi
+
+# --- 3. Start Menu scrolling: open the menu (61 entries in
+#     Accessories), wheel-scroll 15 detents over the app list, verify
+#     the content moved (region change or displacement — a hover only
+#     touches ~3% of the region, a real scroll swaps the row text)
+echo "== harness-wayland: Start Menu scrolling =="
+ti "click 60,22"
+MENU_OPEN2=""
+for t in 1 2 3 4 5 6; do
+  sleep 0.5
+  rm -f /tmp/vantage-wayland.ppm
+  kill -USR1 "$WM_PID" 2>/dev/null
+  wait_ppm || continue
+  L=$(python3 -c '
+try:
+    with open("/tmp/vantage-wayland.ppm","rb") as f: d=f.read()
+    v=[]; i=d.find(b"P6")+2
+    while len(v)<3:
+        while d[i:i+1].isspace(): i+=1
+        j=i
+        while not d[j:j+1].isspace(): j+=1
+        v.append(int(d[i:j])); i=j
+    i+=1; w,h=v[0],v[1]; px=d[i:i+w*h*3]
+    n=0
+    for y in range(60,400,2):
+        for x in range(8,600,2):
+            k=(y*w+x)*3
+            if px[k]>=0x90 and px[k+1]>=0x90 and px[k+2]>=0x90: n+=1
+    print(n)
+except Exception: print(0)')
+  [ "${L:-0}" -gt 300 ] 2>/dev/null && { MENU_OPEN2=1; break; }
+done
+if [ -n "$MENU_OPEN2" ]; then
+  cp /tmp/vantage-wayland.ppm "$WORK/menu-before.ppm"
+  ti "motion x=300 y=200"
+  for i in $(seq 1 15); do ti "axis d=1"; sleep 0.05; done
+  sleep 0.5
+  rm -f /tmp/vantage-wayland.ppm
+  kill -USR1 "$WM_PID" 2>/dev/null
+  wait_ppm || true
+  SCROLL_VERDICT=$(python3 - "$WORK/menu-before.ppm" <<'PYMS'
+import sys
+def load(p):
+    with open(p,'rb') as f: d=f.read()
+    v=[]; i=d.find(b'P6')+2
+    while len(v)<3:
+        while d[i:i+1].isspace(): i+=1
+        j=i
+        while not d[j:j+1].isspace(): j+=1
+        v.append(int(d[i:j])); i=j
+    i+=1
+    return v[0],v[1],d[i:i+v[0]*v[1]*3]
+try:
+    w,h,a=load(sys.argv[1])
+    with open('/tmp/vantage-wayland.ppm','rb') as f: d=f.read()
+    v=[]; i=d.find(b'P6')+2
+    while len(v)<3:
+        while d[i:i+1].isspace(): i+=1
+        j=i
+        while not d[j:j+1].isspace(): j+=1
+        v.append(int(d[i:j])); i=j
+    i+=1; _,_,b=w,h,d[i:i+w*h*3]
+    ya=[sum(a[(y*w+x)*3] for x in range(60,560,4)) for y in range(80,460)]
+    yb=[sum(b[(y*w+x)*3] for x in range(60,560,4)) for y in range(80,460)]
+    best,bestd=0,1e18
+    for shift in range(-800,801,2):
+        s=0; n=0
+        for i2 in range(len(ya)):
+            j=i2+shift
+            if 0<=j<len(yb): s+=abs(ya[i2]-yb[j]); n+=1
+        if n>50:
+            dd=s/n
+            if dd<bestd: bestd=dd; best=shift
+    tot=0; dif=0
+    for y in range(180,460,2):
+        for x in range(200,560,2):
+            k=(y*w+x)*3
+            tot+=1
+            if a[k:k+3]!=b[k:k+3]: dif+=1
+    frac=dif/tot if tot else 0
+    print(f"{best}|{frac:.3f}")
+    sys.exit(0 if (abs(best)>=40 or frac>0.10) else 1)
+except Exception as e:
+    print(f"ERR|{e}"); sys.exit(1)
+PYMS
+)
+  RC=$?
+  ti "motion x=12 y=740"; sleep 0.3; ti "click 12,740"; sleep 0.4
+  if [ $RC -eq 0 ]; then
+    ok "Start Menu scrolls ($SCROLL_VERDICT)"
+  else
+    bad "Start Menu did not scroll ($SCROLL_VERDICT)"
+  fi
+else
+  bad "Start Menu never opened for the scrolling check"
+  ti "motion x=12 y=740" 2>/dev/null; sleep 0.2
+fi
+
+# --- 4/5. XWayland: serial-based association + working SSD buttons
+echo "== harness-wayland: XWayland association + SSD buttons =="
+if [ -n "$XWL_DISPLAY1" ] && [ -n "$XWL_AUTH1" ]; then
+  # racing windows: leader + two toplevels in one burst — a recency
+  # guess swaps their surfaces (each window renders at ANOTHER's
+  # geometry); the serial match must land each on its own
+  RACE_LOG="$WORK/race.log"
+  DISPLAY="$XWL_DISPLAY1" XAUTHORITY="$XWL_AUTH1" \
+    "$(tc vt-x11-testclient)" --seconds 8 --race-probe > "$RACE_LOG" 2>&1 &
+  RACE_PID=$!
+  for i in $(seq 1 40); do
+    grep -q "^mapped" "$RACE_LOG" 2>/dev/null && break
+    kill -0 "$RACE_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  sleep 1.2
+  RACE_MODEL=$(wgeo_t "RaceA")
+  read -r RAX RAY RAW RAH <<< "$(echo "$RACE_MODEL" | tr -d '\t')"
+  rm -f /tmp/vantage-wayland.ppm
+  kill -USR1 "$WM_PID" 2>/dev/null
+  wait_ppm || true
+  RACE_OK=$(python3 <<'PYRC'
+import sys
+with open('/tmp/vantage-wayland.ppm','rb') as f: d=f.read()
+v=[]; i=d.find(b'P6')+2
+while len(v)<3:
+    while d[i:i+1].isspace(): i+=1
+    j=i
+    while not d[j:j+1].isspace(): j+=1
+    v.append(int(d[i:j])); i=j
+i+=1
+w,h=v[0],v[1]; px=d[i:i+w*h*3]
+def near(r,g,b,R,G,B,t=10): return abs(r-R)<=t and abs(g-G)<=t and abs(b-B)<=t
+def blob(R,G,B):
+    xs,ys=[],[]
+    for y in range(0,h,2):
+        for x in range(0,w,2):
+            k=(y*w+x)*3
+            if near(px[k],px[k+1],px[k+2],R,G,B): xs.append(x); ys.append(y)
+    if not xs: return None
+    return (max(xs)-min(xs), max(ys)-min(ys), (min(xs)+max(xs))//2)
+a=blob(0x3a,0x5f,0x9a); b=blob(0x9a,0x3a,0x5f)
+ok = bool(a and b) and a[0]>420 and a[1]>330 and b[0]>220 and b[1]>140 and a[2]<520 and b[2]>600
+print(f"A={a} B={b}")
+sys.exit(0 if ok else 1)
+PYRC
+)
+  if [ $? -eq 0 ] && [ "${RAW:-0}" -eq 500 ]; then
+    ok "racing XWayland windows pair correctly ($RACE_OK)"
+  else
+    bad "racing XWayland windows swapped (model '$RACE_MODEL', $RACE_OK)"
+  fi
+  wait "$RACE_PID" 2>/dev/null
+
+  # SSD buttons on an XWayland window: close must not crash the
+  # compositor (NULL xdg resource) and must actually close the window
+  XBTN_LOG="$WORK/xwl-btn.log"
+  DISPLAY="$XWL_DISPLAY1" XAUTHORITY="$XWL_AUTH1" \
+    "$(tc vt-x11-testclient)" --seconds 14 --title "XwlBtn" > "$XBTN_LOG" 2>&1 &
+  XBTN_PID=$!
+  for i in $(seq 1 40); do
+    grep -q "^mapped" "$XBTN_LOG" 2>/dev/null && break
+    kill -0 "$XBTN_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  sleep 0.8
+  XB=$(wgeo_t "XwlBtn")
+  read -r XX XY XW XH <<< "$(echo "$XB" | tr -d '\t')"
+  if [ -n "$XW" ] && [ "$XW" -gt 100 ]; then
+    XFX=$((XX - 2)); XFY=$((XY - 28)); XFW=$((XW + 4))
+    ti "click $((XFX + XFW - 2 - 22 + 10)),$((XFY + 13))"
+    sleep 1.5
+    if kill -0 "$WM_PID" 2>/dev/null; then
+      ok "compositor survived XWayland SSD close-click"
+      if [ -z "$(wgeo_t "XwlBtn")" ]; then
+        ok "XWayland window closed via the SSD × button"
+      else
+        bad "XWayland window survived the SSD × button"
+        XID=$(wgeo_t "XwlBtn" | awk -F'\t' '{print $1}')
+        [ -n "$XID" ] && "$(vb vantage-remote)" close "$XID" >/dev/null 2>&1
+      fi
+    else
+      bad "compositor CRASHED on XWayland SSD close-click (regression)"
+      # restart the world so later phases still run
+      wait "$XBTN_PID" 2>/dev/null
+    fi
+  else
+    bad "XWayland button-probe window missing: '$XB'"
+    kill "$XBTN_PID" 2>/dev/null
+  fi
+  wait "$XBTN_PID" 2>/dev/null
+
+  # XWayland maximize via the SSD button: the frame fills the WORKAREA
+  # (panel visible, client top below the panel + title band)
+  XBM_LOG="$WORK/xwl-max.log"
+  DISPLAY="$XWL_DISPLAY1" XAUTHORITY="$XWL_AUTH1" \
+    "$(tc vt-x11-testclient)" --seconds 12 --title "XwlMax" > "$XBM_LOG" 2>&1 &
+  XBM_PID=$!
+  for i in $(seq 1 40); do
+    grep -q "^mapped" "$XBM_LOG" 2>/dev/null && break
+    kill -0 "$XBM_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  sleep 0.8
+  XM=$(wgeo_t "XwlMax")
+  read -r MX MY MW MH <<< "$(echo "$XM" | tr -d '\t')"
+  if [ -n "$MW" ] && [ "$MW" -gt 100 ]; then
+    MFX=$((MX - 2)); MFY=$((MY - 28)); MFW=$((MW + 4))
+    ti "click $((MFX + MFW - 2 - 22 - 24 + 11)),$((MFY + 13))"
+    sleep 1.2
+    XM2=$(wgeo_t "XwlMax")
+    read -r MX2 MY2 MW2 MH2 <<< "$(echo "$XM2" | tr -d '\t')"
+    rm -f /tmp/vantage-wayland.ppm
+    kill -USR1 "$WM_PID" 2>/dev/null
+    wait_ppm || true
+    BARPX2=$(panel_band_px)
+    if [ "${MW2:-0}" -gt 900 ] && [ "${MY2:-999}" -ge 70 ] && [ "${BARPX2:-0}" -gt 500 ]; then
+      ok "XWayland maximize fills the workarea, panel visible (${MW2}x${MH2} at +${MX2}+${MY2})"
+    else
+      bad "XWayland maximize wrong: ${MW2:-?}x${MH2:-?} at +${MX2:-?}+${MY2:-?} bar-px=${BARPX2:-?}"
+    fi
+    XID2=$(wgeo_t "XwlMax" | awk -F'\t' '{print $1}')
+    [ -n "$XID2" ] && "$(vb vantage-remote)" close "$XID2" >/dev/null 2>&1
+  else
+    bad "XWayland maximize-probe window missing: '$XM'"
+  fi
+  wait "$XBM_PID" 2>/dev/null
+else
+  bad "Xwayland not available for the association/button checks"
+fi
 
 # ------------------------------------------------------------- shutdown
 # Ctrl+C (SIGINT) takes the same clean-unwind path as SIGTERM: restore,

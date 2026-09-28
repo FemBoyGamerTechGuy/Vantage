@@ -1086,6 +1086,26 @@ static _rect_t _output_for_window(vt_wm_x11_t *e, _client_t *c) {
     return o;
 }
 
+/* The rectangle a window's FRAME must occupy when maximized: the
+ * intersection of the window's output with the WORKAREA (panel struts
+ * are NOT usable space) — the raw output covered the docked panel and
+ * pushed the frame's title band off-screen. Callers inset the client
+ * by the frame extents (the X11 session draws its own frame around
+ * every non-CSD window). */
+static _rect_t _maximize_rect(vt_wm_x11_t *e, _client_t *c) {
+    _rect_t o = _output_for_window(e, c);
+    _rect_t wa = e->workarea;
+    /* intersect output with the global workarea (single-output in
+     * practice; a multi-head workarea is the union) */
+    int x0 = o.x > wa.x ? o.x : wa.x;
+    int y0 = o.y > wa.y ? o.y : wa.y;
+    int x1 = (o.x + o.w) < (wa.x + wa.w) ? (o.x + o.w) : (wa.x + wa.w);
+    int y1 = (o.y + o.h) < (wa.y + wa.h) ? (o.y + o.h) : (wa.y + wa.h);
+    if (x1 - x0 < 50 || y1 - y0 < 50) return o;   /* degenerate: raw output */
+    _rect_t r = { x0, y0, x1 - x0, y1 - y0 };
+    return r;
+}
+
 /* ------------------------------------------------------------ manage */
 static void _apply_configure(vt_wm_x11_t *e, _client_t *c, int x, int y,
                              int w, int h) {
@@ -1304,11 +1324,28 @@ static void _unmanage(vt_wm_x11_t *e, Window w, bool destroyed) {
 static void _maximize(vt_wm_x11_t *e, _client_t *c, bool on) {
     if (on == c->model.maximized) return;
     if (on) {
-        _rect_t out = _output_for_window(e, c);
-        c->model.prev_x = c->model.x; c->model.prev_y = c->model.y;
-        c->model.prev_w = c->model.w; c->model.prev_h = c->model.h;
-        c->model.maximized = true;
-        _apply_configure(e, c, out.x, out.y, out.w, out.h);
+        _rect_t r = _maximize_rect(e, c);
+        /* the FRAME fills the maximize rect: inset the client by the
+         * frame extents so the title bar stays below the top panel
+         * and the whole frame is on screen (the old code placed the
+         * CLIENT at the raw output origin — it covered the panel and
+         * cut the × button off the top of the screen). */
+        if (_framed(c)) {
+            int fx = r.x + _FR_BORDER;
+            int fy = r.y + c->fr_title + _FR_BORDER;
+            int fw = r.w - 2 * _FR_BORDER;
+            int fh = r.h - c->fr_title - 2 * _FR_BORDER;
+            if (fw < 50 || fh < 50) { fw = r.w; fh = r.h; fx = r.x; fy = r.y; }
+            c->model.prev_x = c->model.x; c->model.prev_y = c->model.y;
+            c->model.prev_w = c->model.w; c->model.prev_h = c->model.h;
+            c->model.maximized = true;
+            _apply_configure(e, c, fx, fy, fw, fh);
+        } else {
+            c->model.prev_x = c->model.x; c->model.prev_y = c->model.y;
+            c->model.prev_w = c->model.w; c->model.prev_h = c->model.h;
+            c->model.maximized = true;
+            _apply_configure(e, c, r.x, r.y, r.w, r.h);
+        }
     } else {
         c->model.maximized = false;
         _apply_configure(e, c, c->model.prev_x, c->model.prev_y,

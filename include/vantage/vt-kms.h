@@ -73,6 +73,7 @@ int       vt_kms_out_height(const vt_kms_t *k, int i);
 int       vt_kms_out_refresh(const vt_kms_t *k, int i);
 const char *vt_kms_renderer(const vt_kms_t *k);   /* honest GPU string */
 bool      vt_kms_hw_cursor(const vt_kms_t *k);
+bool      vt_kms_cursor_active(const vt_kms_t *k); /* plane is showing it now */
 const char *vt_kms_scanout_str(const vt_kms_t *k); /* "gbm"|"dumb" */
 int       vt_kms_fd(const vt_kms_t *k);
 

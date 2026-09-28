@@ -150,6 +150,15 @@ void vt_wm_maximize(vt_wm_t *wm, vt_window_t *w, bool on) {
         vt_wm_x11_maximize_id((struct vt_wm_x11 *)wm->engine, w->id, on);
         return;
     }
+    /* Wayland: ask the compositor to apply the state to the native
+     * window (xdg configure / X-side XConfigureWindow). The old code
+     * only flipped the MODEL flag — the taskbar button changed the
+     * window's cosmetic state while nothing happened on screen. */
+    if (wm->backend && wm->backend->kind == VT_BACKEND_WAYLAND &&
+        wm->backend->maximize_window) {
+        if (wm->backend->maximize_window(wm->backend, w->id, on) == 0)
+            return;
+    }
     if (on && !w->maximized) {
         w->prev_x = w->x; w->prev_y = w->y;
         w->prev_w = w->w; w->prev_h = w->h;
@@ -166,6 +175,12 @@ void vt_wm_minimize(vt_wm_t *wm, vt_window_t *w, bool on) {
     if (wm->engine) {
         vt_wm_x11_minimize_id((struct vt_wm_x11 *)wm->engine, w->id, on);
         return;
+    }
+    /* Wayland: through the compositor (xdg minimize / X-side unmap) */
+    if (wm->backend && wm->backend->kind == VT_BACKEND_WAYLAND &&
+        wm->backend->minimize_window) {
+        if (wm->backend->minimize_window(wm->backend, w->id, on) == 0)
+            return;
     }
     w->minimized = on;
 }

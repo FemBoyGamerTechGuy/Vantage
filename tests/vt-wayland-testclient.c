@@ -25,6 +25,7 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <poll.h>
 
 static struct wl_compositor *compositor = NULL;
 static struct wl_shm *shm = NULL;
@@ -75,6 +76,12 @@ static int configured = 0;
 static int buffer_released = 0;   /* wl_buffer.release received? */
 static int popup_done_got = 0;     /* xdg_popup.popup_done received? */
 static int popup_cfg_w = 0, popup_cfg_h = 0;   /* popup configure size */
+static int cfg_w = 0, cfg_h = 0;   /* last toplevel configure size
+                                    * (0 = client-chosen); --apply-configure
+                                    * resizes its buffer to match, exactly
+                                    * like a real toolkit (GTK/Qt) does —
+                                    * the synthetic blind-ack behavior hid
+                                    * configure-handshake bugs */
 
 /* ---- wl_buffer listener: clients may only reuse a buffer after the
  * ---- compositor releases it. A compositor that never sends release
@@ -164,7 +171,12 @@ static const struct xdg_surface_listener _xdg_surface_listener = {
 
 static void _toplevel_configure(void *data, struct xdg_toplevel *t,
                                 int32_t w, int32_t h, struct wl_array *st) {
-    (void)data; (void)t; (void)w; (void)h; (void)st;
+    (void)data; (void)t; (void)st;
+    if (w > 0) cfg_w = w;
+    if (h > 0) cfg_h = h;
+    if (w > 0 && h > 0)
+        printf("toplevel-configure %dx%d\n", w, h);
+    fflush(stdout);
 }
 static void _toplevel_close(void *data, struct xdg_toplevel *t) {
     (void)data; (void)t;
@@ -201,11 +213,17 @@ int main(int argc, char **argv) {
     bool ssd_mode = false;        /* request SERVER-side decorations via
                                     * xdg-decoration: exercises the compositor's
                                     * SSD frame + interactive edge resize */
+    bool apply_configure = false; /* behave like a REAL toolkit: resize the
+                                    * buffer to the last toplevel configure
+                                    * size and re-commit (resize/maximize
+                                    * actually apply — pins the complete
+                                    * xdg configure handshake) */
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--keymap-only")) keymap_only = true;
         else if (!strcmp(argv[i], "--popup")) popup_mode = true;
         else if (!strcmp(argv[i], "--multipool")) multipool_mode = true;
         else if (!strcmp(argv[i], "--ssd")) ssd_mode = true;
+        else if (!strcmp(argv[i], "--apply-configure")) apply_configure = true;
     }
     /* positional arguments (color [w [h]]) — counted across flags so
      * "--ssd 0x112233 300 200" and "0x112233 300 200" both work */
@@ -446,7 +464,51 @@ int main(int argc, char **argv) {
     long live_s = 6;
     const char *live_env = getenv("VT_TESTCLIENT_SECONDS");
     if (live_env && *live_env) live_s = atol(live_env);
-    for (long t = 0; t < live_s; t++) sleep(1);   /* SIGUSR1 windows */
+    for (long t = 0; t < live_s; t++) {
+        if (apply_configure) {
+            /* real-toolkit behavior: drain the compositor's events (a
+             * bare dispatch_pending never READS the socket — configure
+             * events sat unread and the window never applied them),
+             * then commit a buffer matching the configured size. */
+            struct pollfd pfd = { .fd = wl_display_get_fd(d),
+                                  .events = POLLIN };
+            if (poll(&pfd, 1, 150) > 0)
+                wl_display_dispatch(d);
+            if (cfg_w > 0 && cfg_h > 0 &&
+                (cfg_w != width || cfg_h != height)) {
+                width = cfg_w;
+                height = cfg_h;
+                size_t nstride = (size_t)width * 4;
+                size_t nsz = nstride * (size_t)height;
+                int nfd = memfd_create("vt-test-rsz", 0);
+                if (nfd >= 0 && ftruncate(nfd, (off_t)nsz) == 0) {
+                    uint32_t *npix = mmap(NULL, nsz, PROT_READ | PROT_WRITE,
+                                          MAP_SHARED, nfd, 0);
+                    if (npix != MAP_FAILED) {
+                        for (size_t i = 0; i < (size_t)width * height; i++)
+                            npix[i] = color;
+                        struct wl_shm_pool *npool = wl_shm_create_pool(
+                            shm, nfd, (int32_t)nsz);
+                        struct wl_buffer *nbuf = wl_shm_pool_create_buffer(
+                            npool, 0, width, height, (int32_t)nstride,
+                            WL_SHM_FORMAT_ARGB8888);
+                        wl_buffer_add_listener(nbuf, &_buf_listener, NULL);
+                        wl_surface_attach(surf, nbuf, 0, 0);
+                        wl_surface_damage(surf, 0, 0, width, height);
+                        wl_surface_commit(surf);
+                        /* small requests sit in libwayland's output
+                         * buffer until something flushes — push the
+                         * commit out NOW (the compositor cannot act on
+                         * a resize it never received). */
+                        wl_display_flush(d);
+                        printf("resized-to %dx%d\n", width, height);
+                        fflush(stdout);
+                    }
+                }
+            }
+        }
+        sleep(1);   /* SIGUSR1 windows */
+    }
     (void)have_globals;
     if (buffer_released)
         printf("buffer released %d\n", buffer_released);

@@ -74,6 +74,12 @@ typedef struct _wl_surf {
     int32_t  win_gx, win_gy, win_gw, win_gh;
     bool     have_win_geo;
     int32_t  last_gx, last_gy;        /* previous geometry offset (anchor) */
+    uint32_t last_cfg_serial;         /* last xdg_surface.configure serial
+                                       * we sent (ack_configure sanity) */
+    int32_t  last_announced_w, last_announced_h;   /* last size announced
+                                                    * to the WM model
+                                                    * (dedup for resize
+                                                    * commits) */
     /* wl_pointer.set_cursor duties */
     bool     is_cursor;
     int      hotspot_x, hotspot_y;
@@ -100,6 +106,14 @@ typedef struct _xdg_toplevel {
     char *title;
     char *app_id;
     int32_t min_w, min_h, max_w, max_h;   /* xdg size hints; 0 = unset */
+    /* geometry mirror for XWayland toplevels whose surface has not
+     * paired yet (the WIN_MAP event fires at X-map time with no
+     * surface; announcing 0x0-at-+0+0 made the WM model a "tiny window
+     * in the corner" until the first buffer commit). Maintained by the
+     * xwl code from the X window's geometry. */
+    int x, y, w, h;
+    /* restore geometry for unmaximize (both xdg and xwl windows) */
+    int prev_x, prev_y, prev_w, prev_h;
 } _xdg_toplevel_t;
 
 /* xdg_positioner state (popup placement) — parsed for real, so GTK
@@ -261,7 +275,7 @@ extern _wl_state_t *_wls;
 
 void _emit_win(_wl_state_t *st, vt_backend_wl_event_kind_t kind,
                _xdg_toplevel_t *t);
-void _toplevel_configure(struct wl_resource *res, int32_t w, int32_t h,
+void _toplevel_configure(struct _xdg_toplevel *t, int32_t w, int32_t h,
                          uint32_t state);
 void _kbd_enter_focus(_wl_state_t *st, _wl_surf_t *s);
 void _popup_done(_wl_state_t *st, _wl_surf_t *s);

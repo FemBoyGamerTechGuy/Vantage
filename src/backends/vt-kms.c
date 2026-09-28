@@ -1082,6 +1082,15 @@ const char *vt_kms_renderer(const vt_kms_t *k) {
 bool vt_kms_hw_cursor(const vt_kms_t *k) {
     return k ? k->hw_cursor : false;
 }
+
+bool vt_kms_cursor_active(const vt_kms_t *k) {
+    /* the hardware plane is ACTUALLY showing the cursor right now
+     * (not merely capable of it): the software sprite must not also
+     * blend a copy into the framebuffer in that state — the two
+     * overlapped renderings double-blend the cursor's antialiased
+     * fringe/shadow into a visible halo around the pointer. */
+    return k ? (k->hw_cursor && k->cursor_on) : false;
+}
 const char *vt_kms_scanout_str(const vt_kms_t *k) {
     if (!k) return "none";
 #if defined(VT_HAVE_GBM)

@@ -184,10 +184,24 @@ void _layer_workarea(_wl_state_t *st, int *wx, int *wy, int *ww, int *wh) {
             if (ls->layer != ZWLR_LAYER_SHELL_V1_LAYER_TOP &&
                 ls->layer != ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY)
                 continue;
-            if (ls->anchors & _A_TOP)    top = (e > top) ? e : top;
-            if (ls->anchors & _A_BOTTOM) bottom = (e > bottom) ? e : bottom;
-            if (ls->anchors & _A_LEFT)  left = (e > left) ? e : left;
-            if (ls->anchors & _A_RIGHT) right = (e > right) ? e : right;
+            /* STRETCH anchors do not reserve space: a full-width top
+             * panel anchors LEFT|RIGHT|TOP — the LEFT/RIGHT anchors
+             * only stretch it across the screen. Counting them as side
+             * reservations shrank the workarea by the panel height on
+             * the left and right (maximized windows got bogus margins
+             * and everything the workarea feeds — placement clamps,
+             * maximize, tiling — was skewed). An edge reserves space
+             * only when the surface does NOT span the opposite axis. */
+            bool spans_h = (ls->anchors & _A_LEFT) && (ls->anchors & _A_RIGHT);
+            bool spans_v = (ls->anchors & _A_TOP) && (ls->anchors & _A_BOTTOM);
+            if (!spans_v) {
+                if (ls->anchors & _A_TOP)    top = (e > top) ? e : top;
+                if (ls->anchors & _A_BOTTOM) bottom = (e > bottom) ? e : bottom;
+            }
+            if (!spans_h) {
+                if (ls->anchors & _A_LEFT)  left = (e > left) ? e : left;
+                if (ls->anchors & _A_RIGHT) right = (e > right) ? e : right;
+            }
         }
     }
     if (wx) *wx = left;

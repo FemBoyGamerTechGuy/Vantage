@@ -102,6 +102,13 @@ typedef struct vt_backend {
     /* Ask the backend to close a native window (xdg_toplevel close on
      * Wayland; X11 goes through its WM engine instead). Optional. */
     int      (*close_window)(struct vt_backend *self, uint64_t window_id);
+    /* Ask the backend to maximize/unmaximize or (un)minimize a native
+     * window — the taskbar buttons route through here (Wayland side;
+     * X11 goes through its WM engine). Optional. */
+    int      (*maximize_window)(struct vt_backend *self, uint64_t window_id,
+                               bool on);
+    int      (*minimize_window)(struct vt_backend *self, uint64_t window_id,
+                               bool on);
     /* Optional: compositor-side hotkey dispatch, set by the WM host.
      * Returns true when the combo was consumed (do not forward the key
      * to the focused client). */

@@ -94,6 +94,25 @@ if wl_client_ok
 endif
 
 # ------------------------------------------------------------------
+# REAL-toolkit GTK4 probe: a plain GTK application (CSD headerbar,
+# cairo content) the harnesses drive through the compositor's own
+# input path. The synthetic vt-wayland-testclient acks configures
+# blindly and ignores the configured size — GTK4 hides nothing, so
+# this probe pins the COMPLETE xdg configure handshake (resize and
+# maximize must actually apply), pointer scrolling, and the XWayland
+# window-management paths against real-toolkit behavior.
+# ------------------------------------------------------------------
+if sub_dep_gtk4.found() and get_option('tests').enabled()
+  gtk4_probe = executable('vt-gtk4-probe',
+    sources : 'gtk4-probe.c',
+    dependencies : [sub_dep_gtk4],
+    install : true,
+    install_dir : join_paths(vt_libdir, 'vantage', 'tests'),
+    install_rpath : vt_extra_rpath,
+  )
+endif
+
+# ------------------------------------------------------------------
 # Integration harnesses — boot the real session / compositor.
 #   xvfb    : Xvfb + full vantage-session (wm+panel+desktop) + clients
 #   wayland : vantage-wm as headless Wayland compositor + xdg-shell client
@@ -123,7 +142,7 @@ if harness_wayland.found() and wl_client_ok and \
    dep_wayland_server.found() and get_option('tests').enabled()
   test('harness-wayland', harness_wayland,
     args : [meson.project_build_root()],
-    timeout : 60,
+    timeout : 200,
     suite : 'integration',
     is_parallel : false)
 endif
