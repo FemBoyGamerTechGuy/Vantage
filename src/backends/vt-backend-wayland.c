@@ -301,6 +301,10 @@ static void _surf_commit(struct wl_client *cli, struct wl_resource *res) {
     /* buffer/offset bookkeeping before mapping math */
     if (s->dx || s->dy) {
         if (s->mapped) {
+            if (s->xwl)
+                vt_logd("wayland: xwl surface %p attach-delta %d,%d: "
+                        "(%d,%d) -> (%d,%d)", (void*)s, s->dx, s->dy,
+                        s->x, s->y, s->x - s->dx, s->y - s->dy);
             s->x -= s->dx;
             s->y -= s->dy;
         }
@@ -326,7 +330,11 @@ static void _surf_commit(struct wl_client *cli, struct wl_resource *res) {
             /* Xwayland window: the X-side WM (vt-wl-xwayland.c) owns
              * geometry; the surface paints exactly where the X window
              * is, no xdg configure handshake involved */
+            vt_logd("wayland: xwl surface %p first commit %dx%d at "
+                    "+%d+%d (pre-geom)", (void*)s, s->w, s->h, s->x, s->y);
             _xwl_win_geom(s);
+            vt_logd("wayland: xwl surface %p mapped at +%d+%d %dx%d",
+                    (void*)s, s->x, s->y, s->w, s->h);
             _xwl_announce_geom(s);
             return;
         }
@@ -615,6 +623,12 @@ static void _compositor_create_surface(struct wl_client *cli,
     wl_resource_set_implementation(sr, &_surf_impl, s,
                                    _surf_resource_destroy);
     s->res = sr;
+    /* Identify the Xwayland client by PID the moment it creates its
+     * first surface: legacy Xwayland builds never bind
+     * xwayland_shell_v1, so _bind_xwl_shell cannot learn the client —
+     * but their WL_SURFACE_ID association messages are useless without
+     * it (the handler resolves resource ids through X.client). */
+    _xwl_learn_client(cli);
     /* wl_surface.enter at CREATION (single-output desktop: every
      * surface is on the one output). Waiting for the first commit is
      * circular: Xwayland's software path waits for enter before it
@@ -632,8 +646,14 @@ static const struct wl_compositor_interface _compositor_impl = {
 static void _bind_compositor(struct wl_client *cli, void *data,
                              uint32_t version, uint32_t id) {
     (void)data;
+    /* the resource MUST match the version the client bound at (capped
+     * at what we truly support, 6): the old hardcoded cap of 4 with a
+     * v6-advertised global gave clients a v6 proxy over a v4 resource —
+     * the first wl_surface.offset (v5+, GTK4 frame cycles) was rejected
+     * with "invalid method 10 (since 4 < 5)" and the client DIED with
+     * EINVAL. */
     struct wl_resource *res = wl_resource_create(cli,
-        &wl_compositor_interface, version < 4 ? version : 4, id);
+        &wl_compositor_interface, version > 6 ? 6 : version, id);
     if (!res) { wl_client_post_no_memory(cli); return; }
     wl_resource_set_implementation(res, &_compositor_impl, NULL, NULL);
 }
@@ -813,10 +833,14 @@ static void _send_selection(_wl_state_t *st, struct wl_resource *dev_res) {
         wl_resource_get_version(dev_res), 0);
     if (!offer) return;
     wl_resource_set_implementation(offer, &_offer_impl, NULL, NULL);
+    /* PROTOCOL: wl_data_device.data_offer goes out EXACTLY ONCE,
+     * followed by one wl_data_offer.offer per mime type. Sending
+     * data_offer once per mime confused real toolkits (kitty aborted
+     * its clipboard path on the duplicate events). */
+    wl_data_device_send_data_offer(dev_res, offer);
     for (size_t i = 0; i < st->selection->mimes.size; i++) {
         const char *m = *(const char *const *)
             vt_vec_at(&st->selection->mimes, i);
-        wl_data_device_send_data_offer(dev_res, offer);
         wl_data_offer_send_offer(offer, m);
     }
     wl_data_device_send_selection(dev_res, offer);
@@ -932,13 +956,18 @@ static void _ddm_get_data_device(struct wl_client *cli,
 
 static void _ddm_create_data_source(struct wl_client *cli,
                                     struct wl_resource *res, uint32_t id) {
-    (void)res;
     _data_src_t *s = vt_malloc0(sizeof(*s));
     if (!s) { wl_client_post_no_memory(cli); return; }
     s->cli = cli;
     vt_vec_init(&s->mimes, sizeof(char *), 4);
+    /* create the resource at the MANAGER's version, not hardcoded 1:
+     * a v3 client calling set_actions on a v1 resource is a version
+     * violation — libwayland kills the client (kitty died the moment
+     * it tried to copy anything: create_data_source → offer →
+     * set_actions → connection torn down = "crash") */
     struct wl_resource *r = wl_resource_create(
-        cli, &wl_data_source_interface, 1, id);
+        cli, &wl_data_source_interface,
+        wl_resource_get_version(res), id);
     if (!r) {
         vt_vec_fini(&s->mimes);
         vt_free(s);
@@ -963,6 +992,184 @@ static void _bind_ddm(struct wl_client *cli, void *data,
         version < 3 ? version : 3, id);
     if (!res) { wl_client_post_no_memory(cli); return; }
     wl_resource_set_implementation(res, &_ddm_impl, NULL, NULL);
+}
+
+/* --------------------------------------------- zwp_primary_selection_v1 */
+/* The PRIMARY selection (X11-style: select-to-copy, middle-click paste).
+ * Terminals (foot, kitty, mirage's selection) drive their selection
+ * clipboard through this protocol; without the global they silently
+ * lose selection-paste. Mirrors the clipboard device/source/offer shape
+ * one-to-one. */
+static void _ps_offer_receive(struct wl_client *cli,
+                              struct wl_resource *res,
+                              const char *mime, int32_t fd) {
+    (void)cli;
+    struct wl_resource *src = wl_resource_get_user_data(res);
+    _wl_state_t *st = _wls;
+    if (!st || !src) { close(fd); return; }
+    zwp_primary_selection_source_v1_send_send(src, mime, fd);
+}
+static void _ps_offer_destroy(struct wl_client *cli,
+                              struct wl_resource *res) {
+    (void)cli;
+    wl_resource_destroy(res);
+}
+static const struct zwp_primary_selection_offer_v1_interface _ps_offer_impl = {
+    .receive = _ps_offer_receive,
+    .destroy = _ps_offer_destroy,
+};
+
+static void _ps_send_selection(_wl_state_t *st, struct wl_resource *dev_res) {
+    if (!st->primary_selection || st->primary_selection->dead) {
+        zwp_primary_selection_device_v1_send_selection(dev_res, NULL);
+        return;
+    }
+    struct wl_resource *offer = wl_resource_create(
+        wl_resource_get_client(dev_res),
+        &zwp_primary_selection_offer_v1_interface,
+        wl_resource_get_version(dev_res), 0);
+    if (!offer) return;
+    struct wl_resource *src = st->primary_selection->res;
+    wl_resource_set_implementation(offer, &_ps_offer_impl, src, NULL);
+    zwp_primary_selection_device_v1_send_data_offer(dev_res, offer);
+    for (size_t i = 0; i < st->primary_selection->mimes.size; i++) {
+        const char *m = *(const char *const *)
+            vt_vec_at(&st->primary_selection->mimes, i);
+        zwp_primary_selection_offer_v1_send_offer(offer, m);
+    }
+    zwp_primary_selection_device_v1_send_selection(dev_res, offer);
+}
+
+static void _ps_broadcast(_wl_state_t *st) {
+    if (!st || !st->kbd_focus || !st->kbd_focus->res) return;
+    _data_dev_t *d;
+    wl_list_for_each(d, &st->primary_devs, link) {
+        if (d->cli == wl_resource_get_client(st->kbd_focus->res))
+            _ps_send_selection(st, d->res);
+    }
+}
+
+static void _ps_src_offer(struct wl_client *cli, struct wl_resource *res,
+                          const char *mime) {
+    (void)cli;
+    _data_src_t *s = wl_resource_get_user_data(res);
+    if (!s) return;
+    char *m = vt_strdup(mime ? mime : "");
+    vt_vec_push(&s->mimes, &m);
+}
+static void _ps_src_destroy(struct wl_client *cli, struct wl_resource *res) {
+    (void)cli;
+    _data_src_t *s = wl_resource_get_user_data(res);
+    if (s) s->dead = true;
+    wl_resource_destroy(res);
+}
+static const struct zwp_primary_selection_source_v1_interface _ps_src_impl = {
+    .offer = _ps_src_offer,
+    .destroy = _ps_src_destroy,
+};
+static void _ps_src_res_destroy(struct wl_resource *res) {
+    _data_src_t *s = wl_resource_get_user_data(res);
+    if (!s) return;
+    if (_wls && _wls->primary_selection == s) {
+        _wls->primary_selection = NULL;
+        _ps_broadcast(_wls);
+    }
+    for (size_t i = 0; i < s->mimes.size; i++) {
+        char **m = vt_vec_at(&s->mimes, i);
+        vt_free(*m);
+    }
+    vt_vec_fini(&s->mimes);
+    vt_free(s);
+}
+
+static void _ps_dev_set_selection(struct wl_client *cli,
+                                  struct wl_resource *res,
+                                  struct wl_resource *src, uint32_t serial) {
+    (void)cli; (void)serial;
+    _wl_state_t *st = _wls;
+    if (!st) return;
+    _data_src_t *s = src ? wl_resource_get_user_data(src) : NULL;
+    if (s && s->dead) s = NULL;
+    if (st->primary_selection && st->primary_selection != s &&
+        !st->primary_selection->dead)
+        zwp_primary_selection_source_v1_send_cancelled(
+            st->primary_selection->res);
+    st->primary_selection = s;
+    _ps_broadcast(st);
+}
+static void _ps_dev_destroy(struct wl_client *cli, struct wl_resource *res) {
+    (void)cli;
+    wl_resource_destroy(res);
+}
+static const struct zwp_primary_selection_device_v1_interface _ps_dev_impl = {
+    .set_selection = _ps_dev_set_selection,
+    .destroy = _ps_dev_destroy,
+};
+static void _ps_dev_res_destroy(struct wl_resource *res) {
+    _data_dev_t *d = wl_resource_get_user_data(res);
+    if (!d) return;
+    wl_list_remove(&d->link);
+    vt_free(d);
+}
+
+static void _ps_mgr_get_device(struct wl_client *cli,
+                               struct wl_resource *res, uint32_t id,
+                               struct wl_resource *seat) {
+    (void)seat;
+    _wl_state_t *st = _wls;
+    if (!st) return;
+    _data_dev_t *d = vt_malloc0(sizeof(*d));
+    if (!d) { wl_client_post_no_memory(cli); return; }
+    d->cli = cli;
+    struct wl_resource *r = wl_resource_create(
+        cli, &zwp_primary_selection_device_v1_interface,
+        wl_resource_get_version(res), id);
+    if (!r) { vt_free(d); wl_client_post_no_memory(cli); return; }
+    wl_resource_set_implementation(r, &_ps_dev_impl, d,
+                                   _ps_dev_res_destroy);
+    d->res = r;
+    wl_list_insert(st->primary_devs.prev, &d->link);
+    if (st->kbd_focus && st->kbd_focus->res &&
+        wl_resource_get_client(st->kbd_focus->res) == cli)
+        _ps_send_selection(st, r);
+}
+static void _ps_mgr_create_source(struct wl_client *cli,
+                                  struct wl_resource *res, uint32_t id) {
+    _data_src_t *s = vt_malloc0(sizeof(*s));
+    if (!s) { wl_client_post_no_memory(cli); return; }
+    s->cli = cli;
+    vt_vec_init(&s->mimes, sizeof(char *), 4);
+    struct wl_resource *r = wl_resource_create(
+        cli, &zwp_primary_selection_source_v1_interface,
+        wl_resource_get_version(res), id);
+    if (!r) {
+        vt_vec_fini(&s->mimes);
+        vt_free(s);
+        wl_client_post_no_memory(cli);
+        return;
+    }
+    wl_resource_set_implementation(r, &_ps_src_impl, s,
+                                   _ps_src_res_destroy);
+    s->res = r;
+}
+static void _ps_mgr_destroy(struct wl_client *cli, struct wl_resource *res) {
+    (void)cli;
+    wl_resource_destroy(res);
+}
+static const struct
+zwp_primary_selection_device_manager_v1_interface _ps_mgr_impl = {
+    .create_source = _ps_mgr_create_source,
+    .get_device = _ps_mgr_get_device,
+    .destroy = _ps_mgr_destroy,
+};
+
+static void _bind_primary_sel(struct wl_client *cli, void *data,
+                              uint32_t version, uint32_t id) {
+    (void)data; (void)version;
+    struct wl_resource *res = wl_resource_create(
+        cli, &zwp_primary_selection_device_manager_v1_interface, 1, id);
+    if (!res) { wl_client_post_no_memory(cli); return; }
+    wl_resource_set_implementation(res, &_ps_mgr_impl, NULL, NULL);
 }
 
 /* ------------------------------------------------------------ xdg-shell */
@@ -1975,6 +2182,11 @@ static void _decor_destroy_req(struct wl_client *cli,
     _decor_t *d = wl_resource_get_user_data(res);
     if (d) {
         if (d->surf) d->surf->decor_res = NULL;
+        /* detach the user_data BEFORE wl_resource_destroy: its
+         * destructor (_decor_res_destroy) reads the record — leaving
+         * the pointer set was a heap-use-after-free the moment a real
+         * toolkit (foot) destroyed its decoration object at startup */
+        wl_resource_set_user_data(res, NULL);
         vt_free(d);
     }
     wl_resource_destroy(res);
@@ -2095,6 +2307,14 @@ static struct wl_resource *_out_res_for_client(struct wl_client *cli) {
     return NULL;
 }
 
+static void _out_release(struct wl_client *cli, struct wl_resource *res) {
+    (void)cli;
+    wl_resource_destroy(res);
+}
+static const struct wl_output_interface _out_impl = {
+    .release = _out_release,
+};
+
 static void _bind_output(struct wl_client *cli, void *data, uint32_t version,
                          uint32_t id) {
     (void)data;
@@ -2102,7 +2322,11 @@ static void _bind_output(struct wl_client *cli, void *data, uint32_t version,
                                                  version < 3 ? version : 3,
                                                  id);
     if (!res) { wl_client_post_no_memory(cli); return; }
-    wl_resource_set_implementation(res, NULL, NULL, _out_res_destroy);
+    /* v3 clients send wl_output.release() at teardown — a NULL
+     * implementation made libwayland dereference a NULL function
+     * pointer and SEGFAULTED the whole compositor (foot died at exit
+     * and took the session down with it) */
+    wl_resource_set_implementation(res, &_out_impl, NULL, _out_res_destroy);
     if (_n_out_res < _MAX_OUT_RES)
         _out_res[_n_out_res++] = res;
     int w = _wls ? _wls->out_w : 1024;
@@ -2128,6 +2352,17 @@ static void _surface_output_enter(_wl_surf_t *s) {
                          * the next commit after it does */
     wl_surface_send_enter(s->res, out);
     s->out_entered = true;
+    /* wl_surface v6 preferred scale/transform: a v6 client that never
+     * hears from us falls back to wl_output.scale (1) — but foot and
+     * GTK4 treat an explicit event as the authoritative answer and
+     * some builds wait for it before first render. One event at enter
+     * time is the documented point ("whenever the preferred scale
+     * changes"; entering the output IS that moment). */
+    if (wl_resource_get_version(s->res) >= 6) {
+        wl_surface_send_preferred_buffer_scale(s->res, 1);
+        wl_surface_send_preferred_buffer_transform(
+            s->res, WL_OUTPUT_TRANSFORM_NORMAL);
+    }
 }
 
 static void _surface_output_leave(_wl_surf_t *s) {
@@ -2542,6 +2777,7 @@ static void _click_to_focus(_wl_state_t *st, _wl_surf_t *s) {
     if (s->toplevel)
         _emit_win(st, VT_BACKEND_WL_EVENT_WIN_FOCUS, s->toplevel);
     _broadcast_selection(st);
+    _ps_broadcast(st);
 }
 
 /* Edge bits under the cursor for an SSD-framed toplevel:
@@ -3742,7 +3978,15 @@ static void _emit_ws(_wl_state_t *st) {
 /* alpha-blend an ARGB sprite over the XRGB framebuffer.
  * stride is in uint32 units and may exceed sw (cursor_img is a
  * 64x64 cell with the image in the top-left corner; client cursor
- * surfaces follow the client's own row padding). */
+ * surfaces follow the client's own row padding).
+ * The source is PREMULTIPLIED (wl_shm ARGB8888 and Xcursor images both
+ * are): the correct "over" is sp + dp*(1-a). The old straight-alpha
+ * form (sp*a + dp*(1-a)) double-multiplied the antialiased edges and
+ * the cursor's soft shadow — over the dark panel that darkened fringe
+ * read as a colored aura/halo around the pointer (the "blue glow over
+ * the bar": the compositor arrow looked fine on the hardware plane —
+ * drm cursor bo's are premultiplied and copied verbatim — but the
+ * client cursor from the panel is software-blended). */
 static void _blend_sprite(_wl_state_t *st, const uint32_t *sprite,
                           int sstride, int sw, int sh, int hx, int hy) {
     int cx = st->cursor_x - hx;
@@ -3761,10 +4005,14 @@ static void _blend_sprite(_wl_state_t *st, const uint32_t *sprite,
             if (a == 0xff) {
                 out = 0xff000000 | (sp & 0xffffff);
             } else {
-                uint32_t rb = ((sp & 0x00ff00ff) * a +
-                               (dp & 0x00ff00ff) * (255 - a)) / 255;
-                uint32_t g = ((sp & 0x0000ff00) * a +
-                              (dp & 0x0000ff00) * (255 - a)) / 255;
+                /* premultiplied source over XRGB destination:
+                 * out = sp + dp * (1 - a). The RGB channels of sp
+                 * already carry their own alpha weight. */
+                uint32_t ia = 255 - a;
+                uint32_t rb = (sp & 0x00ff00ff) +
+                              ((dp & 0x00ff00ff) * ia) / 255;
+                uint32_t g = (sp & 0x0000ff00) +
+                             ((dp & 0x0000ff00) * ia) / 255;
                 out = 0xff000000 | (rb & 0x00ff00ff) | (g & 0x0000ff00);
             }
             st->fb[dy * st->out_w + dx] = out;
@@ -3912,9 +4160,22 @@ static void _present(void) {
         vt_kms_present(st->kms, st->fb, st->out_w, st->out_h);
 }
 
-/* screenshot on SIGUSR1 (testing hook) */
-static void _screenshot(int sig) {
+/* screenshot on SIGUSR1 (testing hook). The write itself is DEFERRED
+ * to the main loop (after _paint/_present complete): writing the PPM
+ * from inside the signal handler could interrupt the paint loop
+ * MID-BLIT, and a dump of that half-painted framebuffer showed windows
+ * cut off at arbitrary rows — harness pixel checks flaked on exactly
+ * that (a window whose blob was 66px of 220). */
+static volatile sig_atomic_t _shot_pending = 0;
+
+static void _screenshot_req(int sig) {
     (void)sig;
+    _shot_pending = 1;
+}
+
+static void _screenshot_maybe(void) {
+    if (!_shot_pending) return;
+    _shot_pending = 0;
     _wl_state_t *st = _wls;
     if (!st) return;
     FILE *f = fopen("/tmp/vantage-wayland.ppm", "wb");
@@ -4055,6 +4316,7 @@ static int _wl_init(vt_backend_t *self) {
     wl_list_init(&st->ptr_reses);
     wl_list_init(&st->kbd_reses);
     wl_list_init(&st->data_devs);
+    wl_list_init(&st->primary_devs);
 
     /* ---- stage 1/15: session (XDG_RUNTIME_DIR) -------------------- */
     _stage_begin(0, "XDG_RUNTIME_DIR preparation");
@@ -4278,7 +4540,7 @@ static int _wl_init(vt_backend_t *self) {
         goto fail_no_kms;
     }
     st->compositor_g = wl_global_create(st->display,
-        &wl_compositor_interface, 3, NULL, _bind_compositor);
+        &wl_compositor_interface, 6, NULL, _bind_compositor);
     st->seat_g = wl_global_create(st->display, &wl_seat_interface, 9, NULL,
                                   _bind_seat);
     st->output_g = wl_global_create(st->display, &wl_output_interface, 3,
@@ -4296,6 +4558,13 @@ static int _wl_init(vt_backend_t *self) {
     st->decor_g = wl_global_create(
         st->display, &zxdg_decoration_manager_v1_interface, 1, NULL,
         _bind_decor_mgr);
+    /* zwp_primary_selection_device_manager_v1 — the selection
+     * clipboard every terminal (foot, kitty, GTK) drives */
+    st->primary_sel_g = wl_global_create(
+        st->display, &zwp_primary_selection_device_manager_v1_interface,
+        1, NULL, _bind_primary_sel);
+    if (!st->primary_sel_g)
+        vt_logw("wayland: primary-selection global creation failed");
     if (!st->decor_g)
         vt_logw("wayland: xdg-decoration global creation failed "
                 "(clients cannot request server-side decorations)");
@@ -4388,7 +4657,7 @@ static int _wl_init(vt_backend_t *self) {
     o.primary = true;
     vt_vec_push(&self->outputs, &o);
 
-    signal(SIGUSR1, _screenshot);
+    signal(SIGUSR1, _screenshot_req);
     _wls = st;
     st->dirty = true;
 
@@ -4496,6 +4765,9 @@ static int _wl_dispatch(vt_backend_t *self, int timeout_ms) {
     _xwl_dispatch();
     _paint();
     _present();
+    /* deferred screenshot: the framebuffer is COMPLETE here (a dump
+     * taken mid-paint photographed half-blitted windows) */
+    _screenshot_maybe();
     return 0;
 }
 

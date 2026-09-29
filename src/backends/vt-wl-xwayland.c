@@ -101,10 +101,29 @@ static struct {
                 a_wl_surface_id, a_wl_surface_serial;
     int wm_screen_width, wm_screen_height;
     /* legacy pairing: WL_SURFACE_ID messages that arrived BEFORE the
-     * window's CreateNotify crossed the X socket */
+     * window's CreateNotify crossed the X socket, or BEFORE the
+     * wl_surface resource itself was created on the wayland socket
+     * (the X socket routinely runs AHEAD: Xwayland sends the client
+     * message right after creating the surface, and the compositor may
+     * read the X event first — without the stash the association was
+     * silently DROPPED and the window's surface stranded at +0+0) */
     struct { xcb_window_t win; uint32_t surface_id; }
-        pending_ids[8];
+        pending_ids[16];
     size_t n_pending_ids;
+    /* WL_SURFACE_SERIAL messages that arrived BEFORE the window's
+     * CreateNotify crossed the X socket (same socket-ordering hazard,
+     * same stash-then-retry cure) */
+    struct { xcb_window_t win; uint64_t serial; }
+        pending_serials[16];
+    size_t n_pending_serials;
+    /* association placeholders created by get_xwayland_surface: they
+     * are NOT in X.wins (no X window yet) and their wl_surface may not
+     * have committed yet (so it is not in st->surfaces either — the
+     * serial reconcile used to iterate st->surfaces and could not see
+     * a placeholder whose first commit was still in flight; the
+     * pairing then NEVER happened and the surface rendered at +0+0
+     * behind the panel forever) */
+    _xwl_win_t *placeholders;
 } X;
 
 /* ------------------------------------------------------------- utils */
@@ -146,6 +165,35 @@ static _xwl_win_t *_xwl_find(xcb_window_t xwin) {
 
 static _xwl_win_t *_xwl_find_by_surf(_wl_surf_t *s) {
     return s ? s->xwl : NULL;
+}
+
+/* placeholder list plumbing: placeholders live in X.placeholders (NOT
+ * X.wins) so the serial reconcile can find them even before their
+ * wl_surface has committed (an uncommitted surface is in no list at
+ * all — that invisibility was the lost-association root cause) */
+static void _xwl_placeholder_link(_xwl_win_t *ph) {
+    if (!ph) return;
+    ph->prev = NULL;
+    ph->next = X.placeholders;
+    if (X.placeholders) X.placeholders->prev = ph;
+    X.placeholders = ph;
+}
+
+static void _xwl_placeholder_unlink(_xwl_win_t *ph) {
+    if (!ph) return;
+    if (ph->prev) ph->prev->next = ph->next;
+    else if (X.placeholders == ph) X.placeholders = ph->next;
+    if (ph->next) ph->next->prev = ph->prev;
+    ph->next = ph->prev = NULL;
+}
+
+/* free a placeholder that has been adopted into a real window record
+ * (the caller has already moved its resource/serial to the record and
+ * detached the surface) */
+static void _xwl_placeholder_free(_xwl_win_t *ph) {
+    if (!ph) return;
+    _xwl_placeholder_unlink(ph);
+    vt_free(ph);
 }
 
 /* -------------------------------------------------------- properties */
@@ -356,12 +404,49 @@ static void _xwl_close_win(_xwl_win_t *w) {
 
 static void _xwl_sever(_xwl_win_t *w);
 static void _xwl_serial_reconcile(void);
+static void _xwl_pending_ids_resolve(void);
+static void _xwl_late_pair(_xwl_win_t *w, _wl_surf_t *s);
+
+/* Resolve stashed legacy WL_SURFACE_ID associations: each entry holds
+ * (X window, wl_surface resource id) for a message that crossed the X
+ * socket before the wl_surface resource existed compositor-side (or
+ * before the window's CreateNotify). Retried whenever a new surface
+ * appears (get_xwayland_surface, surface commit) and whenever a new
+ * window record is created. */
+static void _xwl_pending_ids_resolve(void) {
+    if (!X.client || !X.st) return;
+    for (size_t i = 0; i < X.n_pending_ids; ) {
+        _xwl_win_t *w = _xwl_find(X.pending_ids[i].win);
+        if (!w) { i++; continue; }   /* CreateNotify still in flight */
+        struct wl_resource *r = wl_client_get_object(
+            X.client, X.pending_ids[i].surface_id);
+        _wl_surf_t *s = (r &&
+                         wl_resource_instance_of(
+                             r, &wl_surface_interface, NULL))
+                            ? wl_resource_get_user_data(r) : NULL;
+        if (!s) { i++; continue; }   /* surface still in flight */
+        if (w->surf != s) {
+            vt_logd("xwayland: stashed WL_SURFACE_ID resolved: 0x%x",
+                    (unsigned)w->xwin);
+            _xwl_late_pair(w, s);
+        }
+        X.pending_ids[i] = X.pending_ids[X.n_pending_ids - 1];
+        X.n_pending_ids--;
+    }
+}
 
 static void _xwl_surface_destroy_req(struct wl_client *cli,
                                      struct wl_resource *res) {
     (void)cli;
     _xwl_win_t *w = wl_resource_get_user_data(res);
     _xwl_sever(w);   /* drops w->xwl_res too: destructor becomes a no-op */
+    /* a PLACEHOLDER dying with its wrapper has no X window to wait
+     * for — detach the resource's user_data (the destructor below must
+     * not read a freed record) and free it */
+    if (w && w->xwin == 0) {
+        wl_resource_set_user_data(res, NULL);
+        _xwl_placeholder_free(w);
+    }
     wl_resource_destroy(res);
 }
 
@@ -382,6 +467,8 @@ static void _xwl_surface_set_serial(struct wl_client *cli,
     vt_logd("xwayland: surface serial %llu (record 0x%x)",
             (unsigned long long)serial, (unsigned)w->xwin);
     _xwl_serial_reconcile();
+    /* the reconcile above may have just adopted this placeholder into
+     * a real window record — nothing else to do either way */
 }
 
 static const struct xwayland_surface_v1_interface _xwl_surface_impl = {
@@ -411,12 +498,21 @@ static void _xwl_sever(_xwl_win_t *w) {
     if (w->toplevel && w->toplevel->surf)
         w->toplevel->surf = NULL;
     w->xwl_res = NULL;
+    /* NOTE: a placeholder whose wrapper died is freed by the CALLERS
+     * (after the resource destructor can no longer read the record) */
 }
 
 static void _xwl_surface_res_destroy(struct wl_resource *res) {
     _xwl_win_t *w = wl_resource_get_user_data(res);
-    if (w && w->xwl_res == res)
+    if (w && w->xwl_res == res) {
         _xwl_sever(w);
+        /* a placeholder whose wrapper died from the CLIENT side
+         * (disconnect) would leak in X.placeholders forever */
+        if (w->xwin == 0) {
+            wl_resource_set_user_data(res, NULL);
+            _xwl_placeholder_free(w);
+        }
+    }
 }
 
 /* The wl surface can arrive AFTER the X window was already mapped —
@@ -442,20 +538,34 @@ static void _xwl_late_pair(_xwl_win_t *w, _wl_surf_t *s) {
         }
         ph->xwl_res = NULL;
         ph->surf = NULL;
-        vt_free(ph);   /* placeholders are never linked into X.wins */
+        _xwl_placeholder_free(ph);   /* unlink + free */
     }
     w->surf = s;
     s->xwl = w;
+    /* SEED THE GEOMETRY UNCONDITIONALLY: the surface's position up to
+     * this point was the placeholder's +0+0 (a placeholder carries no
+     * X geometry). The old code only seeded inside the toplevel
+     * backlink branch — a window whose toplevel already had ANOTHER
+     * surface (racing re-association) kept rendering at +0+0. */
+    s->x = w->x;
+    s->y = w->y;
+    if (w->w > 0) s->w = w->w;
+    if (w->h > 0) s->h = w->h;
+    s->ws = X.st ? X.st->ws_cur : 0;
+    /* the SSD MODE too: the first commit already ran while the surface
+     * was still placeholder-paired (_xwl_win_geom returns early there),
+     * so nobody ever told the surface it is server-decorated — no SSD
+     * frame rendered, no title-bar hit-box, the window could not be
+     * dragged or closed through OUR chrome */
+    s->ssd = !w->motif_csd && !w->override_redirect;
     if (w->toplevel && !w->toplevel->surf) {
         w->toplevel->surf = s;
         s->toplevel = w->toplevel;
-        s->x = w->x;
-        s->y = w->y;
-        s->ws = X.st ? X.st->ws_cur : 0;
         _emit_win(X.st, VT_BACKEND_WL_EVENT_WIN_GEOMETRY, w->toplevel);
-        vt_logd("xwayland: surface paired late with 0x%x (geometry "
-                "re-announced at +%d+%d)", (unsigned)w->xwin, w->x, w->y);
     }
+    if (X.st) X.st->dirty = true;
+    vt_logd("xwayland: surface paired late with 0x%x (geometry "
+            "re-announced at +%d+%d)", (unsigned)w->xwin, w->x, w->y);
 }
 
 /* ------------------------------------------------- serial association
@@ -481,18 +591,29 @@ static _xwl_win_t *_xwl_win_by_serial(uint64_t serial) {
 
 static void _xwl_serial_reconcile(void) {
     if (!X.st) return;
-    /* 1) pair placeholders by exact serial */
-    _wl_surf_t *s;
-    wl_list_for_each(s, &X.st->surfaces, link) {
-        _xwl_win_t *ph = s->xwl;
-        if (!ph || ph->xwin != 0 || !ph->have_surf_serial)
+    /* 1) pair placeholders by exact serial. Iterate the PLACEHOLDER
+     * LIST, not st->surfaces: an uncommitted wl_surface sits in NO
+     * list until its first commit, so a surface whose set_serial
+     * preceded its first commit was invisible here — with the X
+     * socket running ahead of the wayland socket (Xwayland sends the
+     * WL_SURFACE_SERIAL client message immediately after creating
+     * the surface) the pairing silently NEVER happened and the window
+     * rendered at +0+0 behind the panel, full buffer size, forever
+     * (the "racing XWayland windows swapped" failure on real
+     * hardware). */
+    for (_xwl_win_t *ph = X.placeholders; ph; ) {
+        _xwl_win_t *next_ph = ph->next;
+        if (!ph->surf || !ph->have_surf_serial) {
+            ph = next_ph;
             continue;
+        }
         _xwl_win_t *w = _xwl_win_by_serial(ph->surf_serial);
         if (w && !w->surf) {
             /* adopt the placeholder into the real window and attach.
              * Detach s->xwl BEFORE the free: _xwl_late_pair reads it
              * (its own placeholder-merge step) — leaving the dangling
              * pointer was a heap-use-after-free under ASan. */
+            _wl_surf_t *s = ph->surf;
             if (ph->xwl_res) {
                 w->xwl_res = ph->xwl_res;
                 wl_resource_set_user_data(w->xwl_res, w);
@@ -502,11 +623,12 @@ static void _xwl_serial_reconcile(void) {
             w->surf_serial = ph->surf_serial;
             ph->surf = NULL;
             s->xwl = NULL;
-            vt_free(ph);          /* placeholders never sit in X.wins */
+            _xwl_placeholder_free(ph);
             _xwl_late_pair(w, s);
             vt_logd("xwayland: serial %llu paired surface with 0x%x",
                     (unsigned long long)w->surf_serial, (unsigned)w->xwin);
         }
+        ph = next_ph;
     }
     /* 2) repair wrong pairings (win_serial vs surf_serial mismatch) */
     for (_xwl_win_t *w = X.wins; w; w = w->next) {
@@ -603,15 +725,20 @@ static void _xwl_get_xwayland_surface(struct wl_client *cli,
     if (!w) { wl_client_post_no_memory(cli); return; }
     w->surf = s;
     s->xwl = w;
+    _xwl_placeholder_link(w);
     struct wl_resource *r = wl_resource_create(
         cli, &xwayland_surface_v1_interface, 1, id);
-    if (!r) { vt_free(w); wl_client_post_no_memory(cli); return; }
+    if (!r) { s->xwl = NULL; _xwl_placeholder_free(w); wl_client_post_no_memory(cli); return; }
     wl_resource_set_implementation(r, &_xwl_surface_impl, w,
                                    _xwl_surface_res_destroy);
     w->xwl_res = r;
     vt_logd("xwayland: get_xwayland_surface request arrived");
     /* maybe the serials are already here (both sides raced ahead) */
     _xwl_serial_reconcile();
+    /* a stashed legacy WL_SURFACE_ID for this surface (the X message
+     * crossed before the wl_surface resource existed) can resolve
+     * now that the surface is created */
+    _xwl_pending_ids_resolve();
     /* Legacy Xwayland (no serials at all, ever): the placeholder is
      * reconciled by _xwl_win_geom's commit-time fallback below. */
     (void)w;
@@ -647,14 +774,22 @@ static void _bind_xwl_shell(struct wl_client *cli, void *data,
  * surface commits a new buffer) */
 void _xwl_win_geom(_wl_surf_t *s) {
     _xwl_win_t *w = _xwl_find_by_surf(s);
-    if (!w || !s) {
-        /* An UNPAIRED placeholder reaching its first commit: the
-         * association serials never arrived (legacy Xwayland without
-         * xwayland_shell_v1 serial support). Fall back to the recency
-         * guess — adopt the newest waiting window. Modern Xwayland is
-         * reconciled by serial long before this point. */
-        _xwl_win_t *ph = s ? s->xwl : NULL;
-        if (ph && ph->xwin == 0 && !ph->have_surf_serial) {
+    if (!w || w->xwin == 0) {
+        /* The surface is still tied to a PLACEHOLDER (or nothing): its
+         * X window may simply not have been paired YET. Run the serial
+         * reconcile first — with the X socket running ahead of the
+         * wayland socket the WL_SURFACE_SERIAL client message can
+         * precede BOTH get_xwayland_surface and the first commit, and
+         * this commit is the first moment all three sides coexist. */
+        _xwl_serial_reconcile();
+        _xwl_pending_ids_resolve();
+        w = s ? s->xwl : NULL;
+        if (w && w->xwin == 0 && !w->have_surf_serial) {
+            /* Legacy Xwayland (no serials, ever): an UNPAIRED
+             * placeholder reaching its first commit falls back to the
+             * recency guess — adopt the newest waiting window. Modern
+             * Xwayland is reconciled by serial above. */
+            _xwl_win_t *ph = w;
             for (_xwl_win_t *cand = X.wins; cand; cand = cand->next) {
                 if (cand->waiting_surface && !cand->surf) {
                     if (ph->xwl_res) {
@@ -664,7 +799,7 @@ void _xwl_win_geom(_wl_surf_t *s) {
                     }
                     ph->surf = NULL;
                     s->xwl = NULL;   /* detach before free (UAF guard) */
-                    vt_free(ph);
+                    _xwl_placeholder_free(ph);
                     _xwl_late_pair(cand, s);
                     vt_logd("xwayland: commit-time fallback pairing for "
                             "0x%x (no serials)", (unsigned)cand->xwin);
@@ -673,7 +808,13 @@ void _xwl_win_geom(_wl_surf_t *s) {
                 }
             }
         }
-        if (!w) return;
+        if (!w || w->xwin == 0) {
+            /* STILL a placeholder: applying its geometry would park a
+             * real window at +0+0 behind the panel (the exact
+             * "racing windows swapped" symptom). Leave the surface
+             * where it is and wait for the real pairing. */
+            return;
+        }
     }
     int ox = s->x, oy = s->y, ow = s->w, oh = s->h;
     s->x = w->x;
@@ -733,6 +874,21 @@ static void _xwl_handle_create(xcb_create_notify_event_t *e) {
         break;
     }
 
+    /* a WL_SURFACE_SERIAL message may have arrived BEFORE this record
+     * existed (the X socket runs ahead of the wayland socket on real
+     * hardware) — apply the stashed serial now, before the link below
+     * lets _xwl_serial_reconcile() see the record */
+    for (size_t i = 0; i < X.n_pending_serials; i++) {
+        if (X.pending_serials[i].win != e->window) continue;
+        w->win_serial = X.pending_serials[i].serial;
+        w->have_win_serial = true;
+        X.pending_serials[i] = X.pending_serials[X.n_pending_serials - 1];
+        X.n_pending_serials--;
+        vt_logd("xwayland: stashed WL_SURFACE_SERIAL applied to 0x%x",
+                (unsigned)w->xwin);
+        break;
+    }
+
     /* LATE WINDOW: get_xwayland_surface may already have paired the
      * wl surface with a PLACEHOLDER record (xwin == 0) — the wayland
      * request was read before this CreateNotify crossed the X socket.
@@ -746,10 +902,9 @@ static void _xwl_handle_create(xcb_create_notify_event_t *e) {
      * When serials are pending, _xwl_serial_reconcile() does the
      * exact pairing as soon as they arrive. */
     if (X.st) {
-        _wl_surf_t *s;
-        wl_list_for_each(s, &X.st->surfaces, link) {
-            _xwl_win_t *ph = s->xwl;
-            if (!ph || ph->xwin != 0 || !ph->xwl_res)
+        for (_xwl_win_t *ph = X.placeholders; ph; ph = ph->next) {
+            _wl_surf_t *s = ph->surf;
+            if (!s || !ph->xwl_res)
                 continue;   /* not an unadopted pairing placeholder */
             if (ph->have_surf_serial)
                 continue;   /* serial known: wait for the exact match */
@@ -759,7 +914,7 @@ static void _xwl_handle_create(xcb_create_notify_event_t *e) {
             s->xwl = w;
             ph->surf = NULL;
             ph->xwl_res = NULL;
-            vt_free(ph);
+            _xwl_placeholder_free(ph);
             w->waiting_surface = false;
             vt_logd("xwayland: late X window 0x%x adopted an already-"
                     "paired surface", (unsigned)w->xwin);
@@ -965,6 +1120,11 @@ static void _xwl_handle_config_req(xcb_configure_request_event_t *e) {
 static void _xwl_handle_client_msg(xcb_client_message_event_t *e) {
     _wl_state_t *st = X.st;
 
+    vt_logd("xwayland: client msg win=0x%x type=0x%x "
+            "l=[%u,%u,%u,%u,%u]", (unsigned)e->window, (unsigned)e->type,
+            e->data.data32[0], e->data.data32[1], e->data.data32[2],
+            e->data.data32[3], e->data.data32[4]);
+
     if (e->type == X.a_wl_surface_serial && st) {
         /* xwayland_shell_v1's X-side association: the SAME unique
          * serial the wl_surface announced via set_serial, delivered on
@@ -977,6 +1137,23 @@ static void _xwl_handle_client_msg(xcb_client_message_event_t *e) {
                             (uint64_t)e->data.data32[0];
             w->have_win_serial = true;
             _xwl_serial_reconcile();
+        } else {
+            /* the CreateNotify is still in flight on this same socket
+             * (both events are ordered server-side, but the poll loop
+             * can hand us the message in the same batch it reads the
+             * create — no: events are queued in order, yet a
+             * different client's flood may interleave; stash instead
+             * of dropping: a dropped association strands the surface
+             * at +0+0 forever) */
+            if (X.n_pending_serials < 16) {
+                X.pending_serials[X.n_pending_serials].win = e->window;
+                X.pending_serials[X.n_pending_serials].serial =
+                    ((uint64_t)e->data.data32[1] << 32) |
+                    (uint64_t)e->data.data32[0];
+                X.n_pending_serials++;
+                vt_logd("xwayland: WL_SURFACE_SERIAL stashed for late "
+                        "window 0x%x", (unsigned)e->window);
+            }
         }
         return;
     }
@@ -999,10 +1176,27 @@ static void _xwl_handle_client_msg(xcb_client_message_event_t *e) {
         _xwl_win_t *w = _xwl_find(e->window);
         if (w && s && w->surf != s) {
             _xwl_late_pair(w, s);
+        } else if (!s) {
+            /* the wl_surface resource does not exist compositor-side
+             * YET: Xwayland sends this message right after creating
+             * the surface, and the X socket can be read before the
+             * wayland socket delivers create_surface. Stash (both
+             * the window-record-missing and the surface-missing
+             * cases) and retry when the missing side appears — the
+             * old code silently DROPPED the w-exists/s-missing case
+             * and that window's surface never paired. */
+            if (X.n_pending_ids < 16) {
+                X.pending_ids[X.n_pending_ids].win = e->window;
+                X.pending_ids[X.n_pending_ids].surface_id = sid;
+                X.n_pending_ids++;
+                vt_logd("xwayland: WL_SURFACE_ID stashed (surface or "
+                        "window not yet known) for 0x%x",
+                        (unsigned)e->window);
+            }
         } else if (!w && s) {
             /* surface id arrived before the CreateNotify: stash and
              * pair when the window record exists */
-            if (X.n_pending_ids < 8) {
+            if (X.n_pending_ids < 16) {
                 X.pending_ids[X.n_pending_ids].win = e->window;
                 X.pending_ids[X.n_pending_ids].surface_id = sid;
                 X.n_pending_ids++;
@@ -1044,6 +1238,21 @@ static void _xwl_handle_client_msg(xcb_client_message_event_t *e) {
     }
 }
 
+void _xwl_learn_client(struct wl_client *cli) {
+    if (!cli || !X.started || X.client) return;
+    /* wl_client_get_credentials: pid is valid for local (unix socket)
+     * clients — Xwayland always is */
+    pid_t cpid = 0;
+    uid_t cuid = 0;
+    gid_t cgid = 0;
+    wl_client_get_credentials(cli, &cpid, &cuid, &cgid);
+    if (X.pid > 0 && cpid == X.pid) {
+        X.client = cli;
+        vt_logd("xwayland: client identified by pid %d (surface path)",
+                (int)cpid);
+    }
+}
+
 void _xwl_dispatch(void) {
     if (!X.started || !X.xc) return;
     xcb_generic_event_t *ev;
@@ -1076,9 +1285,18 @@ void _xwl_surface_destroyed(_wl_surf_t *s) {
         _xwl_free_win(w);
     } else if (w->xwin == 0) {
         /* a placeholder that never met its X window dies with the
-         * surface (it is not in X.wins; leaving it leaks the record
-         * and its pairing resource outlives it) */
-        _xwl_free_win(w);
+         * surface (it is in X.placeholders, not X.wins; leaving it
+         * leaks the record and its pairing resource outlives it).
+         * Destroy the resource FIRST — its destructor reads the
+         * user_data record, which must still be alive (the
+         * xwl_res==res guard makes the sever a no-op). */
+        s->xwl = NULL;
+        if (w->xwl_res) {
+            struct wl_resource *r = w->xwl_res;
+            w->xwl_res = NULL;
+            wl_resource_destroy(r);
+        }
+        _xwl_placeholder_free(w);
     }
 }
 

@@ -1068,8 +1068,8 @@ for y in range(4, 54):
         if near(pix[i],pix[i+1],pix[i+2],0x47,0x75,0xc7,2) or \
            near(pix[i],pix[i+1],pix[i+2],0x2e,0x30,0x38,2):
             colcnt[x] += 1
-cols = [x for x, c in colcnt.items() if c >= 20]
-span = (cols[-1] - cols[0]) if cols else 0
+cols = sorted(x for x, c in colcnt.items() if c >= 20)
+span = (cols[-1] - cols[0]) if cols else 0  # MUST sort: Counter order is first-seen, cols[-1] was arbitrary
 foc = 0
 if cols:
     for y in range(4, 54):

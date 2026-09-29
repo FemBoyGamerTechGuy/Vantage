@@ -26,6 +26,8 @@ wl_protocols_dir = dep_wayland_protocols.get_variable(
 xdg_shell_xml = join_paths(wl_protocols_dir, 'stable', 'xdg-shell', 'xdg-shell.xml')
 xdg_decoration_xml = join_paths(wl_protocols_dir, 'unstable',
   'xdg-decoration', 'xdg-decoration-unstable-v1.xml')
+primary_selection_xml = join_paths(wl_protocols_dir, 'unstable',
+  'primary-selection', 'primary-selection-unstable-v1.xml')
 # vendored protocol XMLs (repo-root protocols/):
 #   wlr-layer-shell (MIT, wlr-protocols — panels dock through it)
 #   xwayland-shell (wayland-protocols staging — X11 window association)
@@ -66,6 +68,19 @@ if dep_wayland_server.found() and dep_wayland_client.found() and \
     output: 'wlr-layer-shell-protocol.c',
     command: [prog_wl_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
 
+  # zwp_primary_selection_device_manager_v1 — the PRIMARY selection
+  # (X11-style middle-click paste). foot/kitty/GTK terminals drive their
+  # selection clipboard through it; without the global they warn and
+  # lose selection-paste, and some builds fail outright.
+  primary_selection_proto_h = custom_target('primary-selection-protocol.h',
+    input: primary_selection_xml,
+    output: 'primary-selection-protocol.h',
+    command: [prog_wl_scanner, 'server-header', '@INPUT@', '@OUTPUT@'])
+  primary_selection_proto_c = custom_target('primary-selection-protocol.c',
+    input: primary_selection_xml,
+    output: 'primary-selection-protocol.c',
+    command: [prog_wl_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
   # xwayland_shell_v1 — explicit X11 window ↔ wl_surface association
   xwayland_shell_proto_h = custom_target('xwayland-shell-protocol.h',
     input: xwayland_shell_xml,
@@ -83,6 +98,7 @@ if dep_wayland_server.found() and dep_wayland_client.found() and \
     xdg_decoration_proto_c, xdg_decoration_proto_h,
     layer_shell_proto_c, layer_shell_proto_h,
     xwayland_shell_proto_c, xwayland_shell_proto_h,
+    primary_selection_proto_c, primary_selection_proto_h,
     'vt-wl-layer.c', 'vt-wl-xwayland.c']
 
   # Xwayland window management needs xcb (+icccm for property types).

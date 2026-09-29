@@ -23,6 +23,7 @@
 #include "xdg-decoration-protocol.h"
 #include "wlr-layer-shell-protocol.h"
 #include "xwayland-shell-protocol.h"
+#include "primary-selection-protocol.h"
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -217,6 +218,10 @@ typedef struct {
     /* clipboard */
     struct wl_list data_devs;        /* _data_dev_t */
     struct _data_src *selection;
+    /* primary selection (X11-style middle-click paste) */
+    struct wl_list primary_devs;     /* _data_dev_t (same shape) */
+    struct _data_src *primary_selection;
+    struct wl_global *primary_sel_g;
     /* desktop background: the SAME wallpaper engine the X11 desktop
      * uses, rendered once into an ARGB buffer (config [wallpaper]) */
     vt_wallpaper_t *wall;
@@ -347,6 +352,8 @@ void _xwl_stop(_wl_state_t *st);
 void _xwl_dispatch(void);             /* drain the xcb connection */
 int  _xwl_display(void);              /* display number or -1 */
 const char *_xwl_auth_file(void);     /* Xauthority path or NULL */
+void _xwl_learn_client(struct wl_client *cli);  /* pid-match the Xwayland
+                                                    wayland client */
 
 /* events from the backend core into the Xwayland WM */
 void _xwl_surface_destroyed(_wl_surf_t *s);   /* surface is dying */

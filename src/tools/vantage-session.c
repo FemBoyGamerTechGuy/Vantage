@@ -38,6 +38,11 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <errno.h>
+#include <time.h>
+#include <sys/prctl.h>
 
 static volatile sig_atomic_t _stop = 0;
 static void _on_sig(int sig) { (void)sig; _stop = 1; }
@@ -84,6 +89,187 @@ static void _print_usage(FILE *fp, const char *argv0) {
 }
 
 /* ---------------------------------------------------------- backend */
+
+/* -------- session-owned X server (startx-equivalent) --------------
+ * `vantage-session --x11` from a TTY used to fail with "requires a
+ * running X server" — the user had to run startx by hand first. Now
+ * the session launches its own Xorg: displayfd for the display number,
+ * a generated MIT-MAGIC-COOKIE-1 authority file, -keeptty on the
+ * current VT, and a supervised lifetime (SIGTERM at session end). */
+static struct {
+    pid_t  pid;
+    char   auth_file[384];
+    bool   active;
+} _xsrv = { .pid = -1, .active = false };
+
+static bool _xsrv_write_auth(const char *path, const unsigned char cookie[16]) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    /* Xauthority binary record: FamilyWild + empty address/number +
+     * MIT-MAGIC-COOKIE-1 + 16 bytes — matches any display, exactly the
+     * record `xauth add :0 . <cookie>` would write */
+    unsigned char rec[2 + 2 + 2 + 2 + 16 + 2 + 16];
+    size_t i = 0;
+    unsigned char *w16 = &rec[i]; w16[0] = 0xff; w16[1] = 0xff; i += 2; /* FamilyWild */
+    rec[i++] = 0; rec[i++] = 0;               /* address len 0 */
+    rec[i++] = 0; rec[i++] = 0;               /* number len 0 */
+    rec[i++] = 0; rec[i++] = 18;              /* name len: MIT-MAGIC-COOKIE-1 */
+    memcpy(&rec[i], "MIT-MAGIC-COOKIE-1", 18); i += 18;
+    rec[i++] = 0; rec[i++] = 16;              /* data len 16 */
+    memcpy(&rec[i], cookie, 16); i += 16;
+    bool ok = fwrite(rec, 1, i, f) == i;
+    fclose(f);
+    return ok;
+}
+
+static const char *_xsrv_find_binary(void) {
+    static const char *const cands[] = {
+        "/usr/lib/xorg/Xorg",      /* Debian: the real binary */
+        "/usr/libexec/Xorg",       /* Fedora/Arch (logind layout) */
+        "/usr/bin/Xorg",           /* wrapper script — still works */
+        "/usr/bin/X",
+    };
+    for (size_t i = 0; i < sizeof(cands) / sizeof(cands[0]); i++)
+        if (access(cands[i], X_OK) == 0) return cands[i];
+    /* PATH search last (custom installs, dev prefixes) */
+    const char *path = getenv("PATH");
+    if (path && *path) {
+        static char buf[512];
+        const char *p = path;
+        while (*p) {
+            const char *e = strchr(p, ':');
+            size_t len = e ? (size_t)(e - p) : strlen(p);
+            if (len > 0 && len + 6 < sizeof(buf)) {
+                memcpy(buf, p, len);
+                buf[len] = '/';
+                memcpy(buf + len + 1, "Xorg", 5);
+                if (access(buf, X_OK) == 0) return buf;
+            }
+            if (!e) break;
+            p = e + 1;
+        }
+    }
+    return NULL;
+}
+
+/* Launch the session X server. Returns 0 with the DISPLAY string set
+ * in the environment (and XAUTHORITY), -1 on failure (caller falls
+ * back to the manual-start instructions). */
+static int _xsrv_launch(void) {
+    const char *bin = _xsrv_find_binary();
+    if (!bin) {
+        vt_logw("session: no Xorg binary found — cannot auto-start the "
+                "X server");
+        return -1;
+    }
+    unsigned char cookie[16];
+    bool have_random = false;
+    int rf = open("/dev/urandom", O_RDONLY);
+    if (rf >= 0) {
+        have_random = read(rf, cookie, sizeof(cookie)) == (ssize_t)sizeof(cookie);
+        close(rf);
+    }
+    if (!have_random) {
+        /* fallback entropy: pid + time hashed into the cookie */
+        uint64_t seed = ((uint64_t)getpid() << 32) ^
+                        (uint64_t)time(NULL) ^ 0x9e3779b97f4a7c15ull;
+        for (size_t i = 0; i < sizeof(cookie); i++) {
+            seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+            cookie[i] = (unsigned char)(seed >> 33);
+        }
+    }
+    const char *rd = getenv("XDG_RUNTIME_DIR");
+    if (!rd || !*rd) rd = "/tmp";
+    snprintf(_xsrv.auth_file, sizeof(_xsrv.auth_file),
+             "%s/vantage-serverauth.%d", rd, (int)getpid());
+    if (!_xsrv_write_auth(_xsrv.auth_file, cookie)) {
+        vt_logw("session: cannot write %s", _xsrv.auth_file);
+        return -1;
+    }
+    int fds[2];
+    if (pipe(fds) != 0) return -1;
+    pid_t pid = fork();
+    if (pid < 0) { close(fds[0]); close(fds[1]); return -1; }
+    if (pid == 0) {
+        /* child: Xorg with the displayfd at fd 7, stdio to /dev/null,
+         * kept on our tty (it needs a VT to run on). PDEATHSIG: if the
+         * session itself dies, the server must not linger on the VT. */
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
+        setsid();
+        if (fds[1] != 7) { dup2(fds[1], 7); close(fds[1]); }
+        close(fds[0]);
+        int nul = open("/dev/null", O_WRONLY);
+        if (nul >= 0) { dup2(nul, 1); dup2(nul, 2); }
+        char vtarg[16] = "";
+        const char *vtnr = getenv("XDG_VTNR");
+        if (vtnr && *vtnr)
+            snprintf(vtarg, sizeof(vtarg), "vt%s", vtnr);
+        else {
+            char ttybuf[64] = "";
+            if (ttyname_r(0, ttybuf, sizeof(ttybuf) - 1) == 0) {
+                const char *v = strstr(ttybuf, "tty");
+                if (v && v[1]) snprintf(vtarg, sizeof(vtarg), "vt%s", v + 3);
+            }
+        }
+        if (vtarg[0])
+            execl(bin, "Xorg", "-displayfd", "7", "-auth", _xsrv.auth_file,
+                  "-nolisten", "tcp", "-noreset", "-keeptty", vtarg,
+                  (char *)NULL);
+        else
+            execl(bin, "Xorg", "-displayfd", "7", "-auth", _xsrv.auth_file,
+                  "-nolisten", "tcp", "-noreset", (char *)NULL);
+        _exit(127);
+    }
+    close(fds[1]);
+    _xsrv.pid = pid;
+    /* read the display number (Xorg writes it once the socket listens);
+     * 15 s covers slow driver probes */
+    struct pollfd pf = { .fd = fds[0], .events = POLLIN };
+    char disp[8] = "";
+    int n = -1;
+    for (int t = 0; t < 150; t++) {
+        if (poll(&pf, 1, 100) == 1) { n = (int)read(fds[0], disp, sizeof(disp) - 1); break; }
+        if (waitpid(pid, NULL, WNOHANG) == pid) break;   /* Xorg died */
+    }
+    close(fds[0]);
+    if (n <= 0) {
+        vt_logw("session: Xorg did not report a display (missing logind "
+                "permissions? try startx)");
+        kill(pid, SIGTERM);
+        waitpid(pid, NULL, 0);
+        unlink(_xsrv.auth_file);
+        _xsrv.pid = -1;
+        return -1;
+    }
+    disp[n] = 0;
+    int dnum = atoi(disp);
+    if (dnum < 0 || dnum > 99) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); unlink(_xsrv.auth_file); _xsrv.pid = -1; return -1; }
+    char dpy[16];
+    snprintf(dpy, sizeof(dpy), ":%d", dnum);
+    setenv("DISPLAY", dpy, 1);
+    setenv("XAUTHORITY", _xsrv.auth_file, 1);
+    _xsrv.active = true;
+    vt_logi("session: started Xorg %s (pid %d, auth %s)", dpy, pid,
+            _xsrv.auth_file);
+    return 0;
+}
+
+static void _xsrv_shutdown(void) {
+    if (!_xsrv.active || _xsrv.pid <= 0) return;
+    kill(_xsrv.pid, SIGTERM);
+    /* bounded grace: a wedged Xorg must not hang the logout */
+    for (int i = 0; i < 30; i++) {
+        if (waitpid(_xsrv.pid, NULL, WNOHANG) == _xsrv.pid) break;
+        vt_time_sleep_ms(100);
+    }
+    kill(_xsrv.pid, SIGKILL);
+    waitpid(_xsrv.pid, NULL, 0);
+    unlink(_xsrv.auth_file);
+    _xsrv.active = false;
+    _xsrv.pid = -1;
+    vt_logi("session: X server stopped");
+}
+
 static const char *_backend_describe(vt_backend_kind_t k, const char *srv) {
     static char buf[128];
     if (k == VT_BACKEND_X11 && srv && *srv)
@@ -102,10 +288,13 @@ static const char *_backend_describe(vt_backend_kind_t k, const char *srv) {
 static int _preflight_backend(vt_backend_kind_t kind, const char **server_out) {
     if (kind == VT_BACKEND_X11) {
         const char *dpy = getenv("DISPLAY");
+        if ((!dpy || !*dpy) && _xsrv_launch() == 0)
+            dpy = getenv("DISPLAY");
         if (!dpy || !*dpy) {
-            vt_loge("session: the X11 backend requires a running X server,\n"
-                    "  but DISPLAY is not set. Start one (e.g. from a\n"
-                    "  display manager or `startx`), or run\n"
+            vt_loge("session: the X11 backend requires a running X server.\n"
+                    "  Auto-starting one failed (no Xorg found, or it\n"
+                    "  could not open the display — missing logind/seat\n"
+                    "  permissions). Start one manually (startx) or run\n"
                     "  `vantage-session --wayland` for the native\n"
                     "  compositor.");
             return -1;
@@ -349,6 +538,7 @@ int main(int argc, char **argv) {
                 "(VANTAGE_BIN_DIR, PATH, or the install prefix)");
         vt_session_free(s);
         vt_config_free(cfg);
+        _xsrv_shutdown();
         return 1;
     }
     char *wm_cmd = vt_strprintf("\"%s\" %s", wm_bin, be_flag);
@@ -493,6 +683,8 @@ int main(int argc, char **argv) {
     vt_ipc_free(ctx.ipc);
     vt_session_free(s);
     vt_config_free(cfg);
+    /* our own X server (if we started one) dies with the session */
+    _xsrv_shutdown();
     vt_logi("session: exited");
     return 0;
 }
