@@ -182,6 +182,15 @@ static void _wl_event_sink(void *ud, void *event) {
         vt_window_t *w = _wl_mirror_new(wm, ev);
         vt_logi("wm: wayland window %u '%s' mapped", w->id,
                 w->title ? w->title : "");
+        /* a newly mapped window takes the focus — clear the others'
+        * mirror flags (XWayland windows announce focused=true at map,
+        * and nothing reset the previous window: the taskbar showed
+        * every window as active) */
+        for (size_t i = 0; i < wm->windows.size; i++) {
+            vt_window_t *p = *(vt_window_t **)vt_vec_at(&wm->windows, i);
+            if (p && p != w && w->focused)
+                p->focused = false;
+        }
         if (wm->on_window_event)
             wm->on_window_event(wm, w, VT_WM_EVENT_OPEN);
         break;
@@ -227,12 +236,23 @@ static void _wl_event_sink(void *ud, void *event) {
     }
     case VT_BACKEND_WL_EVENT_WIN_FOCUS: {
         vt_window_t *w = _wl_mirror_find(wm, ev->window_id);
-        if (!w || w->focused) break;
+        if (!w) break;
+        /* EXCLUSIVE focus set — the old `w->focused` short-circuit
+         * broke exactly here: XWayland windows map with focused=true
+         * (they take focus at map), so a later WIN_FOCUS for one of
+         * them hit the guard and NEVER cleared the others — every
+         * window in the taskbar showed as active at once. */
+        bool changed = false;
         for (size_t i = 0; i < wm->windows.size; i++) {
             vt_window_t *p = *(vt_window_t **)vt_vec_at(&wm->windows, i);
-            if (p) p->focused = (p == w);
+            if (!p) continue;
+            bool nf = (p == w);
+            if (p->focused != nf) {
+                p->focused = nf;
+                changed = true;
+            }
         }
-        if (wm->on_window_event)
+        if (changed && wm->on_window_event)
             wm->on_window_event(wm, w, VT_WM_EVENT_FOCUS);
         break;
     }

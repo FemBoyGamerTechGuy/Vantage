@@ -155,6 +155,30 @@ static const char *_xsrv_find_binary(void) {
 /* Launch the session X server. Returns 0 with the DISPLAY string set
  * in the environment (and XAUTHORITY), -1 on failure (caller falls
  * back to the manual-start instructions). */
+
+/* print the last few lines of Xorg's log — the (EE) lines say WHY a
+ * launch failed; swallowing them turned every real-hardware failure
+ * into an opaque "just errors" */
+static void _xsrv_print_log_tail(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char *lines[12] = {0};
+    int n = 0;
+    char buf[512];
+    while (fgets(buf, sizeof(buf), f)) {
+        if (n == 12) {
+            memmove(lines, lines + 1, sizeof(lines) - sizeof(lines[0]));
+            n = 11;
+        }
+        lines[n++] = vt_strdup(buf);
+    }
+    fclose(f);
+    for (int i = 0; i < n; i++) {
+        vt_logw("  Xorg: %s", lines[i]);
+        vt_free(lines[i]);
+    }
+}
+
 static int _xsrv_launch(void) {
     const char *bin = _xsrv_find_binary();
     if (!bin) {
@@ -186,29 +210,55 @@ static int _xsrv_launch(void) {
         vt_logw("session: cannot write %s", _xsrv.auth_file);
         return -1;
     }
+    /* Xorg's own diagnostics go HERE now, not /dev/null: when the
+     * launch fails on real hardware the old code swallowed every
+     * (EE) line and the user saw only "just errors". The tail of this
+     * log is printed with the failure. */
+    char logpath[512];
+    snprintf(logpath, sizeof(logpath), "%s/vantage-xorg.log", rd);
+    int logfd = open(logpath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     int fds[2];
     if (pipe(fds) != 0) return -1;
     pid_t pid = fork();
     if (pid < 0) { close(fds[0]); close(fds[1]); return -1; }
     if (pid == 0) {
-        /* child: Xorg with the displayfd at fd 7, stdio to /dev/null,
+        /* child: Xorg with the displayfd at fd 7, stdio to the log,
          * kept on our tty (it needs a VT to run on). PDEATHSIG: if the
-         * session itself dies, the server must not linger on the VT. */
+         * session itself dies, the server must not linger on the VT.
+         *
+         * NO setsid() here: -keeptty exists precisely so Xorg KEEPS
+         * the controlling terminal for VT switching — detaching the
+         * session first removed the controlling tty and broke VT
+         * acquisition on real hardware. */
         prctl(PR_SET_PDEATHSIG, SIGTERM);
-        setsid();
         if (fds[1] != 7) { dup2(fds[1], 7); close(fds[1]); }
         close(fds[0]);
-        int nul = open("/dev/null", O_WRONLY);
-        if (nul >= 0) { dup2(nul, 1); dup2(nul, 2); }
+        if (logfd >= 0) {
+            dup2(logfd, 1);
+            dup2(logfd, 2);
+        } else {
+            int nul = open("/dev/null", O_WRONLY);
+            if (nul >= 0) { dup2(nul, 1); dup2(nul, 2); }
+        }
         char vtarg[16] = "";
         const char *vtnr = getenv("XDG_VTNR");
         if (vtnr && *vtnr)
             snprintf(vtarg, sizeof(vtarg), "vt%s", vtnr);
         else {
+            /* fd 0 may be redirected; the REAL controlling terminal
+             * knows the VT we are on */
             char ttybuf[64] = "";
-            if (ttyname_r(0, ttybuf, sizeof(ttybuf) - 1) == 0) {
+            int tfd = open("/dev/tty", O_RDONLY);
+            if (tfd >= 0) {
+                if (ttyname_r(tfd, ttybuf, sizeof(ttybuf) - 1) == 0) { }
+                close(tfd);
+            }
+            if (!ttybuf[0] && ttyname_r(0, ttybuf, sizeof(ttybuf) - 1) != 0)
+                ttybuf[0] = 0;
+            if (ttybuf[0]) {
                 const char *v = strstr(ttybuf, "tty");
-                if (v && v[1]) snprintf(vtarg, sizeof(vtarg), "vt%s", v + 3);
+                if (v && v[1] && v[3])
+                    snprintf(vtarg, sizeof(vtarg), "vt%s", v + 3);
             }
         }
         if (vtarg[0])
@@ -221,6 +271,7 @@ static int _xsrv_launch(void) {
         _exit(127);
     }
     close(fds[1]);
+    if (logfd >= 0) close(logfd);
     _xsrv.pid = pid;
     /* read the display number (Xorg writes it once the socket listens);
      * 15 s covers slow driver probes */
@@ -233,8 +284,13 @@ static int _xsrv_launch(void) {
     }
     close(fds[0]);
     if (n <= 0) {
-        vt_logw("session: Xorg did not report a display (missing logind "
-                "permissions? try startx)");
+        vt_logw("session: Xorg did not report a display number — its "
+                "last words (from %s):", logpath);
+        _xsrv_print_log_tail(logpath);
+        vt_logw("session: common causes: not launched from a real VT "
+                "(run vantage-session --x11 from a TTY login), missing "
+                "logind/seat permissions, or a driver that cannot "
+                "initialize KMS. Otherwise try startx.");
         kill(pid, SIGTERM);
         waitpid(pid, NULL, 0);
         unlink(_xsrv.auth_file);
@@ -249,8 +305,8 @@ static int _xsrv_launch(void) {
     setenv("DISPLAY", dpy, 1);
     setenv("XAUTHORITY", _xsrv.auth_file, 1);
     _xsrv.active = true;
-    vt_logi("session: started Xorg %s (pid %d, auth %s)", dpy, pid,
-            _xsrv.auth_file);
+    vt_logi("session: started Xorg %s (pid %d, auth %s, log %s)", dpy, pid,
+            _xsrv.auth_file, logpath);
     return 0;
 }
 
@@ -524,6 +580,29 @@ int main(int argc, char **argv) {
     setenv("XDG_CURRENT_DESKTOP", "Vantage", 0);
     setenv("DESKTOP_SESSION", "vantage", 0);
     setenv("QT_QPA_PLATFORMTHEME", "vantage", 0);
+    /* cursor theme consistency for clients that still load their own
+     * cursors (cursor-shape-v1 clients ask us instead, but older
+     * toolkits fall back to XCURSOR_*): without a size hint every app
+     * picked whatever it found — oversized mismatched pointers */
+    setenv("XCURSOR_SIZE", "24", 0);
+    if (!getenv("XCURSOR_THEME")) {
+        /* prefer a real installed theme, else leave unset (toolkits
+         * then use their default) */
+        const char *const try_themes[] = {
+            "Vantage-cursors", "Adwaita", "Breeze", "default",
+        };
+        for (size_t i = 0;
+             i < sizeof(try_themes) / sizeof(try_themes[0]); i++) {
+            char *p = vt_strprintf(
+                "/usr/share/icons/%s/cursors", try_themes[i]);
+            bool have = access(p, F_OK) == 0;
+            vt_free(p);
+            if (have) {
+                setenv("XCURSOR_THEME", try_themes[i], 0);
+                break;
+            }
+        }
+    }
     char *qt_plugins = vt_strprintf("%s/.local/lib/vantage/qt6",
                                     vt_home_dir());
     setenv("QT_PLUGIN_PATH", qt_plugins, 0);

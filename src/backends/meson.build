@@ -28,6 +28,27 @@ xdg_decoration_xml = join_paths(wl_protocols_dir, 'unstable',
   'xdg-decoration', 'xdg-decoration-unstable-v1.xml')
 primary_selection_xml = join_paths(wl_protocols_dir, 'unstable',
   'primary-selection', 'primary-selection-unstable-v1.xml')
+# foot/kitty/GTK4-needed staging protocols: server-side cursors
+# (cursor-shape-v1), focus/urgency (xdg-activation-v1), HiDPI
+# negotiation (fractional-scale-v1), taskbar icons
+# (xdg-toplevel-icon-v1)
+cursor_shape_xml = join_paths(wl_protocols_dir, 'staging',
+  'cursor-shape', 'cursor-shape-v1.xml')
+xdg_activation_xml = join_paths(wl_protocols_dir, 'staging',
+  'xdg-activation', 'xdg-activation-v1.xml')
+fractional_scale_xml = join_paths(wl_protocols_dir, 'staging',
+  'fractional-scale', 'fractional-scale-v1.xml')
+toplevel_icon_xml = join_paths(wl_protocols_dir, 'staging',
+  'xdg-toplevel-icon', 'xdg-toplevel-icon-v1.xml')
+# cursor-shape-v1's generated code references the tablet-tool interface
+# (get_tablet_tool_v2) — link the tablet-unstable-v2 generated code too
+# or the interface symbol stays undefined at link time
+tablet_v2_xml = join_paths(wl_protocols_dir, 'unstable',
+  'tablet', 'tablet-unstable-v2.xml')
+# wp_viewporter: clients combine it with fractional-scale; with our
+# constant integer scale of 1.0 the viewport is always the identity
+viewporter_xml = join_paths(wl_protocols_dir, 'stable',
+  'viewporter', 'viewporter.xml')
 # vendored protocol XMLs (repo-root protocols/):
 #   wlr-layer-shell (MIT, wlr-protocols — panels dock through it)
 #   xwayland-shell (wayland-protocols staging — X11 window association)
@@ -91,6 +112,56 @@ if dep_wayland_server.found() and dep_wayland_client.found() and \
     output: 'xwayland-shell-protocol.c',
     command: [prog_wl_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
 
+  cursor_shape_proto_h = custom_target('cursor-shape-protocol.h',
+    input: cursor_shape_xml,
+    output: 'cursor-shape-protocol.h',
+    command: [prog_wl_scanner, 'server-header', '@INPUT@', '@OUTPUT@'])
+  cursor_shape_proto_c = custom_target('cursor-shape-protocol.c',
+    input: cursor_shape_xml,
+    output: 'cursor-shape-protocol.c',
+    command: [prog_wl_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
+  xdg_activation_proto_h = custom_target('xdg-activation-protocol.h',
+    input: xdg_activation_xml,
+    output: 'xdg-activation-protocol.h',
+    command: [prog_wl_scanner, 'server-header', '@INPUT@', '@OUTPUT@'])
+  xdg_activation_proto_c = custom_target('xdg-activation-protocol.c',
+    input: xdg_activation_xml,
+    output: 'xdg-activation-protocol.c',
+    command: [prog_wl_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
+  fractional_scale_proto_h = custom_target('fractional-scale-protocol.h',
+    input: fractional_scale_xml,
+    output: 'fractional-scale-protocol.h',
+    command: [prog_wl_scanner, 'server-header', '@INPUT@', '@OUTPUT@'])
+  fractional_scale_proto_c = custom_target('fractional-scale-protocol.c',
+    input: fractional_scale_xml,
+    output: 'fractional-scale-protocol.c',
+    command: [prog_wl_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
+  toplevel_icon_proto_h = custom_target('xdg-toplevel-icon-protocol.h',
+    input: toplevel_icon_xml,
+    output: 'xdg-toplevel-icon-protocol.h',
+    command: [prog_wl_scanner, 'server-header', '@INPUT@', '@OUTPUT@'])
+  toplevel_icon_proto_c = custom_target('xdg-toplevel-icon-protocol.c',
+    input: toplevel_icon_xml,
+    output: 'xdg-toplevel-icon-protocol.c',
+    command: [prog_wl_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
+  tablet_v2_proto_c = custom_target('tablet-v2-protocol.c',
+    input: tablet_v2_xml,
+    output: 'tablet-v2-protocol.c',
+    command: [prog_wl_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
+  viewporter_proto_h = custom_target('viewporter-protocol.h',
+    input: viewporter_xml,
+    output: 'viewporter-protocol.h',
+    command: [prog_wl_scanner, 'server-header', '@INPUT@', '@OUTPUT@'])
+  viewporter_proto_c = custom_target('viewporter-protocol.c',
+    input: viewporter_xml,
+    output: 'viewporter-protocol.c',
+    command: [prog_wl_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
   backend_deps += [dep_wayland_client, dep_wayland_server, dep_xkbcommon]
   backend_cargs += ['-DVT_HAVE_WAYLAND']
   lib_vantage_backends_extra_sources = [
@@ -99,7 +170,13 @@ if dep_wayland_server.found() and dep_wayland_client.found() and \
     layer_shell_proto_c, layer_shell_proto_h,
     xwayland_shell_proto_c, xwayland_shell_proto_h,
     primary_selection_proto_c, primary_selection_proto_h,
-    'vt-wl-layer.c', 'vt-wl-xwayland.c']
+    cursor_shape_proto_c, cursor_shape_proto_h,
+    xdg_activation_proto_c, xdg_activation_proto_h,
+    fractional_scale_proto_c, fractional_scale_proto_h,
+    toplevel_icon_proto_c, toplevel_icon_proto_h,
+    tablet_v2_proto_c,
+    viewporter_proto_c, viewporter_proto_h,
+    'vt-wl-layer.c', 'vt-wl-xwayland.c', 'vt-wl-protocols.c']
 
   # Xwayland window management needs xcb (+icccm for property types).
   # xcb-composite: the WM-side CompositeRedirectSubwindows(root, MANUAL)

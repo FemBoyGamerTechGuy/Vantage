@@ -142,6 +142,8 @@ int main(int argc, char **argv) {
     const char *shot = NULL;
     const char *title = "Vantage Test";
     const char *click = NULL;         /* "x,y" before the screenshot */
+    const char *rclick = NULL;        /* "x,y" RIGHT-button click (taskbar
+                                        * context menus) before the shot */
     const char *clicks = NULL;        /* "x,y;x,y;…" multi-step UI driving */
     bool no_windows = false;          /* pure input driver: map nothing */
     bool ewmh_only = false;
@@ -174,6 +176,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--screenshot") && i + 1 < argc) shot = argv[++i];
         else if (!strcmp(argv[i], "--title") && i + 1 < argc) title = argv[++i];
         else if (!strcmp(argv[i], "--click") && i + 1 < argc) click = argv[++i];
+        else if (!strcmp(argv[i], "--rclick") && i + 1 < argc) rclick = argv[++i];
         else if (!strcmp(argv[i], "--clicks") && i + 1 < argc) clicks = argv[++i];
         else if (!strcmp(argv[i], "--no-windows")) no_windows = true;
         else if (!strcmp(argv[i], "--ewmh-probe")) ewmh_only = true;
@@ -714,6 +717,25 @@ int main(int argc, char **argv) {
         }
         msleep(100);
         XFlush(d);
+    }
+
+    if (rclick) {
+        /* XTest RIGHT click at root coordinates — the taskbar
+         * context-menu path (the panel's right-click gesture). Same
+         * real-input pipeline as --click, button 3. */
+        int cx = 0, cy = 0;
+        sscanf(rclick, "%d,%d", &cx, &cy);
+        int evb = 0, errb = 0, vmaj = 0, vmin = 0;
+        if (XTestQueryExtension(d, &evb, &errb, &vmaj, &vmin)) {
+            XTestFakeMotionEvent(d, -1, cx, cy, CurrentTime);
+            XSync(d, False);
+            XTestFakeButtonEvent(d, 3, True, CurrentTime);
+            XTestFakeButtonEvent(d, 3, False, CurrentTime);
+            XSync(d, False);
+            printf("right-clicked %d,%d\n", cx, cy);
+            fflush(stdout);
+            msleep(700);
+        }
     }
 
     if (click) {

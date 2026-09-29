@@ -161,8 +161,16 @@ void _emit_win(_wl_state_t *st, vt_backend_wl_event_kind_t kind,
     ev.app_id = t->app_id;
     _wl_surf_t *s = t->surf;
     if (s) {
-        ev.x = s->x; ev.y = s->y;
-        ev.w = s->w; ev.h = s->h;
+        /* report the WINDOW (content) rect, not the raw buffer: CSD
+         * clients commit buffers that include shadow margins outside
+         * set_window_geometry — announcing the raw rect made the pager
+         * and taskbar over-report every CSD window by its shadow
+         * (428x329 for a 400x300 GTK window). */
+        int cx, cy, cw, ch;
+        _win_content_rect(s, &cx, &cy, &cw, &ch);
+        ev.x = cx; ev.y = cy;
+        ev.w = cw > 0 ? cw : 0;
+        ev.h = ch > 0 ? ch : 0;
     } else {
         /* XWayland windows emit events before their surface pairs —
          * the toplevel's geometry mirror (from the X window) keeps the
@@ -180,6 +188,82 @@ void _emit_win(_wl_state_t *st, vt_backend_wl_event_kind_t kind,
     /* emit through the backend's sink list: find backend from st */
     if (_wls && _wls->backend_self) b = _wls->backend_self;
     if (b) vt_backend_emit_event(b, &ev);
+}
+
+/* The WINDOW rect (content rect) in screen coordinates — see the
+ * header. Buffer-bounded: win_gw/gh are clamped to the committed
+ * buffer so a geometry larger than the buffer cannot make hit-tests
+ * or painting read outside the client content. */
+void _win_content_rect(const _wl_surf_t *s, int *cx, int *cy,
+                        int *cw, int *ch) {
+    *cx = s->x; *cy = s->y; *cw = s->w; *ch = s->h;
+    if (s->have_win_geo) {
+        int gx = s->win_gx, gy = s->win_gy;
+        int gw = s->win_gw, gh = s->win_gh;
+        if (gx < 0) gx = 0;
+        if (gy < 0) gy = 0;
+        if (gx > s->w) gx = s->w;
+        if (gy > s->h) gy = s->h;
+        if (gw > s->w - gx) gw = s->w - gx;
+        if (gh > s->h - gy) gh = s->h - gy;
+        *cx = s->x + gx;
+        *cy = s->y + gy;
+        *cw = gw > 0 ? gw : 0;
+        *ch = gh > 0 ? gh : 0;
+    }
+}
+
+/* pointer-input containment: the client's input region if it set
+ * one (CSD toolkits exclude shadow margins), else the window/content
+ * rect — NEVER the raw buffer rect (that delivered clicks and resize
+ * grabs into the transparent shadow band around CSD windows, which
+ * read as "a black region that behaves like a solid part of the
+ * window"). */
+/* content size helpers (set_window_geometry aware) — used by the
+ * interactive resize seeding (defined near _pointer_button) */
+static inline int _surf_cw(const _wl_surf_t *s);
+static inline int _surf_ch(const _wl_surf_t *s);
+
+/* exclusive activation bookkeeping (defined after _click_to_focus) */
+static void _activate_toplevel(_wl_state_t *st, _xdg_toplevel_t *t);
+
+bool _surf_input_contains(const _wl_surf_t *s, int x, int y) {
+    if (!s || !s->mapped) return false;
+    int sx = s->x, sy = s->y;
+    if (s->popup && s->popup->parent) {
+        sx = s->popup->parent->x + s->popup->rel_x;
+        sy = s->popup->parent->y + s->popup->rel_y;
+    }
+    int lx = x - sx, ly = y - sy;
+    if (s->input_set) {
+        bool inside = false;
+        for (int i = 0; i < s->n_in_adds; i++) {
+            const struct _vt_rect *r = &s->in_adds[i];
+            if (lx >= r->x && lx < r->x + r->w &&
+                ly >= r->y && ly < r->y + r->h) { inside = true; break; }
+        }
+        if (!inside) return false;
+        for (int i = 0; i < s->n_in_subs; i++) {
+            const struct _vt_rect *r = &s->in_subs[i];
+            if (lx >= r->x && lx < r->x + r->w &&
+                ly >= r->y && ly < r->y + r->h) return false;
+        }
+        return true;
+    }
+    int cx, cy, cw, ch;
+    if (s->popup && s->popup->parent) {
+        /* popup: _win_content_rect is buffer-relative — re-root it at
+         * the popup's on-screen origin (parent + rel) */
+        int bx, by, bw, bh;
+        _win_content_rect(s, &bx, &by, &bw, &bh);
+        cx = bx - s->x + sx;
+        cy = by - s->y + sy;
+        cw = bw;
+        ch = bh;
+    } else {
+        _win_content_rect(s, &cx, &cy, &cw, &ch);
+    }
+    return x >= cx && x < cx + cw && y >= cy && y < cy + ch;
 }
 
 /* ---------------------------------------------------------- compositor */
@@ -294,6 +378,25 @@ static void _surf_commit(struct wl_client *cli, struct wl_resource *res) {
             if (st) st->dirty = true;
             if (st && st->ptr_focus == s) st->ptr_focus = NULL;
             if (st && st->kbd_focus == s) st->kbd_focus = NULL;
+            /* A TOPLEVEL hiding itself with a nil commit IS a window
+             * close from the WM's point of view — and it is the close
+             * path real toolkits take after xdg_toplevel.send_close:
+             * GTK destroys the window (nil commit unmaps it) and only
+             * then destroys the wl_surface, whose destructor now sees
+             * mapped == false and stays silent. Without this emit the
+             * WM model kept the window forever: the "ghost window"
+             * (visible in the pager, dead to every interaction) after
+             * closing an app. Popups hide the same way but are not WM
+             * windows — they must not emit. */
+            if (s->toplevel && st) {
+                if (st->focused_toplevel == s->toplevel)
+                    st->focused_toplevel = NULL;
+                if (st->op_surf == s) {
+                    st->op_active = false;
+                    st->op_surf = NULL;
+                }
+                _emit_win(st, VT_BACKEND_WL_EVENT_WIN_UNMAP, s->toplevel);
+            }
         }
     }
     s->attach_pending = false;
@@ -385,21 +488,27 @@ static void _surf_commit(struct wl_client *cli, struct wl_resource *res) {
             s->ws = st->ws_cur;
             /* place the first frame: maximized/fullscreen anchor below
              * the panel (or at the very top for fullscreen); everything
-             * else centers inside the workarea */
+             * else centers inside the workarea — the WINDOW (content)
+             * rect, not the buffer: CSD shadow margins must not count
+             * toward the window's on-screen size */
             int wx, wy, ww, wh;
             _layer_workarea(_wls, &wx, &wy, &ww, &wh);
+            int gx = s->have_win_geo ? s->win_gx : 0;
+            int gy = s->have_win_geo ? s->win_gy : 0;
+            int gw = s->have_win_geo && s->win_gw > 0 ? s->win_gw : s->w;
+            int gh = s->have_win_geo && s->win_gh > 0 ? s->win_gh : s->h;
             if (s->toplevel->fullscreen) {
-                s->x = 0;
-                s->y = 0;
+                s->x = -gx;
+                s->y = -gy;
             } else if (s->toplevel->maximized) {
-                s->x = wx;
-                s->y = wy;
+                s->x = wx - gx;
+                s->y = wy - gy;
             } else if (s->x == 0 && s->y == 0) {
-                s->x = wx + (ww - s->w) / 2;
-                s->y = wy + (wh - s->h) / 2;
-                if (s->y < wy) s->y = wy;
-                if (s->x < 0) s->x = 0;
-                if (s->y < 0) s->y = 0;
+                s->x = wx + (ww - gw) / 2 - gx;
+                s->y = wy + (wh - gh) / 2 - gy;
+                if (s->y + gy < wy) s->y = wy - gy;
+                if (s->x + gx < 0) s->x = -gx;
+                if (s->y + gy < 0) s->y = -gy;
             }
             vt_logi("wayland: window 0x%llx '%s' mapped %dx%d at +%d+%d",
                     (unsigned long long)(s->toplevel->id),
@@ -415,6 +524,7 @@ static void _surf_commit(struct wl_client *cli, struct wl_resource *res) {
              * clients render their own chrome when we answer "client") */
             _decor_notify(s);
             _kbd_enter_focus(st, s);
+            _activate_toplevel(_wls, s->toplevel);
         }
         _wls->dirty = true;
     } else if (s->mapped && s->w > 0) {
@@ -456,10 +566,56 @@ static void _surf_set_opaque(struct wl_client *cli,
     (void)cli; (void)res; (void)region;
 }
 
+/* wl_region: REAL rect storage now — set_input_region hands the rect
+ * list to the surface, and CSD toolkits (GTK4/Qt) build their input
+ * region as content-rect MINUS shadow margins. The old no-op made
+ * the compositor deliver clicks into transparent shadow bands. */
+typedef struct _region {
+    struct _vt_rect *adds;
+    int             n_adds;
+    struct _vt_rect *subs;
+    int             n_subs;
+} _region_t;
+
 static void _surf_set_input(struct wl_client *cli,
                             struct wl_resource *res,
                             struct wl_resource *region) {
-    (void)cli; (void)res; (void)region;
+    (void)cli;
+    _wl_surf_t *s = wl_resource_get_user_data(res);
+    if (!s) return;
+    /* drop the previous region (both arrays) */
+    vt_free(s->in_adds); vt_free(s->in_subs);
+    s->in_adds = NULL; s->in_subs = NULL;
+    s->n_in_adds = 0; s->n_in_subs = 0;
+    s->input_set = false;
+    if (!region) return;          /* NULL region = whole surface */
+    _region_t *rg = wl_resource_get_user_data(region);
+    if (!rg || (rg->n_adds == 0 && rg->n_subs == 0)) {
+        /* an EMPTY region: no input anywhere (protocol: an empty region
+         * means the surface does not accept input at all) */
+        s->input_set = true;
+        return;
+    }
+    if (rg->n_adds > 0) {
+        s->in_adds = vt_malloc(sizeof(struct _vt_rect) * (size_t)rg->n_adds);
+        if (s->in_adds) {
+            memcpy(s->in_adds, rg->adds,
+                   sizeof(struct _vt_rect) * (size_t)rg->n_adds);
+            s->n_in_adds = rg->n_adds;
+        }
+    }
+    if (rg->n_subs > 0) {
+        s->in_subs = vt_malloc(sizeof(struct _vt_rect) * (size_t)rg->n_subs);
+        if (s->in_subs) {
+            memcpy(s->in_subs, rg->subs,
+                   sizeof(struct _vt_rect) * (size_t)rg->n_subs);
+            s->n_in_subs = rg->n_subs;
+        }
+    }
+    s->input_set = true;
+    /* pointer state may change immediately: the surface under the
+     * cursor may no longer accept input there */
+    if (_wls) _pointer_focus_update(_wls, false);
 }
 static void _surf_set_buffer_transform(struct wl_client *cli,
                                         struct wl_resource *res,
@@ -483,32 +639,65 @@ static void _surf_offset(struct wl_client *cli,
     s->dy = y;
 }
 
-static void _region_destroy(struct wl_client *cli, struct wl_resource *res);
+/* wl_region implementation (see _region_t above) */
+static void _region_destroy(struct wl_client *cli,
+                            struct wl_resource *res) {
+    (void)cli;
+    wl_resource_destroy(res);
+}
 static void _region_add(struct wl_client *cli, struct wl_resource *res,
                         int32_t x, int32_t y, int32_t w, int32_t h) {
-    (void)cli; (void)res; (void)x; (void)y; (void)w; (void)h;
+    (void)cli;
+    _region_t *rg = wl_resource_get_user_data(res);
+    if (!rg || w <= 0 || h <= 0) return;
+    struct _vt_rect *na = vt_realloc(rg->adds,
+        sizeof(struct _vt_rect) * (size_t)(rg->n_adds + 1));
+    if (!na) return;
+    rg->adds = na;
+    rg->adds[rg->n_adds].x = x;
+    rg->adds[rg->n_adds].y = y;
+    rg->adds[rg->n_adds].w = w;
+    rg->adds[rg->n_adds].h = h;
+    rg->n_adds++;
 }
 static void _region_subtract(struct wl_client *cli,
                              struct wl_resource *res,
                              int32_t x, int32_t y, int32_t w, int32_t h) {
-    (void)cli; (void)res; (void)x; (void)y; (void)w; (void)h;
+    (void)cli;
+    _region_t *rg = wl_resource_get_user_data(res);
+    if (!rg || w <= 0 || h <= 0) return;
+    struct _vt_rect *ns = vt_realloc(rg->subs,
+        sizeof(struct _vt_rect) * (size_t)(rg->n_subs + 1));
+    if (!ns) return;
+    rg->subs = ns;
+    rg->subs[rg->n_subs].x = x;
+    rg->subs[rg->n_subs].y = y;
+    rg->subs[rg->n_subs].w = w;
+    rg->subs[rg->n_subs].h = h;
+    rg->n_subs++;
 }
 static const struct wl_region_interface _region_impl = {
     .destroy = _region_destroy,
     .add = _region_add,
     .subtract = _region_subtract,
 };
-static void _region_destroy(struct wl_client *cli, struct wl_resource *res) {
-    (void)cli;
-    wl_resource_destroy(res);
+static void _region_res_destroy(struct wl_resource *res) {
+    _region_t *rg = wl_resource_get_user_data(res);
+    if (!rg) return;
+    vt_free(rg->adds);
+    vt_free(rg->subs);
+    vt_free(rg);
 }
 static void _compositor_create_region(struct wl_client *cli,
                                       struct wl_resource *res, uint32_t id) {
     (void)res;
+    _region_t *rg = vt_malloc0(sizeof(*rg));
+    if (!rg) { wl_client_post_no_memory(cli); return; }
     struct wl_resource *r = wl_resource_create(cli, &wl_region_interface,
                                                1, id);
-    if (!r) { wl_client_post_no_memory(cli); return; }
-    wl_resource_set_implementation(r, &_region_impl, NULL, NULL);
+    if (!r) { vt_free(rg); wl_client_post_no_memory(cli); return; }
+    wl_resource_set_implementation(r, &_region_impl, rg,
+                                   _region_res_destroy);
 }
 
 static const struct wl_surface_interface _surf_impl = {
@@ -565,6 +754,9 @@ static void _surf_resource_destroy(struct wl_resource *res) {
          * through d->surf (ASan heap-use-after-free) — orphan it. */
         _decor_orphan(s);
     }
+    /* staging-protocol weak links (activation tokens, fractional
+     * scale objects) must be detached before the surface memory goes */
+    _proto_surface_destroyed(s);
     if (s->mapped) {
         wl_list_remove(&s->link);
         if (_wls) {
@@ -589,15 +781,34 @@ static void _surf_resource_destroy(struct wl_resource *res) {
                 _wls->op_active = false;
                 _wls->op_surf = NULL;
             }
+            /* same guard for the implicit pointer grab: a press that
+             * was forwarded to this surface must not try to deliver
+             * its release to freed memory */
+            if (_wls->press_surf == s) {
+                _wls->press_surf = NULL;
+                _wls->press_consumed = true;
+            }
         }
         if (s->toplevel)
             _emit_win(_wls, VT_BACKEND_WL_EVENT_WIN_UNMAP, s->toplevel);
     }
     if (s->toplevel) {
-        vt_free(s->toplevel->title);
-        vt_free(s->toplevel->app_id);
-        vt_free(s->toplevel);
+        _xdg_toplevel_t *t = s->toplevel;
+        if (t->res == NULL) {
+            /* synthetic toplevel (XWayland) or one whose resource is
+             * already gone: the SURFACE destructor owns the record */
+            _toplevel_free(t);
+        } else {
+            /* the xdg_toplevel resource outlives the surface at client
+             * death (libwayland destroys resources in creation order:
+             * wl_surface first) — its destructor owns the record, we
+             * only detach so it never writes through freed memory */
+            t->surf = NULL;
+            s->toplevel = NULL;
+        }
     }
+    vt_free(s->in_adds);
+    vt_free(s->in_subs);
     vt_free(s->own);
     vt_free(s);
     if (_wls) _wls->dirty = true;
@@ -1247,6 +1458,42 @@ static void _toplevel_set_title(struct wl_client *cli,
         _emit_win(_wls, VT_BACKEND_WL_EVENT_WIN_TITLE, t);
     }
 }
+/* xdg_toplevel resource teardown — the OTHER half of the window-close
+ * handshake. Destroying the toplevel (without a nil commit first, or
+ * after it) is how toolkits close windows; the resource previously had
+ * NO destructor, so the record leaked AND the window never emitted
+ * WIN_UNMAP when the client kept the wl_surface alive — a stale
+ * pager/taskbar entry that no longer responded to anything (the ghost
+ * window). The emit only fires while the surface still maps THIS
+ * toplevel (the nil-commit path in _surf_commit already emitted). */
+static void _toplevel_res_destroy(struct wl_resource *res) {
+    _xdg_toplevel_t *t = wl_resource_get_user_data(res);
+    if (!t) return;
+    wl_resource_set_user_data(res, NULL);
+    _wl_surf_t *s = t->surf;
+    if (s && s->toplevel == t) {
+        if (s->mapped) {
+            s->mapped = false;
+            wl_list_remove(&s->link);
+            if (_wls) {
+                _surface_output_leave(s);
+                if (_wls->ptr_focus == s) _wls->ptr_focus = NULL;
+                if (_wls->kbd_focus == s) _wls->kbd_focus = NULL;
+                if (_wls->op_surf == s) {
+                    _wls->op_active = false;
+                    _wls->op_surf = NULL;
+                }
+                if (_wls->focused_toplevel == t)
+                    _wls->focused_toplevel = NULL;
+                _wls->dirty = true;
+                _emit_win(_wls, VT_BACKEND_WL_EVENT_WIN_UNMAP, t);
+            }
+        }
+        s->toplevel = NULL;
+    }
+    t->surf = NULL;
+    _toplevel_free(t);
+}
 static void _toplevel_set_app_id(struct wl_client *cli,
                                  struct wl_resource *res,
                                  const char *app_id) {
@@ -1314,8 +1561,8 @@ static void _toplevel_resize(struct wl_client *cli,
         _wls->op_grab_y = _wls->cursor_y;
         _wls->op_start_x = t->surf->x;
         _wls->op_start_y = t->surf->y;
-        _wls->op_start_w = t->surf->w;
-        _wls->op_start_h = t->surf->h;
+        _wls->op_start_w = _surf_cw(t->surf);
+        _wls->op_start_h = _surf_ch(t->surf);
         _wls->op_last_geo_us = 0;
         t->resizing = true;
     }
@@ -1383,8 +1630,15 @@ static void _wl_maximize_apply(_xdg_toplevel_t *t, bool on) {
         }
         int tbar = s->ssd ? (_WL_SSD_TITLE + _WL_SSD_BORDER) : 0;
         int brd  = s->ssd ? _WL_SSD_BORDER : 0;
-        s->x = wx + brd;
-        s->y = wy + tbar;
+        /* place the WINDOW (content) rect: CSD buffers carry shadow
+         * margins outside set_window_geometry — placing the BUFFER
+         * origin at the workarea left the content inset by the margin
+         * and the shadow band (opaque black before the blend fix)
+         * edging the maximized window. */
+        int gx = s->have_win_geo ? s->win_gx : 0;
+        int gy = s->have_win_geo ? s->win_gy : 0;
+        s->x = wx + brd - gx;
+        s->y = wy + tbar - gy;
         t->maximized = true;
         _toplevel_configure(t, ww - 2 * brd, wh - tbar - brd,
                             XDG_TOPLEVEL_STATE_MAXIMIZED);
@@ -1426,8 +1680,14 @@ static void _toplevel_fullscreen(struct wl_client *cli,
     t->prev_x = s->x; t->prev_y = s->y;
     t->prev_w = s->w; t->prev_h = s->h;
     t->fullscreen = true;
-    s->x = 0;
-    s->y = 0;
+    /* the CONTENT rect covers the output: a fullscreen CSD window
+     * whose buffer still carries shadow margins would otherwise show
+     * them as black edges of the display (the reported "browser ends
+     * up with a black portion of the screen in fullscreen"). */
+    int gx = s->have_win_geo ? s->win_gx : 0;
+    int gy = s->have_win_geo ? s->win_gy : 0;
+    s->x = -gx;
+    s->y = -gy;
     _toplevel_configure(t, _wls->out_w, _wls->out_h,
                         XDG_TOPLEVEL_STATE_FULLSCREEN);
     _emit_win(_wls, VT_BACKEND_WL_EVENT_WIN_STATE, t);
@@ -1473,7 +1733,7 @@ static void _toplevel_set_minimized(struct wl_client *cli,
         st->kbd_focus = s;
         st->focused_toplevel = s->toplevel;
         _kbd_enter_focus(st, s);
-        _emit_win(st, VT_BACKEND_WL_EVENT_WIN_FOCUS, s->toplevel);
+        _activate_toplevel(st, s->toplevel);
         break;
     }
 }
@@ -1546,7 +1806,8 @@ static void _xdg_get_toplevel(struct wl_client *cli,
     struct wl_resource *tres = wl_resource_create(cli,
         &xdg_toplevel_interface, wl_resource_get_version(res), id);
     if (!tres) { vt_free(t); wl_client_post_no_memory(cli); return; }
-    wl_resource_set_implementation(tres, &_toplevel_impl, t, NULL);
+    wl_resource_set_implementation(tres, &_toplevel_impl, t,
+                                   _toplevel_res_destroy);
     t->res = tres;
     _toplevel_configure(t, 0, 0, 0);
     /* legacy double-configure kept for toolkits that count exactly
@@ -1962,10 +2223,12 @@ static void _ptr_set_cursor(struct wl_client *cli,
             s->hotspot_y = hotspot_y;
             st->cursor_surf = s;
             st->cur_client_set = true;
+            st->client_shape = 0;   /* surface cursor replaces a named shape */
         }
     } else {
-        st->cursor_surf = NULL;
-        st->cur_client_set = false;
+        /* client cleared its cursor: restore the compositor arrow (a
+         * client_shape image may currently occupy the cursor slot) */
+        _cursor_client_release();
     }
     /* keep the hardware plane consistent with the takeover: while a
      * client cursor is active the plane must be HIDDEN (the sprite is
@@ -2576,8 +2839,10 @@ static void _cursor_apply_hw(_wl_state_t *st) {
     if (!st || !st->kms) return;
     /* an active resize/edge shape ALWAYS wins over the client cursor:
      * the frame band belongs to the compositor, not the app */
-    if (st->cur_shape == 0 && st->cur_client_set && st->cursor_surf) {
-        /* client cursor surface: software sprite owns the pointer —
+    if (st->cur_shape != 0) {
+        /* compositor resize shape — our image, straight to the plane */
+    } else if (st->cur_client_set && st->cursor_surf) {
+        /* client cursor SURFACE: software sprite owns the pointer —
          * hide the plane even before the sprite's buffer commits (a
          * briefly invisible cursor during the swap is the standard
          * compositor behavior; leaving the plane up made the compositor
@@ -2585,6 +2850,9 @@ static void _cursor_apply_hw(_wl_state_t *st) {
         vt_kms_cursor_hide(st->kms);
         return;
     }
+    /* everything else — the compositor arrow OR a cursor-shape-v1
+     * named shape the client asked for (WE rendered it from the
+     * Xcursor theme into cursor_img) — is OUR pixels: hardware plane */
     if (!vt_kms_cursor_set(st->kms, st->cursor_img,
                            st->cur_img_w, st->cur_img_h, 64)) {
         /* drmModeSetCursor failed (quirky drivers): the software sprite
@@ -2592,6 +2860,195 @@ static void _cursor_apply_hw(_wl_state_t *st) {
          * and dirty forces the repaint that blends it. */
         st->dirty = true;
     }
+}
+
+/* ------------------------------------------------ cursor-shape-v1 hooks */
+
+/* cursor-shape enum → Xcursor name (plus a small alias chain). The
+ * compositor owns named-shape rendering, so every toolkit gets the
+ * SAME theme cursor — no more per-app fallback icons as pointers
+ * (the "some applications fall back to whatever cursor they can
+ * find" report, and the oversized bluish cursor it produced). */
+static const char *const _shape_names[][3] = {
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT]        = { "left_ptr", "arrow", "default" },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_CONTEXT_MENU]   = { "context-menu", "left_ptr", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_HELP]           = { "question_arrow", "help", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER]        = { "pointer", "hand", "hand2" },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_PROGRESS]       = { "left_ptr_watch", "watch", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_WAIT]           = { "watch", "left_ptr_watch", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_CELL]           = { "cross", "plus", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_CROSSHAIR]      = { "crosshair", "cross", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TEXT]           = { "xterm", "text", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_VERTICAL_TEXT]  = { "vertical-text", "xterm", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_ALIAS]          = { "dnd-link", "link", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_COPY]           = { "dnd-copy", "copy", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_MOVE]           = { "dnd-move", "move", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NO_DROP]        = { "dnd-no-drop", "forbidden", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NOT_ALLOWED]    = { "not-allowed", "crossed_circle", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_GRAB]           = { "openhand", "grab", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_GRABBING]       = { "closedhand", "grabbing", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_E_RESIZE]       = { "right_side", "e-resize", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_N_RESIZE]       = { "top_side", "n-resize", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NE_RESIZE]      = { "top_right_corner", "ne-resize", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NW_RESIZE]      = { "top_left_corner", "nw-resize", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_S_RESIZE]       = { "bottom_side", "s-resize", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_SE_RESIZE]      = { "bottom_right_corner", "se-resize", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_SW_RESIZE]      = { "bottom_left_corner", "sw-resize", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_W_RESIZE]       = { "left_side", "w-resize", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_EW_RESIZE]      = { "sb_h_double_arrow", "size_hor", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NS_RESIZE]      = { "sb_v_double_arrow", "size_ver", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NESW_RESIZE]    = { "fd_double_arrow", "size_bdiag", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NWSE_RESIZE]    = { "bd_double_arrow", "size_fdiag", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_COL_RESIZE]     = { "split_h", "sb_h_double_arrow", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_ROW_RESIZE]     = { "split_v", "sb_v_double_arrow", NULL },
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_ALL_SCROLL]     = { "fleur", "all-scroll", NULL },
+#ifdef WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_ALL_RESIZE
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_ALL_RESIZE]     = { "fleur", "all-scroll", NULL },
+#endif
+#ifdef WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DND_ASK
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DND_ASK]        = { "dnd-ask", "question_arrow", NULL },
+#endif
+#ifdef WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_ZOOM_IN
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_ZOOM_IN]        = { "zoom-in", "zoom_in", NULL },
+#endif
+#ifdef WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_ZOOM_OUT
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_ZOOM_OUT]       = { "zoom-out", "zoom_out", NULL },
+#endif
+#ifdef WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_UP_DOWN
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_UP_DOWN]        = { "center_ptr", "sb_v_double_arrow", NULL },
+#endif
+#ifdef WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_LEFT_RIGHT
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_LEFT_RIGHT]     = { "center_ptr", "sb_h_double_arrow", NULL },
+#endif
+#ifdef WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TOP_LEFT_CORNER
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TOP_LEFT_CORNER]  = { "top_left_corner", "nw-resize", NULL },
+#endif
+#ifdef WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TOP_RIGHT_CORNER
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TOP_RIGHT_CORNER] = { "top_right_corner", "ne-resize", NULL },
+#endif
+#ifdef WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_BOTTOM_RIGHT_CORNER
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_BOTTOM_RIGHT_CORNER] = { "bottom_right_corner", "se-resize", NULL },
+#endif
+#ifdef WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_BOTTOM_LEFT_CORNER
+    [WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_BOTTOM_LEFT_CORNER]  = { "bottom_left_corner", "sw-resize", NULL },
+#endif
+};
+
+/* loaded-shape cache: shape → 64x64 cell + metrics. Lazy: only shapes
+ * actually used get loaded (and only once). */
+#define _MAX_SHAPES 64
+typedef struct { bool valid; int w, h, hx, hy; uint32_t px[64 * 64]; }
+    _shape_cache_t;
+static _shape_cache_t _shape_cache[_MAX_SHAPES];
+
+/* the ACTIVE cursor image slot + hardware plane update. The source is
+ * a 64-stride cell (same layout as cursor_img itself). */
+static void _cursor_set_client_img(const uint32_t *cell, int w, int h,
+                                    int hx, int hy) {
+    _wl_state_t *st = _wls;
+    if (!st) return;
+    memcpy(st->cursor_img, cell, sizeof(st->cursor_img));
+    if (w > 64) w = 64;
+    if (h > 64) h = 64;
+    st->cur_img_w = w;
+    st->cur_img_h = h;
+    st->cur_img_hx = hx;
+    st->cur_img_hy = hy;
+    _cursor_apply_hw(st);
+    st->dirty = true;
+}
+
+void _cursor_client_shape(uint32_t shape) {
+    _wl_state_t *st = _wls;
+    if (!st) return;
+    if (shape == 0 || shape >= sizeof(_shape_names) / sizeof(_shape_names[0]))
+        shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT;
+    /* remember: a client-named shape is active (clears any surface) */
+    st->client_shape = shape;
+    st->cur_client_set = true;
+    st->cursor_surf = NULL;
+    if (st->cur_shape != 0)
+        return;   /* compositor resize shape wins while it is active */
+    _shape_cache_t *c = &_shape_cache[shape % _MAX_SHAPES];
+    if (!c->valid) {
+        c->valid = true;
+        c->w = c->h = 0;
+        bool loaded = false;
+#if defined(VT_HAVE_XCURSOR)
+        const char *theme = getenv("XCURSOR_THEME");
+        const char *szs = getenv("XCURSOR_SIZE");
+        int size = szs && *szs ? atoi(szs) : 24;
+        if (size <= 0 || size > 64) size = 24;
+        for (int a = 0; a < 3 && !loaded; a++) {
+            const char *name = _shape_names[shape][a];
+            if (!name) break;
+            XcursorImages *imgs = XcursorLibraryLoadImages(
+                name, theme && *theme ? theme : "default", size);
+            if (!imgs && theme && *theme)
+                imgs = XcursorLibraryLoadImages(name, "default", size);
+            if (imgs && imgs->nimage > 0) {
+                XcursorImage *im = imgs->images[0];
+                if (im && im->width <= 64 && im->height <= 64 &&
+                    im->pixels) {
+                    memset(c->px, 0, sizeof(c->px));
+                    for (uint32_t y = 0; y < im->height; y++)
+                        for (uint32_t x = 0; x < im->width; x++)
+                            c->px[y * 64 + x] =
+                                ((const uint32_t *)im->pixels)[y * im->width + x];
+                    c->w = (int)im->width;
+                    c->h = (int)im->height;
+                    c->hx = (int)im->xhot;
+                    c->hy = (int)im->yhot;
+                    loaded = true;
+                }
+                XcursorImagesDestroy(imgs);
+            }
+        }
+#endif
+        if (!loaded) {
+            /* no theme art: fall back to the built-in arrow set (and
+             * the built-in resize arrows for resize shapes) */
+            int fallback = 0;
+            if (shape >= WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_EW_RESIZE &&
+                shape <= WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NWSE_RESIZE)
+                fallback = (shape == WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_EW_RESIZE)
+                               ? 1
+                               : (shape == WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NS_RESIZE)
+                                     ? 2
+                                     : (shape == WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NESW_RESIZE)
+                                           ? 4 : 3;
+            memcpy(c->px, _wls->cur_shape_img[fallback], sizeof(c->px));
+            c->w = _wls->cur_shape_w[fallback];
+            c->h = _wls->cur_shape_h[fallback];
+            c->hx = _wls->cur_shape_hx[fallback];
+            c->hy = _wls->cur_shape_hy[fallback];
+        }
+    }
+    _cursor_set_client_img(c->px, c->w, c->h, c->hx, c->hy);
+}
+
+/* the pointer left the client (or the client cleared its cursor):
+ * restore the COMPOSITOR cursor. The old code never released the
+ * client cursor on leave — the last app's cursor surface lingered
+ * over the panel and every other window ("the cursor gets bigger and
+ * the aura comes back over the bar": the lingering image was some
+ * app's oversized fallback icon). */
+void _cursor_client_release(void) {
+    _wl_state_t *st = _wls;
+    if (!st) return;
+    st->cur_client_set = false;
+    st->cursor_surf = NULL;
+    st->client_shape = 0;
+    /* restore the compositor image for the active shape (arrow or
+     * resize affordance) */
+    memcpy(st->cursor_img, st->cur_shape_img[st->cur_shape],
+           sizeof(st->cursor_img));
+    st->cur_img_w = st->cur_shape_w[st->cur_shape];
+    st->cur_img_h = st->cur_shape_h[st->cur_shape];
+    st->cur_img_hx = st->cur_shape_hx[st->cur_shape];
+    st->cur_img_hy = st->cur_shape_hy[st->cur_shape];
+    _cursor_apply_hw(st);
+    st->dirty = true;
 }
 
 /* ----------------------------------------------------- input: libinput */
@@ -2663,13 +3120,12 @@ static _wl_surf_t *_surface_at(_wl_state_t *st, int x, int y) {
     wl_list_for_each_reverse(s, &st->surfaces, link) {
         if (!s->mapped || s->is_cursor || s->minimized) continue;
         if (s->toplevel && s->ws != st->ws_cur) continue;
-        int sx = s->x, sy = s->y;
-        if (s->popup && s->popup->parent) {
-            sx = s->popup->parent->x + s->popup->rel_x;
-            sy = s->popup->parent->y + s->popup->rel_y;
-        }
-        if (x >= sx && x < sx + s->w &&
-            y >= sy && y < sy + s->h) {
+        /* Input containment is region-aware (set_input_region) and
+         * geometry-aware (set_window_geometry): clicks never land in
+         * the transparent shadow band around CSD windows — that band
+         * was the reported "black region that behaves like a solid
+         * part of the window". */
+        if (_surf_input_contains(s, x, y)) {
             found = s;
             break;
         }
@@ -2702,6 +3158,13 @@ void _pointer_focus_update(_wl_state_t *st, bool force) {
                     wl_pointer_send_frame(pr->res);
             }
         }
+        /* release the client cursor: the wl_pointer contract is that
+         * the client re-sends set_cursor on the next enter. Keeping
+         * the old client's cursor made the LAST app's pointer image
+         * linger over every other surface — over the panel that read
+         * as "the cursor gets bigger and the aura comes back". */
+        if (st->cur_client_set)
+            _cursor_client_release();
     }
     st->ptr_focus = s;
     if (s && s->res) {
@@ -2775,9 +3238,39 @@ static void _click_to_focus(_wl_state_t *st, _wl_surf_t *s) {
         }
     }
     if (s->toplevel)
-        _emit_win(st, VT_BACKEND_WL_EVENT_WIN_FOCUS, s->toplevel);
+        _activate_toplevel(st, s->toplevel);
     _broadcast_selection(st);
     _ps_broadcast(st);
+}
+
+/* xdg-activation equivalent of a focus click (exported for
+ * vt-wl-protocols.c): apps "activate" their own window when a token
+ * they hold is redeemed — taskbar-like focus from the client side */
+void _focus_surface(_wl_surf_t *s) {
+    _wl_state_t *st = _wls;
+    if (!st || !s || !s->res) return;
+    _click_to_focus(st, s);
+}
+
+/* EXCLUSIVE activation bookkeeping: mark `t` as THE focused window,
+ * clear every other toplevel, emit WIN_FOCUS for each change. Native
+ * Wayland windows previously NEVER got t->activated set (the taskbar
+ * never showed them as active) while XWayland windows never got it
+ * cleared (ALL of them showed active) — the focus state was wrong on
+ * both sides of the session. */
+static void _activate_toplevel(_wl_state_t *st, _xdg_toplevel_t *t) {
+    if (!st || !t) return;
+    _wl_surf_t *s;
+    wl_list_for_each(s, &st->surfaces, link) {
+        if (s->toplevel && s->toplevel != t && s->toplevel->activated) {
+            s->toplevel->activated = false;
+            _emit_win(st, VT_BACKEND_WL_EVENT_WIN_FOCUS, s->toplevel);
+        }
+    }
+    if (!t->activated) {
+        t->activated = true;
+        _emit_win(st, VT_BACKEND_WL_EVENT_WIN_FOCUS, t);
+    }
 }
 
 /* Edge bits under the cursor for an SSD-framed toplevel:
@@ -2958,6 +3451,20 @@ static void _pointer_motion(_wl_state_t *st, double dx, double dy) {
     st->dirty = true;
 }
 
+/* content size of a surface (set_window_geometry aware) — interactive
+ * resize must track the WINDOW size, not the buffer: CSD margins
+ * added ~28px to every Super+drag start and the client then re-added
+ * its margins on top of the configured size (slow window growth per
+ * drag). */
+static inline int _surf_cw(const _wl_surf_t *s) {
+    return (s->have_win_geo && s->win_gw > 0 && s->win_gw <= s->w)
+               ? s->win_gw : s->w;
+}
+static inline int _surf_ch(const _wl_surf_t *s) {
+    return (s->have_win_geo && s->win_gh > 0 && s->win_gh <= s->h)
+               ? s->win_gh : s->h;
+}
+
 static void _pointer_button(_wl_state_t *st, uint32_t button,
                             bool pressed) {
     if (!pressed && (button == 0x110 || button == 0x111 || button == 0x112)) {
@@ -2985,7 +3492,12 @@ static void _pointer_button(_wl_state_t *st, uint32_t button,
         st->op_active = false;
         _cursor_set_shape(st, _edge_shape(_ssd_edge_at(st, st->ptr_focus)));
     }
-    if (st->op_active && pressed) return;
+    if (st->op_active && pressed) {
+        /* a second press while an interactive op runs is consumed by it */
+        st->press_consumed = true;
+        st->press_surf = NULL;
+        return;
+    }
     /* a grabbed popup is dismissed when the press is NOT inside it or
      * its parent chain (menus close when you click elsewhere) */
     if (pressed) {
@@ -3001,7 +3513,9 @@ static void _pointer_button(_wl_state_t *st, uint32_t button,
                 }
                 if (!inside) {
                     _popup_done(st, top);
-                    return;   /* the dismiss click is consumed */
+                    st->press_consumed = true;   /* dismiss click consumed */
+                    st->press_surf = NULL;
+                    return;
                 }
                 break;
             }
@@ -3022,14 +3536,29 @@ static void _pointer_button(_wl_state_t *st, uint32_t button,
                 st->op_grab_y = st->cursor_y - s->y;
                 st->op_start_x = s->x;
                 st->op_start_y = s->y;
+                st->press_consumed = true;
+                st->press_surf = NULL;
                 return;
-            } else if (button == 0x112) {
-                /* edge picked from which half of the window the pointer
-                 * is in — Super+right-drag in the left half resizes the
-                 * LEFT edge, not always the bottom-right corner */
+            } else if (button == 0x111) {
+                /* edge picked from which half of the WINDOW the
+                 * pointer is in — Super+right-drag in the left half
+                 * resizes the LEFT edge, not always the bottom-right
+                 * corner. The halves are computed on the CONTENT rect:
+                 * CSD shadow margins are asymmetric (e.g. 12 top /
+                 * 17 bottom), so the BUFFER's center is not the
+                 * window's visual center — a center-of-window grab
+                 * picked the NORTH edge and the drag INVERTED the
+                 * height (300 -> 190 for a +110 pull).
+                 * 0x111 is BTN_RIGHT (linux/input-event-codes.h); the
+                 * old 0x112 test was BTN_MIDDLE — Super+right-drag did
+                 * NOTHING on real hardware (libinput sends 0x111) and
+                 * only worked in harnesses whose own test-input mapping
+                 * shared the same inverted code. */
+                int ccx, ccy, ccw, cch;
+                _win_content_rect(s, &ccx, &ccy, &ccw, &cch);
                 uint8_t e = 0;
-                if (st->cursor_x < s->x + s->w / 2) e |= 4; else e |= 1;
-                if (st->cursor_y < s->y + s->h / 2) e |= 8; else e |= 2;
+                if (st->cursor_x < ccx + ccw / 2) e |= 4; else e |= 1;
+                if (st->cursor_y < ccy + cch / 2) e |= 8; else e |= 2;
                 st->op_active = true;
                 st->op_resize = true;
                 st->op_edges = e;
@@ -3038,9 +3567,11 @@ static void _pointer_button(_wl_state_t *st, uint32_t button,
                 st->op_grab_y = st->cursor_y;
                 st->op_start_x = s->x;
                 st->op_start_y = s->y;
-                st->op_start_w = s->w;
-                st->op_start_h = s->h;
+                st->op_start_w = _surf_cw(s);
+                st->op_start_h = _surf_ch(s);
                 st->op_last_geo_us = 0;
+                st->press_consumed = true;
+                st->press_surf = NULL;
                 return;
             }
         }
@@ -3070,6 +3601,8 @@ static void _pointer_button(_wl_state_t *st, uint32_t button,
                         } else if (s->toplevel->res) {
                             xdg_toplevel_send_close(s->toplevel->res);
                         }
+                        st->press_consumed = true;
+                        st->press_surf = NULL;
                         return;
                     } else if (lx >= bx - (_WL_SSD_BTN + 2)) {
                         /* maximize toggle: the FRAME fills the WORKAREA
@@ -3082,6 +3615,8 @@ static void _pointer_button(_wl_state_t *st, uint32_t button,
                             _wl_maximize_apply(s->toplevel,
                                                !s->toplevel->maximized);
                         }
+                        st->press_consumed = true;
+                        st->press_surf = NULL;
                         return;
                     } else if (lx >= bx - 2 * (_WL_SSD_BTN + 2)) {
                         /* minimize via our own SSD button */
@@ -3091,12 +3626,16 @@ static void _pointer_button(_wl_state_t *st, uint32_t button,
                             /* X-side unmap (the WM-side flag alone left
                              * the X window mapped and visible) */
                             _xwl_minimize(s, true);
+                            st->press_consumed = true;
+                            st->press_surf = NULL;
                             return;
                         }
                         if (st->kbd_focus == s) st->kbd_focus = NULL;
                         st->dirty = true;
                         _emit_win(st, VT_BACKEND_WL_EVENT_WIN_STATE,
                                   s->toplevel);
+                        st->press_consumed = true;
+                        st->press_surf = NULL;
                         return;
                     }
                 }
@@ -3115,14 +3654,16 @@ static void _pointer_button(_wl_state_t *st, uint32_t button,
                     st->op_grab_y = st->cursor_y;
                     st->op_start_x = s->x;
                     st->op_start_y = s->y;
-                    st->op_start_w = s->w;
-                    st->op_start_h = s->h;
+                    st->op_start_w = _surf_cw(s);
+                    st->op_start_h = _surf_ch(s);
                     st->op_last_geo_us = 0;
                     if (s->toplevel && s->toplevel->res && !s->xwl) {
                         s->toplevel->resizing = true;
                         _toplevel_configure(s->toplevel, s->w, s->h,
                                             XDG_TOPLEVEL_STATE_RESIZING);
                     }
+                    st->press_consumed = true;
+                    st->press_surf = NULL;
                     return;
                 }
                 /* titlebar drag → move */
@@ -3135,22 +3676,64 @@ static void _pointer_button(_wl_state_t *st, uint32_t button,
                     st->op_grab_y = st->cursor_y - s->y;
                     st->op_start_x = s->x;
                     st->op_start_y = s->y;
+                    st->press_consumed = true;
+                    st->press_surf = NULL;
                     return;
                 }
             }
         }
+        /* FORWARD to the client — under IMPLICIT-GRAB rules:
+         * a PRESS marks the surface that owns the following release;
+         * a RELEASE goes ONLY to that surface's client (never to
+         * whatever is under the cursor at release time — that stray
+         * release was a real client-visible protocol bug), and a
+         * compositor-consumed press consumes its release too. */
+        if (!pressed) {
+            bool consumed = st->press_consumed;
+            _wl_surf_t *target = st->press_surf;
+            st->press_consumed = false;
+            st->press_surf = NULL;
+            if (consumed)
+                return;               /* release pairs with a consumed press */
+            if (!target || !target->res)
+                return;               /* no forwarded press ever happened */
+            _ptr_res_t *pr;
+            wl_list_for_each(pr, &st->ptr_reses, link) {
+                if (wl_resource_get_client(pr->res) ==
+                    wl_resource_get_client(target->res)) {
+                    wl_pointer_send_button(pr->res, ++st->serial, 0, button,
+                                           WL_POINTER_BUTTON_STATE_RELEASED);
+                    if (wl_resource_get_version(pr->res) >=
+                        WL_POINTER_FRAME_SINCE_VERSION)
+                        wl_pointer_send_frame(pr->res);
+                }
+            }
+            return;
+        }
+        st->press_surf = s;
+        st->press_consumed = false;
         _ptr_res_t *pr;
         wl_list_for_each(pr, &st->ptr_reses, link) {
             if (wl_resource_get_client(pr->res) ==
                 wl_resource_get_client(s->res)) {
                 wl_pointer_send_button(pr->res, ++st->serial, 0, button,
-                                       pressed ? WL_POINTER_BUTTON_STATE_PRESSED
-                                               : WL_POINTER_BUTTON_STATE_RELEASED);
+                                       WL_POINTER_BUTTON_STATE_PRESSED);
                 if (wl_resource_get_version(pr->res) >=
                     WL_POINTER_FRAME_SINCE_VERSION)
                     wl_pointer_send_frame(pr->res);
             }
         }
+        return;
+    }
+    /* no surface under the pointer: the press is consumed by the
+     * compositor (background/desktop click) so its release cannot
+     * become a stray release for an unrelated client later */
+    if (pressed) {
+        st->press_consumed = true;
+        st->press_surf = NULL;
+    } else {
+        st->press_consumed = false;
+        st->press_surf = NULL;
     }
 }
 
@@ -3355,15 +3938,21 @@ static void _li_process(_wl_state_t *st) {
             break;
         }
         case LIBINPUT_EVENT_POINTER_AXIS: {
+#if defined(LIBINPUT_EVENT_POINTER_SCROLL_WHEEL)
+            /* libinput >= 1.19 sends BOTH this legacy event and the new
+             * SCROLL_* events for the same physical scroll — processing
+             * both doubled every scroll (the "wonky/inconsistent
+             * scrolling": apps scrolled twice per detent on machines
+             * with newer libinput, once on older ones). When the new
+             * event types exist we consume ONLY those (the documented
+             * "do not mix and match" rule). */
+            break;
+#else
             struct libinput_event_pointer *pe =
                 libinput_event_get_pointer_event(ev);
             enum libinput_pointer_axis_source src =
                 libinput_event_pointer_get_axis_source(pe);
             bool wheel = (src == LIBINPUT_POINTER_AXIS_SOURCE_WHEEL);
-            /* BOTH sources reach the client: wheels send the value120
-             * batch, touchpad fingers send continuous axis+frame —
-             * filtering to wheels only (the old code) meant touchpad
-             * scrolling never reached any application. */
             double v = libinput_event_pointer_get_axis_value(
                 pe, LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL);
             if (v != 0.0)
@@ -3373,7 +3962,29 @@ static void _li_process(_wl_state_t *st) {
             if (hv != 0.0)
                 _pointer_axis(st, hv, wheel, true);
             break;
+#endif
         }
+#if defined(LIBINPUT_EVENT_POINTER_SCROLL_WHEEL)
+        case LIBINPUT_EVENT_POINTER_SCROLL_WHEEL:
+        case LIBINPUT_EVENT_POINTER_SCROLL_FINGER:
+        case LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS: {
+            struct libinput_event_pointer *pe =
+                libinput_event_get_pointer_event(ev);
+            bool wheel =
+                (t == LIBINPUT_EVENT_POINTER_SCROLL_WHEEL);
+            bool finger =
+                (t == LIBINPUT_EVENT_POINTER_SCROLL_FINGER);
+            double v = libinput_event_pointer_get_axis_value(
+                pe, LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL);
+            if (v != 0.0)
+                _pointer_axis(st, v, wheel || !finger, false);
+            double hv = libinput_event_pointer_get_axis_value(
+                pe, LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL);
+            if (hv != 0.0)
+                _pointer_axis(st, hv, wheel || !finger, true);
+            break;
+        }
+#endif
         case LIBINPUT_EVENT_KEYBOARD_KEY: {
             struct libinput_event_keyboard *ke =
                 libinput_event_get_keyboard_event(ev);
@@ -3563,10 +4174,16 @@ static int _drm_fd_cb(int fd, uint32_t mask, void *data) {
 /* draw the compositor-side SSD frame (title bar + border + buttons) */
 void _ssd_frame_geom(const _wl_surf_t *s, int *fx, int *fy,
                             int *fw, int *fh) {
-    *fx = s->x - _WL_SSD_BORDER;
-    *fy = s->y - (_WL_SSD_TITLE + _WL_SSD_BORDER);
-    *fw = s->w + 2 * _WL_SSD_BORDER;
-    *fh = s->h + _WL_SSD_TITLE + 2 * _WL_SSD_BORDER;
+    /* frame wraps the WINDOW (content) rect: a client that keeps CSD
+     * margins in its buffer (GTK in SSD mode still ships shadow
+     * margins) would otherwise get a frame around its SHADOW, pushing
+     * the title band off the visible window. */
+    int cx, cy, cw, ch;
+    _win_content_rect(s, &cx, &cy, &cw, &ch);
+    *fx = cx - _WL_SSD_BORDER;
+    *fy = cy - (_WL_SSD_TITLE + _WL_SSD_BORDER);
+    *fw = cw + 2 * _WL_SSD_BORDER;
+    *fh = ch + _WL_SSD_TITLE + 2 * _WL_SSD_BORDER;
 }
 
 /* ---- SSD title text (FreeType, fontconfig "sans", 13px) --------
@@ -4020,6 +4637,57 @@ static void _blend_sprite(_wl_state_t *st, const uint32_t *sprite,
     }
 }
 
+/* blit client pixels into the framebuffer. `blend` = premultiplied
+ * source-over (CSD windows and popups: the buffer contains real alpha
+ * — soft shadows, rounded corners); `clip` = only the window/content
+ * rect (SSD windows: the compositor frame owns everything outside the
+ * content, so the client's leftover CSD margins never bleed under the
+ * title band). The raw copy that preceded this wrote semi-transparent
+ * shadow pixels OPAQUELY into the XRGB framebuffer — every CSD app
+ * got solid black bands around it (GTK4: 14-15px; the reported
+ * "mirage black region"). */
+static void _blit_client(_wl_state_t *st, const _wl_surf_t *s,
+                         int x, int y, bool blend, bool clip) {
+    int cw = s->buf_w < s->w ? s->buf_w : s->w;
+    int ch = s->buf_h < s->h ? s->buf_h : s->h;
+    int x0 = 0, y0 = 0;
+    if (clip && s->have_win_geo) {
+        x0 = s->win_gx < 0 ? 0 : s->win_gx;
+        y0 = s->win_gy < 0 ? 0 : s->win_gy;
+        int gx1 = x0 + (s->win_gw > 0 ? s->win_gw : 0);
+        int gy1 = y0 + (s->win_gh > 0 ? s->win_gh : 0);
+        if (gx1 < cw) cw = gx1;
+        if (gy1 < ch) ch = gy1;
+    }
+    for (int sy = y0; sy < ch; sy++) {
+        int dy = y + sy;
+        if (dy < 0 || dy >= st->out_h) continue;
+        for (int sx = x0; sx < cw; sx++) {
+            int dx = x + sx;
+            if (dx < 0 || dx >= st->out_w) continue;
+            uint32_t sp = s->pixels[sy * s->stride + sx];
+            if (!blend) {
+                st->fb[dy * st->out_w + dx] = sp;
+                continue;
+            }
+            uint32_t a = sp >> 24;
+            if (a == 0) continue;
+            if (a == 0xff) {
+                st->fb[dy * st->out_w + dx] = 0xff000000 | sp;
+                continue;
+            }
+            uint32_t dp = st->fb[dy * st->out_w + dx];
+            uint32_t ia = 255 - a;
+            uint32_t rb = (sp & 0x00ff00ff) +
+                          ((dp & 0x00ff00ff) * ia) / 255;
+            uint32_t g = (sp & 0x0000ff00) +
+                         ((dp & 0x0000ff00) * ia) / 255;
+            st->fb[dy * st->out_w + dx] =
+                0xff000000 | (rb & 0x00ff00ff) | (g & 0x0000ff00);
+        }
+    }
+}
+
 static void _paint(void) {
     _wl_state_t *st = _wls;
     if (!st || !st->dirty) return;
@@ -4040,21 +4708,8 @@ static void _paint(void) {
             _wl_surf_t *sub;
             wl_list_for_each(sub, &s->subs, sub_link) {
                 if (!sub->mapped || !sub->pixels || sub->minimized) continue;
-                int cx2 = s->x + sub->dx, cy2 = s->y + sub->dy;
-                /* buffer-bounded blit: sub->w/h may race a pending
-                 * resize — never read past the committed buffer */
-                int cw = sub->buf_w < sub->w ? sub->buf_w : sub->w;
-                int ch = sub->buf_h < sub->h ? sub->buf_h : sub->h;
-                for (int sy = 0; sy < ch; sy++) {
-                    int dy = cy2 + sy;
-                    if (dy < 0 || dy >= st->out_h) continue;
-                    for (int sx = 0; sx < cw; sx++) {
-                        int dx = cx2 + sx;
-                        if (dx < 0 || dx >= st->out_w) continue;
-                        st->fb[dy * st->out_w + dx] =
-                            sub->pixels[sy * sub->stride + sx];
-                    }
-                }
+                _blit_client(st, sub, s->x + sub->dx, s->y + sub->dy,
+                             true, false);
             }
         }
         int x = s->x, y = s->y;
@@ -4069,42 +4724,17 @@ static void _paint(void) {
             _wl_surf_t *sub;
             wl_list_for_each(sub, &s->subs, sub_link) {
                 if (!sub->mapped || !sub->pixels) continue;
-                int cx2 = x + sub->dx, cy2 = y + sub->dy;
-                /* buffer-bounded blit (same pending-resize clamp) */
-                int cw = sub->buf_w < sub->w ? sub->buf_w : sub->w;
-                int ch = sub->buf_h < sub->h ? sub->buf_h : sub->h;
-                for (int sy = 0; sy < ch; sy++) {
-                    int dy = cy2 + sy;
-                    if (dy < 0 || dy >= st->out_h) continue;
-                    for (int sx = 0; sx < cw; sx++) {
-                        int dx = cx2 + sx;
-                        if (dx < 0 || dx >= st->out_w) continue;
-                        st->fb[dy * st->out_w + dx] =
-                            sub->pixels[sy * sub->stride + sx];
-                    }
-                }
+                _blit_client(st, sub, x + sub->dx, y + sub->dy,
+                             true, false);
             }
         }
-        /* Client content: blit min(buffer, configured). During a
-         * pending resize s->w/h are already the NEW size while pixels
-         * is the OLD buffer (the client has not committed the acked
-         * geometry yet) — bounds from w/h read past the buffer; bounds
-         * from buf alone could paint outside the frame on a pending
-         * shrink. min() is safe in both directions. */
-        {
-            int cw = s->buf_w < s->w ? s->buf_w : s->w;
-            int ch = s->buf_h < s->h ? s->buf_h : s->h;
-            for (int sy = 0; sy < ch; sy++) {
-                int dy = y + sy;
-                if (dy < 0 || dy >= st->out_h) continue;
-                for (int sx = 0; sx < cw; sx++) {
-                    int dx = x + sx;
-                    if (dx < 0 || dx >= st->out_w) continue;
-                    st->fb[dy * st->out_w + dx] =
-                        s->pixels[sy * s->stride + sx];
-                }
-            }
-        }
+        /* Client content. SSD windows: clipped to the content rect
+         * (opaque copy — the frame surrounds it). Everything else
+         * (CSD toplevels, popups): full buffer, alpha-BLENDED — CSD
+         * shadow margins are real alpha and must composite over the
+         * background instead of being stamped in as solid black. */
+        _blit_client(st, s, x, y,
+                     !(s->ssd && s->toplevel), s->ssd && s->toplevel);
     }
     /* fire frame callbacks for EVERY surface (also hidden ones):
      * clients that commit while on another workspace / minimized must
@@ -4256,8 +4886,25 @@ static int _wl_minimize_window(vt_backend_t *self, uint64_t id, bool on) {
                 return 0;
             }
             /* xdg: mirror the set_minimized protocol path (hidden from
-             * compositing, restorable from the taskbar) */
-            if (!on) return 0;
+             * compositing, restorable from the taskbar). RESTORE was a
+             * silent no-op before — a minimized native Wayland window
+             * could never be brought back (taskbar click did nothing,
+             * the window stayed invisible forever). xdg-shell has no
+             * un-minimize event: showing it again is compositor
+             * policy, so clear the flags, repaint, tell the WM, and
+             * hand the window the keyboard back. */
+            if (!on) {
+                if (!s->minimized && !s->toplevel->minimized)
+                    return 0;          /* nothing to restore */
+                s->minimized = false;
+                s->toplevel->minimized = false;
+                if (st->kbd_focus == NULL)
+                    _kbd_enter_focus(st, s);
+                st->dirty = true;
+                _emit_win(st, VT_BACKEND_WL_EVENT_WIN_STATE, s->toplevel);
+                _activate_toplevel(st, s->toplevel);
+                return 0;
+            }
             s->toplevel->minimized = true;
             s->minimized = true;
             if (st->kbd_focus == s) st->kbd_focus = NULL;
@@ -4671,6 +5318,9 @@ static int _wl_init(vt_backend_t *self) {
     if (!st->layer_shell_g)
         vt_logw("wayland: layer-shell global creation failed — docked "
                 "panels cannot attach");
+    /* staging protocols: cursor-shape, xdg-activation,
+     * fractional-scale, toplevel-icon */
+    _proto_globals_create(st);
     /* Xwayland: X11 apps become first-class windows of this session */
     st->xwl_enabled = _xwl_start(st);
 
@@ -4715,6 +5365,7 @@ static void _wl_fini(vt_backend_t *self) {
     vt_logi("wayland: shutting down the compositor");
     _xwl_stop(st);
     _layer_shell_global_destroy(st);
+    _proto_globals_destroy(st);
     _title_cache_free_all();
 #if defined(VT_HAVE_FREETYPE)
     _ssd_title_font_fini();
@@ -4826,12 +5477,12 @@ static int _wl_test_input(vt_backend_t *self, const char *spec) {
         return -1;
     }
     if (sscanf(spec, "press b=%d", &b) == 1 && b >= 1 && b <= 3) {
-        _pointer_button(st, b == 2 ? 0x111 : b == 3 ? 0x112 : 0x110,
+        _pointer_button(st, b == 2 ? 0x112 : b == 3 ? 0x111 : 0x110,
                         true);
         return 0;
     }
     if (sscanf(spec, "release b=%d", &b) == 1 && b >= 1 && b <= 3) {
-        _pointer_button(st, b == 2 ? 0x111 : b == 3 ? 0x112 : 0x110,
+        _pointer_button(st, b == 2 ? 0x112 : b == 3 ? 0x111 : 0x110,
                         false);
         return 0;
     }

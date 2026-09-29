@@ -27,7 +27,9 @@ static void _free_win(gpointer p) {
     g_free(w);
 }
 
-static gboolean _parse_query(vp_wm_t *wm, const char *payload) {
+/* parse a WM_QUERY payload into a FRESH window array (does not touch
+ * wm->wins — the caller swaps after comparing) */
+static GPtrArray *_parse_query_new(const char *payload) {
     GPtrArray *nw = g_ptr_array_new_with_free_func(_free_win);
     const char *line = payload;
     while (line && *line) {
@@ -73,8 +75,33 @@ static gboolean _parse_query(vp_wm_t *wm, const char *payload) {
         g_strfreev(f);
         line = eol ? eol + 1 : NULL;
     }
-    g_ptr_array_free(wm->wins, TRUE);
-    wm->wins = nw;
+    return nw;
+}
+
+/* Did the window model ACTUALLY change? The 400 ms poll used to
+ * report "changed" whenever WM_QUERY succeeded — even when every
+ * field was identical. The panel then rebuilt the whole taskbar every
+ * cycle: hovered taskbar buttons lost their hover state 2.5x/second
+ * (the reported active/inactive FLICKER), and the rebuild DESTROYED
+ * the button a popover menu was parented to, closing the dropdown
+ * before a menu item could be clicked. Only a REAL difference may
+ * count as a change. */
+static gboolean _wins_equal(const vp_wm_t *a, const vp_wm_t *b) {
+    if (a->wins->len != b->wins->len) return FALSE;
+    for (guint i = 0; i < a->wins->len; i++) {
+        const vp_win_t *x = g_ptr_array_index(a->wins, i);
+        const vp_win_t *y = g_ptr_array_index(b->wins, i);
+        if (x->id != y->id || x->ws != y->ws ||
+            x->focused != y->focused || x->minimized != y->minimized ||
+            x->maximized != y->maximized || x->fullscreen != y->fullscreen ||
+            x->dock != y->dock || x->desktop != y->desktop ||
+            x->x != y->x || x->y != y->y || x->w != y->w || x->h != y->h)
+            return FALSE;
+        if (g_strcmp0(x->title, y->title) != 0 ||
+            g_strcmp0(x->cls, y->cls) != 0 ||
+            g_strcmp0(x->app_id, y->app_id) != 0)
+            return FALSE;
+    }
     return TRUE;
 }
 
@@ -193,9 +220,18 @@ gboolean vp_wm_refresh(vp_wm_t *wm) {
     _drain_events(wm);
     char *q = vp_ipc_call(wm->ipc, VP_IPC_WM_QUERY, "", 1500);
     if (q) {
-        _parse_query(wm, q);
+        /* parse into a fresh array, COMPARE with the current model,
+         * then swap — a successful query alone is NOT a change (see
+         * _wins_equal: the no-op rebuild was the taskbar flicker and
+         * the self-closing dropdown menu) */
+        GPtrArray *nw = _parse_query_new(q);
         free(q);
-        changed = TRUE;
+        if (nw) {
+            vp_wm_t old = *wm;      /* shallow copy: wins points at the OLD array */
+            wm->wins = nw;
+            changed = !_wins_equal(&old, wm);
+            g_ptr_array_free(old.wins, TRUE);
+        }
         wm->misses = 0;
     } else if (++wm->misses >= 3) {
         /* three consecutive dead calls: the WM is gone (logout), not
@@ -218,6 +254,11 @@ gboolean vp_wm_refresh(vp_wm_t *wm) {
 
 static gboolean _on_poll(gpointer user) {
     vp_wm_t *wm = user;
+    /* VANTAGE_PANEL_NO_POLL=1: diagnostic switch that freezes the WM
+     * model (isolates panel-side repaints from backend event storms
+     * when debugging taskbar/pager behavior) */
+    if (getenv("VANTAGE_PANEL_NO_POLL"))
+        return G_SOURCE_CONTINUE;
     if (vp_wm_refresh(wm) && wm->on_change)
         wm->on_change(wm->user);
     return G_SOURCE_CONTINUE;

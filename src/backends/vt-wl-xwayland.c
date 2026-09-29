@@ -1009,11 +1009,21 @@ static void _xwl_map(_xwl_win_t *w) {
              * BEFORE any surface exists — without the mirror the WM
              * model sees a 0x0 window at +0+0 ("tiny window in the
              * corner" in the pager); without activated the taskbar
-             * never shows the new window as focused. */
+             * never shows the new window as focused. Every OTHER
+             * window's activated flag is cleared too — focus is
+             * EXCLUSIVE (the old code left them all set: every X11
+             * window in the taskbar showed as active at once). */
             w->toplevel->x = w->x;
             w->toplevel->y = w->y;
             w->toplevel->w = w->w;
             w->toplevel->h = w->h;
+            for (_xwl_win_t *o = X.wins; o; o = o->next) {
+                if (o != w && o->toplevel && o->toplevel->activated) {
+                    o->toplevel->activated = false;
+                    _emit_win(st, VT_BACKEND_WL_EVENT_WIN_FOCUS,
+                              o->toplevel);
+                }
+            }
             w->toplevel->activated = true;
             _emit_win(st, VT_BACKEND_WL_EVENT_WIN_MAP, w->toplevel);
             vt_logi("xwayland: window 0x%x '%s' mapped %dx%d at +%d+%d",
@@ -1306,7 +1316,24 @@ void _xwl_focus_changed(_wl_state_t *st, _wl_surf_t *s) {
     if (w) {
         if (!w->mapped) return;
         _xwl_focus(w);
-        if (w->toplevel) w->toplevel->activated = true;
+        if (w->toplevel) {
+            /* EXCLUSIVE activation: clear every other window's flag
+             * (both X-side records and any native Wayland toplevels —
+             * the core clears its own, we clear ours) and emit the
+             * focus changes so the WM model updates everyone */
+            for (_xwl_win_t *o = X.wins; o; o = o->next) {
+                if (o != w && o->toplevel && o->toplevel->activated) {
+                    o->toplevel->activated = false;
+                    _emit_win(X.st, VT_BACKEND_WL_EVENT_WIN_FOCUS,
+                              o->toplevel);
+                }
+            }
+            if (!w->toplevel->activated) {
+                w->toplevel->activated = true;
+                _emit_win(X.st, VT_BACKEND_WL_EVENT_WIN_FOCUS,
+                          w->toplevel);
+            }
+        }
     }
 }
 

@@ -249,6 +249,31 @@ data = (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr) +
 open(sys.argv[1], 'wb').write(data)
 PYICON3
 cp "$HICOLOR_DIR/image-missing.png" "$ICON_DIR/"
+# taskbar icon for the REAL GTK4 probe window: its app_id is
+# org.vantage.gtkprobe — a solid TEAL icon (used nowhere else on the
+# screen) makes the taskbar button LOCATABLE by pixel scan, which the
+# taskbar-dropdown checks below need (right-click → context menu).
+python3 - "$HICOLOR_DIR/org.vantage.gtkprobe.png" <<'PYICON4'
+import struct, zlib, sys
+w = h = 24
+rgb = (0x20, 0x9a, 0x8a)   # teal — unique to the probe's taskbar button
+raw = b''.join(b'\x00' + bytes(rgb) * w for _ in range(h))
+def chunk(t, d):
+    c = t + d
+    return struct.pack('>I', len(d)) + c + struct.pack(
+        '>I', zlib.crc32(c) & 0xffffffff)
+ihdr = struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)
+data = (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr) +
+        chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+open(sys.argv[1], 'wb').write(data)
+PYICON4
+cp "$HICOLOR_DIR/org.vantage.gtkprobe.png" "$ICON_DIR/"
+# same art under the BINARY name: GDK sends set_app_id from the
+# program name on some GTK builds (observed: app_id "vt-gtk4-probe"
+# despite GtkApplication("org.vantage.gtkprobe")) — ship both names
+# so the button is locatable on every machine
+cp "$HICOLOR_DIR/org.vantage.gtkprobe.png" "$HICOLOR_DIR/vt-gtk4-probe.png"
+cp "$HICOLOR_DIR/org.vantage.gtkprobe.png" "$ICON_DIR/vt-gtk4-probe.png"
 export XDG_DATA_HOME="$WORK/data"
 # XDG_DATA_DIRS must be ISOLATED as well: when unset, vt-apps falls
 # back to /usr/local/share:/usr/share, so host-installed applications
@@ -382,6 +407,21 @@ if grep -qF '[wayland] NOTICE: HEADLESS mode' "$WORK/wm.log"; then
   ok "honest HEADLESS fallback notice present"
 else
   bad "no HEADLESS notice — the fallback would be silent (lied about KMS)"
+fi
+
+# ------------------------------------------------------------- registry
+# The staging protocols must be advertised with their SPEC names (an
+# independent client — no toolkit's own detection bugs involved; foot
+# <= 1.22 matched the WRONG name for the toplevel-icon manager and
+# warned regardless of compositor support, fixed upstream in 1.23).
+if [ -x "$(tc vt-registry-probe)" ]; then
+  if "$(tc vt-registry-probe)" > "$WORK/registry.log" 2>&1; then
+    ok "staging protocols advertised (cursor-shape, activation, fractional-scale, toplevel-icon, viewporter)"
+  else
+    bad "staging protocols missing from the registry: $(tail -1 "$WORK/registry.log")"
+  fi
+else
+  echo "  (vt-registry-probe not built — registry check skipped)"
 fi
 
 # ------------------------------------------------------------- client
@@ -1381,8 +1421,281 @@ if [ -x "$(tc vt-gtk4-probe)" ]; then
   else
     bad "unmaximize wrong: ${GW4:-?}x${GH4:-?}"
   fi
+
+  # --- 2b. CSD shadow composites — the "black region" regression.
+  #     The probe is a REAL GTK4 CSD window (headerbar + client-side
+  #     shadow margins in the buffer, input region/window geometry
+  #     excluding them). Pre-blend-fix the raw blit stamped the
+  #     premultiplied shadow fringe OPAQUELY into the XRGB fb: solid
+  #     near-black bands framed the window (mirage's "black resize
+  #     region"). Now the buffer is alpha-blended: the strip just
+  #     OUTSIDE the content rect must show background (navy gradient,
+  #     shadow-darkened) — not black — and the content itself must be
+  #     the probe's magenta.
+  rm -f /tmp/vantage-wayland.ppm
+  kill -USR1 "$WM_PID" 2>/dev/null
+  wait_ppm || true
+  sleep 0.1
+  python3 - "$GX4" "$GY4" "$GW4" "$GH4" <<'PYEOF6'
+import sys
+gx, gy, gw, gh = (int(v) for v in sys.argv[1:5])
+with open('/tmp/vantage-wayland.ppm','rb') as f:
+    data = f.read()
+vals, pos = [], data.find(b'P6') + 2
+while len(vals) < 3:
+    while data[pos:pos+1].isspace(): pos += 1
+    j = pos
+    while not data[j:j+1].isspace(): j += 1
+    vals.append(int(data[pos:j])); pos = j
+pos += 1
+w, h, _ = vals
+pix = data[pos:pos + w*h*3]
+def px(x, y):
+    i = (y*w + x)*3
+    return (pix[i], pix[i+1], pix[i+2])
+def blackish(c):
+    return c[0] <= 10 and c[1] <= 10 and c[2] <= 10
+# strips just outside the content rect (shadow band), window's
+# vertical middle (never the rounded corners)
+y0, y1 = gy + gh//4, gy + 3*gh//4
+band_r = sum(1 for y in range(y0, y1) for x in range(gx+gw+2, gx+gw+10)
+             if 0 <= x < w and blackish(px(x, y)))
+band_l = sum(1 for y in range(y0, y1) for x in range(gx-9, gx-1)
+             if 0 <= x < w and blackish(px(x, y)))
+mag = 0
+my = gy + gh//2
+for x in range(gx+8, gx+gw-8, 2):
+    c = px(x, my)
+    if abs(c[0]-158) <= 26 and abs(c[1]-46) <= 26 and abs(c[2]-117) <= 26:
+        mag += 1
+print(f"csd: black-px right={band_r} left={band_l} content-magenta={mag}")
+# zero solid-black pixels outside the content rect; the window's own
+# row must be dominated by the probe's magenta fill
+sys.exit(0 if (band_r == 0 and band_l == 0 and mag > 40) else 1)
+PYEOF6
+  [ $? -eq 0 ] && ok "CSD shadow blended (no black bands around the window)" \
+    || bad "CSD window has black bands (raw blit regression)"
+
+  # --- 2c. WINDOW model = the toolkit's window rect, NOT the CSD
+  #     buffer. GTK4 CSD commits a buffer ~28px larger than the
+  #     window (shadow margins + client-side resize grips, which GDK
+  #     legitimately includes in the surface input region — band
+  #     clicks DO reach the client and that is correct). What must
+  #     hold: the WM model reports exactly what the toolkit itself
+  #     allocated ("size WxH" from the probe) — the buffer rect made
+  #     the pager/taskbar over-report every CSD window. A click on
+  #     the bare desktop must reach no client at all.
+  # the probe prints "size WxH" (one token) — split on the x
+  GTK_OWN=$(grep -E "^size " "$GTK_LOG" | tail -1 | \
+            sed -E 's/^size ([0-9]+)x([0-9]+)/\1 \2/')
+  read -r GTK_W GTK_H <<< "$GTK_OWN"
+  if [ -n "$GTK_W" ] && [ "${GW4:-0}" -gt 0 ] && \
+     [ "$((GW4 > GTK_W ? GW4 - GTK_W : GTK_W - GW4))" -le 2 ] && \
+     [ "$((GH4 > GTK_H ? GH4 - GTK_H : GTK_H - GH4))" -le 2 ]; then
+    ok "WM model = toolkit window rect (${GW4}x${GH4} == GTK's ${GTK_W}x${GTK_H}, not the CSD buffer)"
+  else
+    bad "WM model reports the CSD buffer (model ${GW4:-?}x${GH4:-?} vs GTK's ${GTK_W:-?}x${GTK_H:-?})"
+  fi
+  PRESSES_BEFORE=$(grep -c "^button 1 press" "$GTK_LOG")
+  ti "click $((GX4 + GW4 / 2)),$((GY4 + GH4 / 2))"
+  sleep 0.4
+  PRESSES_IN=$(grep -c "^button 1 press" "$GTK_LOG")
+  RELEASES_IN=$(grep -c "^button 1 release" "$GTK_LOG")
+  if [ "${PRESSES_IN:-0}" -gt "${PRESSES_BEFORE:-0}" ] && \
+     [ "${RELEASES_IN:-0}" -ge "${PRESSES_IN:-0}" ]; then
+    ok "click inside content reached the client (press+release paired)"
+  else
+    bad "click inside content never reached the client ($PRESSES_BEFORE -> $PRESSES_IN presses, $RELEASES_IN releases)"
+  fi
+  ti "click 30,700"
+  sleep 0.3
+  PRESSES_DESK=$(grep -c "^button 1 press" "$GTK_LOG")
+  if [ "${PRESSES_DESK:-0}" -eq "${PRESSES_IN:-1}" ]; then
+    ok "click on the bare desktop reached no client"
+  else
+    bad "desktop click leaked to the client ($PRESSES_IN -> $PRESSES_DESK presses)"
+  fi
+
+  # --- 2d. TASKBAR dropdown (right-click context menu): must stay
+  #     open across WM poll cycles (the old full rebuild destroyed
+  #     the parent button 2.5x/s — the menu vanished and hover state
+  #     flickered), and a LEFT click on its Close row must activate
+  #     (the stray-release class could eat the click). Closing the
+  #     window through the menu is also the GHOST-WINDOW check: the
+  #     model and the taskbar must both drop the window.
+  #     The button is located by its TEAL icon (fixture above).
+  BTN_X=""
+  for try in 1 2 3; do
+    rm -f /tmp/vantage-wayland.ppm
+    kill -USR1 "$WM_PID" 2>/dev/null
+    wait_ppm || continue
+    BTN_X=$(python3 - <<'PYEOF7'
+with open('/tmp/vantage-wayland.ppm','rb') as f:
+    data = f.read()
+vals, pos = [], data.find(b'P6') + 2
+while len(vals) < 3:
+    while data[pos:pos+1].isspace(): pos += 1
+    j = pos
+    while not data[j:j+1].isspace(): j += 1
+    vals.append(int(data[pos:j])); pos = j
+pos += 1
+w, h, _ = vals
+pix = data[pos:pos + w*h*3]
+xs = []
+for y in range(4, 44):
+    for x in range(0, w):
+        i = (y*w + x)*3
+        if abs(pix[i]-0x20) <= 26 and abs(pix[i+1]-0x9a) <= 26 \
+           and abs(pix[i+2]-0x8a) <= 26:
+            xs.append(x)
+print(sum(xs)//len(xs) if xs else -1)
+PYEOF7
+)
+    [ "${BTN_X:-0}" -gt 0 ] && break
+    sleep 0.4
+  done
+  if [ "${BTN_X:-0}" -gt 0 ]; then
+    ok "taskbar button found for the GTK4 window (icon by app_id, x=$BTN_X)"
+    ti "motion x=$BTN_X y=22"
+    ti "press b=3"; sleep 0.15; ti "release b=3"
+    # span >=3 WM poll cycles (400 ms) with the menu open
+    sleep 1.5
+    rm -f /tmp/vantage-wayland.ppm
+    kill -USR1 "$WM_PID" 2>/dev/null
+    wait_ppm || true
+    MENU_ROWS=$(python3 - "$BTN_X" <<'PYEOF8'
+import sys
+bx = int(sys.argv[1])
+with open('/tmp/vantage-wayland.ppm','rb') as f:
+    data = f.read()
+vals, pos = [], data.find(b'P6') + 2
+while len(vals) < 3:
+    while data[pos:pos+1].isspace(): pos += 1
+    j = pos
+    while not data[j:j+1].isspace(): j += 1
+    vals.append(int(data[pos:j])); pos = j
+pos += 1
+w, h, _ = vals
+pix = data[pos:pos + w*h*3]
+# light text rows below the bar, near the button's column
+rows = {}
+for y in range(50, 170):
+    light = 0
+    for x in range(max(0, bx-40), min(w, bx+140)):
+        i = (y*w + x)*3
+        if pix[i] >= 0x90 and pix[i+1] >= 0x90 and pix[i+2] >= 0x90:
+            light += 1
+    rows[y] = light
+# cluster consecutive rows with text into bands
+bands, cur = [], None
+for y in sorted(rows):
+    if rows[y] >= 2:
+        if cur and y - cur[1] <= 3:
+            cur[1] = y
+        else:
+            cur = [y, y]
+            bands.append(cur)
+    else:
+        cur = None
+real = [b for b in bands if b[1] - b[0] >= 4]
+if len(real) >= 2:
+    # Close is the second row: print its center
+    print(f"{(real[1][0]+real[1][1])//2}")
+elif len(real) == 1:
+    print(f"{(real[0][0]+real[0][1])//2}")
+else:
+    print("-1")
+PYEOF8
+)
+    if [ "${MENU_ROWS:-0}" -gt 0 ]; then
+      ok "taskbar dropdown stayed open across poll cycles (no rebuild flicker)"
+      # LEFT click on the Close row (second text band); the walk
+      # brackets the scan result with a generous spread (the menu's
+      # row pitch follows the machine's font metrics)
+      CLOSED=""
+      for y in "$MENU_ROWS" "$((MENU_ROWS+6))" "$((MENU_ROWS-6))" \
+               "$((MENU_ROWS+12))" "$((MENU_ROWS-12))" 114 104 94; do
+        [ -z "$y" ] && continue
+        [ "$y" -gt 0 ] || continue
+        [ -n "$CLOSED" ] && break
+        ti "click $((BTN_X + 30)),$y"
+        for i in $(seq 1 15); do
+          [ -z "$(wgeo_t "GtkProbe")" ] && { CLOSED=1; break; }
+          sleep 0.1
+        done
+      done
+      if [ -n "$CLOSED" ]; then
+        ok "dropdown Close item closed the window on left click"
+        # ghost check, part 2: the model stays clean 2s later
+        sleep 2
+        if [ -z "$(wgeo_t "GtkProbe")" ]; then
+          ok "no ghost window in the WM model after close"
+        else
+          bad "ghost window: model still lists GtkProbe after close"
+        fi
+        # ghost check, part 3: the taskbar BUTTON is gone (teal icon
+        # vanished from the bar — dead entries were the user report)
+        sleep 0.5
+        rm -f /tmp/vantage-wayland.ppm
+        kill -USR1 "$WM_PID" 2>/dev/null
+        wait_ppm || true
+        TEAL_LEFT=$(python3 - <<'PYEOF9'
+with open('/tmp/vantage-wayland.ppm','rb') as f:
+    data = f.read()
+vals, pos = [], data.find(b'P6') + 2
+while len(vals) < 3:
+    while data[pos:pos+1].isspace(): pos += 1
+    j = pos
+    while not data[j:j+1].isspace(): j += 1
+    vals.append(int(data[pos:j])); pos = j
+pos += 1
+w, h, _ = vals
+pix = data[pos:pos + w*h*3]
+n = sum(1 for y in range(4, 44) for x in range(0, w)
+        if abs(pix[(y*w+x)*3]-0x20) <= 26
+        and abs(pix[(y*w+x)*3+1]-0x9a) <= 26
+        and abs(pix[(y*w+x)*3+2]-0x8a) <= 26)
+print(n)
+PYEOF9
+)
+        if [ "${TEAL_LEFT:-1}" -eq 0 ]; then
+          ok "taskbar button removed after close (no ghost entry)"
+        else
+          bad "taskbar button survived the window close (ghost entry)"
+        fi
+      else
+        bad "dropdown Close item did not close the window (left-click eaten)"
+      fi
+    else
+      bad "taskbar dropdown did not stay open (rebuild/destroy regression)"
+    fi
+  else
+    bad "taskbar button with teal icon not found (icon lookup by app_id?)"
+  fi
+
+  # --- 2e. button-event accounting: after ALL gestures above (the
+  #     compositor-consumed Super+drag, SSD-style frame clicks,
+  #     forwarded clicks, band clicks, dropdown interaction) the
+  #     client must have seen ZERO stray releases and ZERO double
+  #     presses — the implicit-grab contract (foot's "stray button
+  #     release event (compositor bug?)" class).
+  STRAY=$(grep -c "STRAY-RELEASE" "$GTK_LOG")
+  DBLP=$(grep -c "DOUBLE-PRESS" "$GTK_LOG")
+  if [ "${STRAY:-0}" -eq 0 ] && [ "${DBLP:-0}" -eq 0 ]; then
+    ok "no stray releases / double presses across all gestures"
+  else
+    bad "input pairing broken: stray-releases=$STRAY double-presses=$DBLP"
+  fi
+
   kill "$GTK_PID" 2>/dev/null
   wait "$GTK_PID" 2>/dev/null
+  # window already closed through the dropdown → the app exits on its
+  # own; if it is still alive (dropdown path failed), the kill is the
+  # cleanup. Either way the model must not keep a stale entry.
+  sleep 0.6
+  if [ -n "$(wgeo_t "GtkProbe")" ]; then
+    bad "window still in model after app exit (ghost)"
+  fi
 else
   echo "  (vt-gtk4-probe not built — real-toolkit checks skipped)"
 fi
@@ -1613,6 +1926,61 @@ PYRC
   wait "$XBM_PID" 2>/dev/null
 else
   bad "Xwayland not available for the association/button checks"
+fi
+
+# ------------------------------------------------- real-app protocol check
+# foot is the reference native Wayland terminal: run it briefly and
+# verify the compositor implements the protocols it PROBES for. Three
+# warnings are strict failures (activation, fractional scaling,
+# server-side cursors). The toplevel-icon warning is only strict in
+# foot >= 1.23 wording ("xdg-toplevel-icon"); foot <= 1.22 matched the
+# WRONG global name upstream (fixed in their 1.23) and warns on every
+# compositor — that wording ("XDG toplevel icon") is informational.
+echo "== harness-wayland: foot protocol warnings (real app) =="
+FOOT_BIN=""
+FOOT_ENV=""
+if command -v foot >/dev/null 2>&1; then
+  FOOT_BIN="foot"
+elif [ -x /tmp/foot-root/usr/bin/foot ]; then
+  FOOT_BIN="/tmp/foot-root/usr/bin/foot"
+  FOOT_ENV="LD_LIBRARY_PATH=/tmp/foot-root/usr/lib/x86_64-linux-gnu"
+fi
+if [ -n "$FOOT_BIN" ]; then
+  FOOT_LOG="$WORK/foot.log"
+  env $FOOT_ENV TERM=xterm-256color timeout 5 "$FOOT_BIN" > "$FOOT_LOG" 2>&1
+  NMAPPED=$(grep -cE "window 0x[0-9]+ 'foot' mapped" "$WORK/wm.log" || true)
+  if [ "${NMAPPED:-0}" -lt 1 ]; then
+    bad "foot never mapped a window (protocol checks below would be vacuous): $(tail -3 "$FOOT_LOG")"
+  else
+    ok "foot mapped its window ($NMAPPED) and ran to completion"
+  fi
+  if grep -q "does not implement XDG activation" "$FOOT_LOG"; then
+    bad "foot still warns: XDG activation missing"
+  else
+    ok "foot: xdg-activation implemented (no warning)"
+  fi
+  if grep -q "does not implement fractional scaling" "$FOOT_LOG"; then
+    bad "foot still warns: fractional scaling missing"
+  else
+    ok "foot: fractional-scale implemented (no warning)"
+  fi
+  if grep -q "does not implement server-side cursors" "$FOOT_LOG"; then
+    bad "foot still warns: server-side cursors missing"
+  else
+    ok "foot: cursor-shape implemented (no warning)"
+  fi
+  if grep -q "does not implement the xdg-toplevel-icon protocol" "$FOOT_LOG"; then
+    bad "foot (>=1.23, correct check) still warns: toplevel-icon missing"
+  elif grep -q "does not implement the XDG toplevel icon protocol" "$FOOT_LOG"; then
+    ok "foot <=1.22 known upstream detection bug (toplevel icon) — informational"
+  else
+    ok "foot: xdg-toplevel-icon implemented (no warning)"
+  fi
+  if grep -qiE "segv|assert|aborted" "$FOOT_LOG"; then
+    bad "foot crashed against the compositor"
+  fi
+else
+  echo "  (foot not installed — real-app protocol check skipped)"
 fi
 
 # ------------------------------------------------------------- shutdown

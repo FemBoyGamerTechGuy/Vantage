@@ -24,11 +24,18 @@
 #include "wlr-layer-shell-protocol.h"
 #include "xwayland-shell-protocol.h"
 #include "primary-selection-protocol.h"
+#include "cursor-shape-protocol.h"
 
 #include <stdint.h>
 #include <stdbool.h>
 
 /* ------------------------------------------------------------ surfaces */
+
+/* a plain rect (surface-local for input regions) */
+struct _vt_rect { int32_t x, y, w, h; };
+
+/* forward: xdg-activation token (vt-wl-protocols.c) */
+struct _act_token;
 
 typedef struct _wl_surf {
     struct wl_resource *res;
@@ -74,6 +81,18 @@ typedef struct _wl_surf {
      * the screen on every resize. */
     int32_t  win_gx, win_gy, win_gw, win_gh;
     bool     have_win_geo;
+    /* wl_surface.set_input_region: rectangles (surface-local) where the
+     * surface accepts pointer input. NULL region = whole surface. CSD
+     * toolkits exclude their shadow margins here — without honoring it
+     * the compositor delivered clicks into the (now invisible) shadow
+     * band around windows: "the black region behaves like a solid part
+     * of the window". Implementation: added rects minus subtracted
+     * rects; containment = in-an-add AND not-in-a-subtract. */
+    struct _vt_rect *in_adds;
+    int             n_in_adds;
+    struct _vt_rect *in_subs;
+    int             n_in_subs;
+    bool     input_set;
     int32_t  last_gx, last_gy;        /* previous geometry offset (anchor) */
     uint32_t last_cfg_serial;         /* last xdg_surface.configure serial
                                        * we sent (ack_configure sanity) */
@@ -97,6 +116,10 @@ typedef struct _wl_surf {
     struct _layer_surf *layer;
     /* xwayland_shell_v1 association (X11 windows via Xwayland) */
     struct _xwl_win *xwl;
+    /* staging-protocol attachments (vt-wl-protocols.c; weak links
+     * detached in _proto_surface_destroyed) */
+    struct _act_token *act_token;     /* xdg-activation token for this surface */
+    struct wl_resource *fscale;       /* wp_fractional_scale_v1 resource */
 } _wl_surf_t;
 
 typedef struct _xdg_toplevel {
@@ -228,6 +251,12 @@ typedef struct {
     uint32_t *bg_pix;
     /* xdg-decoration protocol */
     struct wl_global *decor_g;
+    /* staging protocols (vt-wl-protocols.c) */
+    struct wl_global *cshape_g;
+    struct wl_global *activation_g;
+    struct wl_global *fscale_g;
+    struct wl_global *ticon_g;
+    struct wl_global *viewporter_g;
     /* wlr layer-shell protocol */
     struct wl_global *layer_shell_g;
     /* xwayland support */
@@ -238,6 +267,10 @@ typedef struct {
     int cur_img_w, cur_img_h, cur_img_hx, cur_img_hy;
     bool cur_client_set;               /* client provided a cursor */
     _wl_surf_t *cursor_surf;
+    /* cursor-shape-v1: the client asked for a NAMED shape instead of
+     * supplying a surface — we render it (Xcursor theme) on the same
+     * plane the compositor arrow uses. client_shape = 0 = none. */
+    uint32_t client_shape;
     /* shape sets: 0=default arrow, 1=E/W resize, 2=N/S, 3=NW/SE, 4=NE/SW.
      * The ACTIVE image stays in cursor_img (the blit/KMS paths do not
      * change); switching shapes copies the set in and re-applies. */
@@ -256,6 +289,19 @@ typedef struct {
     int op_start_x, op_start_y;        /* surface origin at grab (edge math) */
     int op_start_w, op_start_h;
     uint64_t op_last_geo_us;           /* geometry-event throttle stamp */
+
+    /* IMPLICIT POINTER GRAB: which surface received the last forwarded
+     * button PRESS (and whether the compositor consumed it instead).
+     * A RELEASE may only go to that surface's client — the old code
+     * forwarded releases to whatever was under the cursor at release
+     * time, so a press that started on window A and a release that
+     * landed on window B (pointer crossed a no-input shadow band, the
+     * popup closed, an SSD drag ended over another window) delivered a
+     * release WITHOUT a matching press: foot's "stray button release
+     * event (compositor bug?)" and menu items that "sometimes close
+     * the dropdown instead of activating". */
+    _wl_surf_t *press_surf;
+    bool press_consumed;
 } _wl_state_t;
 
 extern _wl_state_t *_wls;
@@ -277,6 +323,19 @@ extern _wl_state_t *_wls;
 
 /* ------------------------------------------------- backend-core exports */
 /* Defined in vt-backend-wayland.c; used by the protocol modules. */
+
+/* The WINDOW rect (content rect) of a surface in screen coordinates —
+ * the set_window_geometry rect when the client declared one, else the
+ * full committed buffer. This is what the user perceives as "the
+ * window": CSD shadow margins live in the buffer but OUTSIDE this
+ * rect. All placement, hit-testing, pager geometry and SSD framing
+ * must use THIS, not the raw buffer rect (the raw rect was why CSD
+ * apps got solid black resize-looking bands around them and why the
+ * pager over-reported window sizes). */
+void _win_content_rect(const _wl_surf_t *s, int *cx, int *cy,
+                        int *cw, int *ch);
+/* pointer-input containment for a surface at screen (x, y) */
+bool _surf_input_contains(const _wl_surf_t *s, int x, int y);
 
 void _emit_win(_wl_state_t *st, vt_backend_wl_event_kind_t kind,
                _xdg_toplevel_t *t);
@@ -369,5 +428,27 @@ void _xwl_minimize(_wl_surf_t *s, bool on);
 void _xwl_set_workspace(_wl_surf_t *s, int ws);
 int  _xwl_ws_switch(int ws);
 void _xwl_workspace_changed(_wl_state_t *st);
+
+/* ------------------------------------------------- staging protocols */
+/* Implemented in vt-wl-protocols.c: cursor-shape-v1 (server-side
+ * cursors), xdg-activation-v1 (focus/urgency tokens),
+ * fractional-scale-v1 (HiDPI negotiation), xdg-toplevel-icon-v1.
+ * Globals are created after the core globals and destroyed in _wl_fini;
+ * _proto_surface_destroyed detaches per-surface objects at death. */
+void _proto_globals_create(_wl_state_t *st);
+void _proto_globals_destroy(_wl_state_t *st);
+void _proto_surface_destroyed(_wl_surf_t *s);
+
+/* cursor hooks the protocol module calls into (implemented in the
+ * backend core, which owns the cursor image/plane state):
+ *   _cursor_client_shape: a cursor-shape-v1 client asked for a named
+ *       shape — the compositor loads it from the Xcursor theme and
+ *       shows it (hardware plane; NO client surface involved).
+ *   _cursor_client_release: the pointer left the client (or it
+ *       cleared its cursor) — restore the compositor arrow.
+ *   _focus_surface: xdg-activation equivalent of a focus click. */
+void _cursor_client_shape(uint32_t shape);
+void _cursor_client_release(void);
+void _focus_surface(_wl_surf_t *s);
 
 #endif /* VT_WL_INTERNAL_H */

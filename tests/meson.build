@@ -91,6 +91,21 @@ if wl_client_ok
     install_dir : join_paths(vt_libdir, 'vantage', 'tests'),
     install_rpath : vt_extra_rpath,
   )
+
+  # Registry prober: connects as a plain client and verifies the
+  # compositor advertises the staging protocols with their SPEC names
+  # (wp_cursor_shape_manager_v1, xdg_activation_v1,
+  # wp_fractional_scale_manager_v1, xdg_toplevel_icon_manager_v1,
+  # wp_viewporter). Independent of any toolkit's own global-detection
+  # bugs (foot <= 1.22 matched the wrong interface name for the
+  # toplevel-icon manager — upstream fixed in 1.23).
+  registry_probe = executable('vt-registry-probe',
+    sources : 'registry-probe.c',
+    dependencies : [dep_wayland_client],
+    install : true,
+    install_dir : join_paths(vt_libdir, 'vantage', 'tests'),
+    install_rpath : vt_extra_rpath,
+  )
 endif
 
 # ------------------------------------------------------------------

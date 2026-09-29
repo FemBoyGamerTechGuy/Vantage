@@ -674,6 +674,132 @@ PIXEL_RC=$?
 [ "$PIXEL_RC" -eq 0 ] && ok "screenshot shows managed windows + painted desktop" \
     || bad "screenshot pixel check failed (windows/pager/start-icon)"
 
+echo "== harness-xvfb: taskbar context menu (dropdown) =="
+# The SAME panel code drives both backends, but the input path differs
+# completely (X server + XTest instead of the compositor's pointer).
+# Right-click the taskbar button of a managed window → the context
+# menu must OPEN, stay open across the panel's WM polls, and its
+# Close row must close the window on a plain left click (no ghost).
+DD_LOG="$WORK/dd.log"
+rm -f "$WORK/dd.ppm"
+"$(tc vt-x11-testclient)" --seconds 16 --title "Vantage Test" \
+  > "$DD_LOG" 2>&1 &
+DD_PID=$!
+for i in $(seq 1 60); do
+  grep -q "^mapped" "$DD_LOG" 2>/dev/null && break
+  kill -0 "$DD_PID" 2>/dev/null || break
+  sleep 0.1
+done
+sleep 1.0     # let the WM manage it + the panel's 400 ms poll pick it up
+# locate the taskbar button: light label text right of the pager
+rm -f "$WORK/dd-loc.ppm"
+"$(tc vt-x11-testclient)" --no-windows --seconds 1 \
+  --screenshot "$WORK/dd-loc.ppm" > /dev/null 2>&1
+DD_BTN=$(python3 - "$WORK/dd-loc.ppm" <<'PYDD1'
+import sys
+with open(sys.argv[1],'rb') as f: d=f.read()
+i=d.find(b'P6'); vals=[]; pos=i+2
+while len(vals)<3:
+    while d[pos:pos+1].isspace(): pos+=1
+    if d[pos:pos+1]==b'#':
+        while d[pos:pos+1] not in (b'\n',b''): pos+=1
+        continue
+    j=pos
+    while not d[j:j+1].isspace(): j+=1
+    vals.append(int(d[pos:j])); pos=j
+pos+=1; w,h,_=vals; pix=d[pos:pos+w*h*3]
+xs=set()
+for y in range(6,40):
+    for x in range(430,w):
+        k=(y*w+x)*3
+        if pix[k]>=0x90 and pix[k+1]>=0x90 and pix[k+2]>=0x90:
+            xs.add(x)
+# the TASKLIST is the leftmost text cluster after the pager; the
+# clock/tray/net applets live at the far right. Take the first
+# ~100px-wide cluster of light columns.
+xs=sorted(xs)
+if not xs:
+    print(-1)
+else:
+    cluster=[xs[0]]
+    for x in xs[1:]:
+        if x-cluster[-1]<=4: cluster.append(x)
+        else: break
+    print(sum(cluster)//len(cluster))
+PYDD1
+)
+if [ "${DD_BTN:-0}" -gt 0 ]; then
+  ok "taskbar button located for the managed window (x=$DD_BTN)"
+  # right-click it through the REAL X input path; screenshot the menu
+  rm -f "$WORK/dd-menu.ppm"
+  "$(tc vt-x11-testclient)" --no-windows --seconds 2 \
+    --rclick "$DD_BTN,20" --screenshot "$WORK/dd-menu.ppm" > /dev/null 2>&1
+  DD_ROWS=$(python3 - "$WORK/dd-menu.ppm" "$DD_BTN" <<'PYDD2'
+import sys
+bx=int(sys.argv[2])
+with open(sys.argv[1],'rb') as f: d=f.read()
+i=d.find(b'P6'); vals=[]; pos=i+2
+while len(vals)<3:
+    while d[pos:pos+1].isspace(): pos+=1
+    if d[pos:pos+1]==b'#':
+        while d[pos:pos+1] not in (b'\n',b''): pos+=1
+        continue
+    j=pos
+    while not d[j:j+1].isspace(): j+=1
+    vals.append(int(d[pos:j])); pos=j
+pos+=1; w,h,_=vals; pix=d[pos:pos+w*h*3]
+rows={}
+for y in range(46,170):
+    light=sum(1 for x in range(max(0,bx-40),min(w,bx+140))
+              if pix[(y*w+x)*3]>=0x90 and pix[(y*w+x)*3+1]>=0x90
+              and pix[(y*w+x)*3+2]>=0x90)
+    if light>=2: rows[y]=light
+bands=[]; cur=None
+for y in sorted(rows):
+    if cur and y-cur[1]<=3: cur[1]=y
+    else: cur=[y,y]; bands.append(cur)
+real=[b for b in bands if b[1]-b[0]>=3]
+print((real[1][0]+real[1][1])//2 if len(real)>=2 else
+      ((real[0][0]+real[0][1])//2 if real else -1))
+PYDD2
+)
+  if [ "${DD_ROWS:-0}" -gt 0 ]; then
+    ok "taskbar dropdown opened and stayed open across WM polls (row y=$DD_ROWS)"
+    # left click the Close row
+    "$(tc vt-x11-testclient)" --no-windows --seconds 2 \
+      --click "$((DD_BTN+30)),$DD_ROWS" > /dev/null 2>&1
+    DD_CLOSED=""
+    for i in $(seq 1 30); do
+      if ! "$(vb vantage-remote)" list 2>/dev/null | grep -q "Vantage Test"; then
+        DD_CLOSED=1; break
+      fi
+      sleep 0.1
+    done
+    if [ -n "$DD_CLOSED" ]; then
+      ok "dropdown Close item closed the window on left click"
+      sleep 1.5
+      if "$(vb vantage-remote)" list 2>/dev/null | grep -q "Vantage Test"; then
+        bad "ghost window: model still lists the closed window"
+      else
+        ok "no ghost window after the dropdown close"
+      fi
+    else
+      bad "dropdown Close item did not close the window (left-click eaten)"
+    fi
+  else
+    bad "taskbar dropdown did not open/stay open (X11 input path)"
+  fi
+  kill "$DD_PID" 2>/dev/null
+  wait "$DD_PID" 2>/dev/null
+  # cleanup if the window survived a failed path
+  DDID=$("$(vb vantage-remote)" list 2>/dev/null | grep "Vantage Test" | head -1 | cut -f1)
+  [ -n "$DDID" ] && "$(vb vantage-remote)" close "$DDID" >/dev/null 2>&1
+else
+  bad "taskbar button not found by label scan (dropdown check skipped)"
+  kill "$DD_PID" 2>/dev/null
+  wait "$DD_PID" 2>/dev/null
+fi
+
 echo "== harness-xvfb: Programs menu (shared app database) =="
 # deterministic application database — the panel process reads
 # XDG_DATA_HOME at .desktop scan time

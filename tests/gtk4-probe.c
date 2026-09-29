@@ -24,7 +24,7 @@ static GtkWidget *g_draw = NULL;
 static char g_title[128] = "GTK Probe";
 static gboolean g_ssd = FALSE;
 
-static void _on_alloc(GtkWidget *w, gint width, gint height, gint baseline,
+__attribute__((unused)) static void _on_alloc(GtkWidget *w, gint width, gint height, gint baseline,
                       gpointer u) {
     (void)w; (void)baseline; (void)u;
     static int last_w = -1, last_h = -1;
@@ -79,6 +79,42 @@ static void _draw_fn(GtkDrawingArea *da, cairo_t *cr, int w, int h,
     (void)da;
 }
 
+/* button event accounting: every PRESS must pair with a RELEASE and
+ * no RELEASE may arrive without a matching press (the compositor's
+ * implicit-grab contract — violations are exactly foot's "stray
+ * button release event (compositor bug?)"). The harness greps these
+ * lines after driving compositor-consumed gestures (SSD clicks,
+ * Super+drag) over the window. */
+static int g_btn_state[16] = {0};
+static void _on_btn_press(GtkGestureClick *g, int n, double x, double y,
+                           gpointer u) {
+    (void)g; (void)n; (void)x; (void)y; (void)u;
+    guint b = gtk_gesture_single_get_current_button(GTK_GESTURE_SINGLE(g));
+    if (b < 16) {
+        if (g_btn_state[b]) {
+            printf("button %u DOUBLE-PRESS\n", b);
+        } else {
+            g_btn_state[b] = 1;
+            printf("button %u press\n", b);
+        }
+        fflush(stdout);
+    }
+}
+static void _on_btn_release(GtkGestureClick *g, int n, double x, double y,
+                            gpointer u) {
+    (void)g; (void)n; (void)x; (void)y; (void)u;
+    guint b = gtk_gesture_single_get_current_button(GTK_GESTURE_SINGLE(g));
+    if (b < 16) {
+        if (!g_btn_state[b]) {
+            printf("button %u STRAY-RELEASE\n", b);
+        } else {
+            g_btn_state[b] = 0;
+            printf("button %u release\n", b);
+        }
+        fflush(stdout);
+    }
+}
+
 static void _activate(GApplication *app, gpointer u) {
     (void)u;
     GtkWidget *win = gtk_application_window_new(GTK_APPLICATION(app));
@@ -100,6 +136,12 @@ static void _activate(GApplication *app, gpointer u) {
     gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(g_draw), _draw_fn,
                                    NULL, NULL);
     gtk_box_append(GTK_BOX(box), g_draw);
+    /* button accounting on the whole window (see _on_btn_*) */
+    GtkGesture *bg = gtk_gesture_click_new();
+    gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(bg), 0);
+    g_signal_connect(bg, "pressed", G_CALLBACK(_on_btn_press), NULL);
+    g_signal_connect(bg, "released", G_CALLBACK(_on_btn_release), NULL);
+    gtk_widget_add_controller(win, GTK_EVENT_CONTROLLER(bg));
     gtk_window_set_child(GTK_WINDOW(win), box);
     gtk_widget_set_visible(win, TRUE);
 }
