@@ -106,14 +106,25 @@ static struct {
     long              n_imported;
     long              n_mmapped;
     long              n_failed;
+    /* advertisement capability (self-tested by the import engine):
+     * only layouts this machine can actually import are promised to
+     * clients — an unimportable advertisement turns every GPU client
+     * into a black window (the NVIDIA regression) */
+    bool              adv_linear;
+    bool              adv_invalid;
 } _D = {0};
 
 /* --------------------------------------------------------- feedback */
 static void _feedback_send_formats(struct wl_resource *fb_res) {
     /* v4 feedback contract: a format TABLE (fd, 16-byte entries {u32
      * fourcc, u32 pad, u64 modifier}), then main_device + one tranche
-     * whose tranche_formats references the table by 16-bit indices. */
-    int n_entries = _N_FORMATS * 2;          /* each × {LINEAR, INVALID} */
+     * whose tranche_formats references the table by 16-bit indices.
+     * ONLY self-tested-capable (format, modifier) combos are listed. */
+    int n_entries = 0;
+    for (int i = 0; i < _N_FORMATS; i++) {
+        if (_D.adv_invalid) n_entries++;
+        if (_D.adv_linear) n_entries++;
+    }
     size_t table_size = (size_t)n_entries * 16;
     int table_fd = -1;
     uint8_t *table = NULL;
@@ -139,12 +150,16 @@ static void _feedback_send_formats(struct wl_resource *fb_res) {
             struct { uint32_t fmt, pad; uint64_t mod; } v;
             v.fmt = _formats[i];
             v.pad = 0;
-            v.mod = DRM_FORMAT_MOD_INVALID;
-            memcpy(table + (size_t)e * 16, &v, 16);
-            e++;
-            v.mod = DRM_FORMAT_MOD_LINEAR;
-            memcpy(table + (size_t)e * 16, &v, 16);
-            e++;
+            if (_D.adv_invalid) {
+                v.mod = DRM_FORMAT_MOD_INVALID;
+                memcpy(table + (size_t)e * 16, &v, 16);
+                e++;
+            }
+            if (_D.adv_linear) {
+                v.mod = DRM_FORMAT_MOD_LINEAR;
+                memcpy(table + (size_t)e * 16, &v, 16);
+                e++;
+            }
         }
     }
     munmap(table, table_size);
@@ -164,8 +179,9 @@ static void _feedback_send_formats(struct wl_resource *fb_res) {
     zwp_linux_dmabuf_feedback_v1_send_tranche_target_device(fb_res,
                                                             &dev_arr);
     uint16_t idx[_N_FORMATS * 2];
-    for (int i = 0; i < _N_FORMATS * 2; i++) idx[i] = (uint16_t)i;
-    struct wl_array idx_arr = { .size = sizeof(idx), .data = idx };
+    for (int i = 0; i < n_entries; i++) idx[i] = (uint16_t)i;
+    struct wl_array idx_arr = { .size = (size_t)n_entries * sizeof(uint16_t),
+                                .data = idx };
     zwp_linux_dmabuf_feedback_v1_send_tranche_formats(fb_res, &idx_arr);
     zwp_linux_dmabuf_feedback_v1_send_tranche_done(fb_res);
     zwp_linux_dmabuf_feedback_v1_send_done(fb_res);
@@ -253,15 +269,19 @@ static _dmabuf_buf_t *_buffer_import(uint32_t w, uint32_t h, uint32_t fourcc,
             _D.n_imported++;
             return b;
         }
-        vt_logd("dmabuf: EGL import failed fourcc %.4s mod 0x%llx "
-                "— trying mmap", (const char *)&fourcc,
-                (unsigned long long)modifier);
     }
 
-    /* mmap fallback: single LINEAR plane only */
-    if (n_planes == 1 &&
+    /* mmap fallback: single LINEAR plane only. An INVALID modifier
+     * means "driver layout" — that is linear-in-memory ONLY on the
+     * software device (memfd storage); mmapping a tiled real-GPU
+     * buffer would decode garbage rows. (VANTAGE_DMABUF_ZOMBIE skips
+     * this too — the hook reproduces a machine where NOTHING imports,
+     * e.g. NVIDIA GEM without mmap support.) */
+    if (!getenv("VANTAGE_DMABUF_ZOMBIE") &&
+        n_planes == 1 &&
         (modifier == DRM_FORMAT_MOD_LINEAR ||
-         modifier == DRM_FORMAT_MOD_INVALID) &&
+         (modifier == DRM_FORMAT_MOD_INVALID &&
+          vt_dmabuf_egl_is_software())) &&
         planes[0].stride >= w * 4 && planes[0].fd >= 0) {
         size_t len = (size_t)planes[0].offset +
                      (size_t)planes[0].stride * (size_t)h;
@@ -276,8 +296,14 @@ static _dmabuf_buf_t *_buffer_import(uint32_t w, uint32_t h, uint32_t fourcc,
         }
         vt_logd("dmabuf: mmap failed (%s)", strerror(errno));
     }
-    free(b);
     _D.n_failed++;
+    if (_D.n_failed <= 6)
+        vt_logw("dmabuf: buffer import FAILED (%.4s %ux%u mod 0x%llx) — "
+                " EGL=%s mmap=%s", (const char *)&fourcc, w, h,
+                (unsigned long long)modifier,
+                vt_dmabuf_egl_available() ? "tried" : "unavailable",
+                strerror(errno));
+    free(b);
     return NULL;
 }
 
@@ -368,8 +394,10 @@ static void _params_create(struct wl_client *cli, struct wl_resource *res,
 }
 
 /* create_immed: the client gave the buffer id — ALWAYS create the
- * resource (a failed import becomes a zombie: attach = no-op + instant
- * release, so the client's proxy resolves and it can fall back). */
+ * resource. A failed import becomes a ZOMBIE that still carries the
+ * buffer's layout (w/h/fourcc): the surface can map (empty content)
+ * instead of vanishing, attach is a no-op + instant release, and the
+ * client's proxy resolves so it can keep cycling buffers. */
 static void _params_create_immed(struct wl_client *cli,
                                  struct wl_resource *res, uint32_t id,
                                  int32_t w, int32_t h, uint32_t format,
@@ -390,6 +418,17 @@ static void _params_create_immed(struct wl_client *cli,
     }
     _dmabuf_buf_t *b = _buffer_import((uint32_t)w, (uint32_t)h, format,
                                       p->planes, p->n_planes, p->modifier);
+    if (!b) {
+        /* zombie WITH layout: the commit path reports the size and the
+         * surface maps with empty content (see _dmabuf_commit_pixels) */
+        b = calloc(1, sizeof(*b));
+        if (b) {
+            b->magic = _DMABUF_BUF_MAGIC;
+            b->w = (uint32_t)w;
+            b->h = (uint32_t)h;
+            b->fourcc = format;
+        }
+    }
     struct wl_resource *br = wl_resource_create(cli, &wl_buffer_interface,
                                                 1, id);
     if (!br) {
@@ -410,7 +449,8 @@ static void _params_create_immed(struct wl_client *cli,
     vt_logd("dmabuf: immed buffer %p %.4s %dx%d mod 0x%llx (%s)",
             (void *)br, (const char *)&format, w, h,
             (unsigned long long)p->modifier,
-            b ? (b->img ? "EGL" : "mmap") : "zombie");
+            b ? (b->img ? "EGL" : (b->mm.map ? "mmap" : "zombie"))
+              : "zombie");
 }
 
 static const struct zwp_linux_buffer_params_v1_interface _params_impl = {
@@ -439,18 +479,21 @@ static void _bind_dmabuf(struct wl_client *cli, void *data,
     if (!res) { wl_client_post_no_memory(cli); return; }
     wl_resource_set_implementation(res, &_mgr_impl, NULL, NULL);
     /* legacy format/modifier advertisement (v1–v3 binds); v4 clients
-     * use the feedback objects instead */
+     * use the feedback objects instead. Only self-tested-capable
+     * modifiers are promised (same policy as the v4 feedback). */
     if (v < 4) {
         for (int i = 0; i < _N_FORMATS; i++) {
             uint32_t f = _formats[i];
             zwp_linux_dmabuf_v1_send_format(res, f);
             if (v >= 3) {
-                zwp_linux_dmabuf_v1_send_modifier(
-                    res, f, DRM_FORMAT_MOD_INVALID >> 32,
-                    (uint32_t)DRM_FORMAT_MOD_INVALID);
-                zwp_linux_dmabuf_v1_send_modifier(
-                    res, f, DRM_FORMAT_MOD_LINEAR >> 32,
-                    (uint32_t)DRM_FORMAT_MOD_LINEAR);
+                if (_D.adv_invalid)
+                    zwp_linux_dmabuf_v1_send_modifier(
+                        res, f, DRM_FORMAT_MOD_INVALID >> 32,
+                        (uint32_t)DRM_FORMAT_MOD_INVALID);
+                if (_D.adv_linear)
+                    zwp_linux_dmabuf_v1_send_modifier(
+                        res, f, DRM_FORMAT_MOD_LINEAR >> 32,
+                        (uint32_t)DRM_FORMAT_MOD_LINEAR);
             }
         }
     }
@@ -510,6 +553,18 @@ bool _dmabuf_globals_create(_wl_state_t *st) {
                 "global stays unadvertised (clients use wl_shm)");
         return false;
     }
+    _D.adv_linear = vt_dmabuf_egl_advertise_linear();
+    _D.adv_invalid = vt_dmabuf_egl_advertise_implicit();
+    if (!_D.adv_linear && !_D.adv_invalid) {
+        /* the self-test could not import ANY real GPU buffer: promising
+         * dmabuf support anyway would hand every EGL client zombie
+         * buffers (black windows, dead Xwayland). Stay silent instead —
+         * clients keep rendering through wl_shm and the desktop WORKS. */
+        vt_logi("dmabuf: this machine's driver cannot import client GPU "
+                "buffers (selftest failed) — the linux-dmabuf global "
+                "stays unadvertised; clients render via wl_shm");
+        return false;
+    }
     wl_list_init(&_D.bufs);
     _D.global = wl_global_create(
         st->display, &zwp_linux_dmabuf_v1_interface, _DMABUF_VERSION, NULL,
@@ -519,8 +574,11 @@ bool _dmabuf_globals_create(_wl_state_t *st) {
         return false;
     }
     vt_logi("dmabuf: zwp_linux_dmabuf_v1 v%d advertised — import renderer "
-            "'%s', %d formats (ARGB/XRGB/ABGR/XBGR8888, LINEAR+INVALID)",
-            _DMABUF_VERSION, vt_dmabuf_egl_renderer(), _N_FORMATS);
+            "'%s', %d formats, modifiers {%s%s%s} (self-tested)",
+            _DMABUF_VERSION, vt_dmabuf_egl_renderer(), _N_FORMATS,
+            _D.adv_linear ? "LINEAR" : "",
+            _D.adv_linear && _D.adv_invalid ? "+" : "",
+            _D.adv_invalid ? "INVALID" : "");
     return true;
 }
 
@@ -552,15 +610,20 @@ _dmabuf_buf_t *_dmabuf_buffer_of(struct wl_resource *res) {
  * is released right away and the client never stalls.
  *
  * dest == NULL is a PROBE: no readback, only the size is reported
- * (the backend core sizes its pixel storage between the two calls). */
+ * (the backend core sizes its pixel storage between the two calls).
+ *
+ * A ZOMBIE (import failed, layout recorded) still reports its size —
+ * the surface then maps with empty content instead of vanishing — but
+ * yields no pixels, so the readback call returns false. */
 bool _dmabuf_commit_pixels(struct wl_resource *res, uint32_t *dest,
                            int dest_stride_u32, int32_t *out_w,
                            int32_t *out_h) {
     _dmabuf_buf_t *b = _dmabuf_buffer_of(res);
     if (!b) return false;
-    if (!b->img && !b->mm.map) return false;    /* zombie */
     if (out_w) *out_w = (int32_t)b->w;
     if (out_h) *out_h = (int32_t)b->h;
+    if (!b->img && !b->mm.map)
+        return dest == NULL;                     /* zombie: size only */
     if (!dest) return true;                      /* probe only */
     return _buffer_readback(b, dest, dest_stride_u32);
 }

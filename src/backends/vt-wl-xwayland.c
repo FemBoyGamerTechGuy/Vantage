@@ -79,6 +79,10 @@ typedef struct _xwl_win {
 
 static struct {
     bool started;
+    bool dead;                      /* Xwayland died mid-session — the
+                                       connection is a corpse; logged
+                                       once, never routed again (but
+                                       _xwl_stop still cleans up) */
     pid_t pid;
     int display;                    /* display number (e.g. 2 → :2) */
     char auth_file[256];
@@ -1264,7 +1268,37 @@ void _xwl_learn_client(struct wl_client *cli) {
 }
 
 void _xwl_dispatch(void) {
-    if (!X.started || !X.xc) return;
+    if (!X.started || !X.xc || X.dead) return;
+    if (xcb_connection_has_error(X.xc)) {
+        /* Xwayland died mid-session (crash or exit). Its wl surfaces
+         * are cleaned up by the compositor's own client-death path;
+         * what was MISSING was the honest, visible diagnosis — every
+         * X11 check downstream used to fail with no hint why. */
+        X.dead = true;
+        int wst = 0;
+        if (X.pid > 0 && waitpid(X.pid, &wst, WNOHANG) == X.pid) {
+            if (WIFEXITED(wst))
+                vt_logw("xwayland: server EXITED mid-session "
+                        "(status %d) — X11 windows are gone; check the "
+                        "dmabuf import-failure lines above (GPU buffer "
+                        "imports killing Xwayland's glamor)",
+                        WEXITSTATUS(wst));
+            else if (WIFSIGNALED(wst))
+                vt_logw("xwayland: server CRASHED mid-session "
+                        "(signal %d) — X11 windows are gone; check the "
+                        "dmabuf import-failure lines above (GPU buffer "
+                        "imports killing Xwayland's glamor)",
+                        WTERMSIG(wst));
+            else
+                vt_logw("xwayland: server died mid-session — X11 "
+                        "windows are gone");
+            X.pid = 0;
+        } else {
+            vt_logw("xwayland: X connection broke mid-session (server "
+                    "unresponsive) — X11 windows are gone");
+        }
+        return;
+    }
     xcb_generic_event_t *ev;
     while ((ev = xcb_poll_for_event(X.xc))) {
         switch (ev->response_type & 0x7f) {
@@ -1797,6 +1831,7 @@ void _xwl_stop(_wl_state_t *st) {
     }
     unlink(X.auth_file);
     X.started = false;
+    X.dead = false;
     X.pid = 0;
     X.display = -1;
 }

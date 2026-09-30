@@ -1092,6 +1092,15 @@ else
 fi
 
 kill -TERM "$XVFB_PID" 2>/dev/null
+# Xvfb occasionally ignores SIGTERM while an X client socket is wedged —
+# a bare `wait` here hung the whole harness until the meson timeout (the
+# 90s SIGTERM that looked like a test timeout). Bounded: TERM, poll,
+# KILL, reap — the script ALWAYS exits on its own.
+for i in $(seq 1 30); do
+  kill -0 "$XVFB_PID" 2>/dev/null || break
+  sleep 0.1
+done
+kill -KILL "$XVFB_PID" 2>/dev/null
 wait "$XVFB_PID" 2>/dev/null
 
 # ------------------------------------------------------------- summary

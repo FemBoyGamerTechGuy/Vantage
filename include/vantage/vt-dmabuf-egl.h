@@ -40,6 +40,25 @@ dev_t vt_dmabuf_egl_device(void);
 /* GL_RENDERER string for logging ("llvmpipe", "Radeon RX…", …). */
 const char *vt_dmabuf_egl_renderer(void);
 
+/* ---- capability (decides what the dmabuf module advertises) --------
+ * On real hardware init runs a SELF-TEST with actual GBM allocations
+ * (LINEAR and driver-layout) through the full import→render→readback
+ * path. The advertisement then promises ONLY what this machine can
+ * actually import — clients never allocate a layout we would drop:
+ *   advertise_linear   — DRM_FORMAT_MOD_LINEAR buffers are importable
+ *                        (EGL) or CPU-mappable (mmap readback)
+ *   advertise_implicit — DRM_FORMAT_MOD_INVALID (driver-layout)
+ *                        buffers import through EGL
+ * When BOTH are false the linux-dmabuf global must stay unadvertised
+ * (clients fall back to wl_shm — a working desktop beats zombies). */
+bool vt_dmabuf_egl_advertise_linear(void);
+bool vt_dmabuf_egl_advertise_implicit(void);
+/* import display is the software EGL device (no real render node):
+ * memfd/LINEAR semantics — the mmap fallback is valid for INVALID too */
+bool vt_dmabuf_egl_is_software(void);
+/* GEM dma-bufs on this machine are CPU-mappable (mmap fallback sanity) */
+bool vt_dmabuf_egl_gbm_mmap(void);
+
 /* Import a dma-buf layout (up to 4 planes) as an EGLImage-backed
  * texture. `fds` are NOT closed by the callee and must stay open for
  * the lifetime of the returned image. modifier = DRM_FORMAT_MOD_*.

@@ -475,26 +475,38 @@ static void _surf_commit(struct wl_client *cli, struct wl_resource *res) {
                     s->own_cap = need + need / 2;
                     s->own = vt_malloc(sizeof(uint32_t) * s->own_cap);
                 }
-                if (s->own &&
-                    _dmabuf_commit_pixels(s->buf_res, s->own, dw,
-                                          &dw, &dh)) {
+                if (s->own) {
+                    bool got = _dmabuf_commit_pixels(s->buf_res, s->own,
+                                                     dw, &dw, &dh);
+                    if (!got) {
+                        /* zombie GPU buffer (import failed on this
+                         * driver): map the surface with EMPTY content —
+                         * a transparent-but-alive window beats a window
+                         * that never appears at all; input, geometry,
+                         * the taskbar and menus keep working while the
+                         * import failure is reported in the log. */
+                        static long zomb = 0;
+                        memset(s->own, 0, need * sizeof(uint32_t));
+                        if (++zomb <= 3)
+                            vt_logw("wayland: client GPU buffer could not "
+                                    "be imported (%ld) — window maps with "
+                                    "empty content (see the dmabuf "
+                                    "import-failure log lines)", zomb);
+                    }
                     s->pixels = s->own;
                     s->w = dw;
                     s->h = dh;
                     s->buf_w = dw;
                     s->buf_h = dh;
                     s->stride = dw;
-                } else {
-                    ok = false;
                 }
-            }
-            if (!ok) {
+            } else {
                 static bool warned_nonshm = false;
                 if (!warned_nonshm) {
                     warned_nonshm = true;
-                    vt_logw("wayland: client committed a buffer we cannot "
-                            "import (non-shm, import failed) — it will "
-                            "fall back to wl_shm");
+                    vt_logw("wayland: client committed a foreign buffer "
+                            "we cannot import (neither wl_shm nor our "
+                            "linux-dmabuf) — the commit is dropped");
                 }
             }
             /* release in ALL cases: withholding it would deadlock the

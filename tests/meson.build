@@ -209,7 +209,7 @@ if harness_xvfb.found() and prog_xvfb.found() and \
   # becomes meaningless)
   test('harness-xvfb', harness_xvfb,
     args : [meson.project_build_root()],
-    timeout : 90,
+    timeout : 180,
     suite : 'integration',
     is_parallel : false)
 endif

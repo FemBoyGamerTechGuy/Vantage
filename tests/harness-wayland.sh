@@ -431,20 +431,27 @@ fi
 # BOTH map on screen and keep redrawing — the exact failure modes of
 # the browser-stuck-on-one-frame bug class. On headless boxes the EGL
 # device is llvmpipe (the same import code path a real GPU driver
-# runs); on real hardware the render node takes over automatically.
+# runs); on real hardware the render node takes over automatically —
+# and its self-test decides the advertisement (a driver that cannot
+# import ANY GPU buffer keeps the global hidden and clients use
+# wl_shm; that state is an honest SKIP, not a fake pass).
 if [ -x "$(tc vt-dmabuf-probe)" ]; then
-  DMOUT=$(timeout 6 "$(tc vt-dmabuf-probe)" 4 2>&1 | tail -1)
-  if echo "$DMOUT" | grep -q "imported=yes" && \
-     echo "$DMOUT" | grep -q "feedback=yes"; then
-    ok "linux-dmabuf v4: global advertised, feedback parsed, buffers imported (EGL)"
+  if grep -q "linux-dmabuf global stays unadvertised" "$WORK/wm.log" 2>/dev/null; then
+    echo "  (import engine self-test failed on this machine — dmabuf checks skipped; clients use wl_shm)"
   else
-    bad "linux-dmabuf probe: $DMOUT"
-  fi
-  DMFRAMES=$(echo "$DMOUT" | grep -o 'frames=[0-9]*' | cut -d= -f2)
-  if [ -n "$DMFRAMES" ] && [ "$DMFRAMES" -gt 60 ]; then
-    ok "dmabuf client animates continuously ($DMFRAMES frames/4s — no single-frame stall)"
-  else
-    bad "dmabuf client stalled (frames=$DMFRAMES — the browser-freeze class)"
+    DMOUT=$(timeout 6 "$(tc vt-dmabuf-probe)" 4 2>&1 | tail -1)
+    if echo "$DMOUT" | grep -q "imported=yes" && \
+       echo "$DMOUT" | grep -q "feedback=yes"; then
+      ok "linux-dmabuf v4: global advertised, feedback parsed, buffers imported (EGL)"
+    else
+      bad "linux-dmabuf probe: $DMOUT"
+    fi
+    DMFRAMES=$(echo "$DMOUT" | grep -o 'frames=[0-9]*' | cut -d= -f2)
+    if [ -n "$DMFRAMES" ] && [ "$DMFRAMES" -gt 60 ]; then
+      ok "dmabuf client animates continuously ($DMFRAMES frames/4s — no single-frame stall)"
+    else
+      bad "dmabuf client stalled (frames=$DMFRAMES — the browser-freeze class)"
+    fi
   fi
 else
   echo "  (vt-dmabuf-probe not built — dmabuf check skipped)"
@@ -2487,6 +2494,20 @@ if [ "${STRAGGLERS:-0}" -eq 0 ]; then
 else
   bad "$STRAGGLERS process(es) survived session shutdown"
   pgrep -af "$(vb vantage-wm)|$(vb vantage-session)|$(vb vantage-panel)" 2>/dev/null | head -5
+fi
+
+# GPU-import honesty gate: while dmabuf IS advertised (self-test
+# passed), no client buffer may hit the failed-import path — a zombie
+# buffer means a GPU window painted EMPTY (black), the exact class the
+# NVIDIA machine hit. Surface it as a first-class failure instead of
+# a cascade of downstream mystery failures.
+if ! grep -q "linux-dmabuf global stays unadvertised" "$WORK/wm.log" 2>/dev/null; then
+  if grep -qE "buffer import FAILED|maps with empty content" \
+      "$WORK/wm.log" "$SESS_LOG" 2>/dev/null; then
+    bad "GPU buffer import failure logged while dmabuf was advertised (zombie buffers → black windows)"
+  else
+    ok "zero GPU buffer import failures across the whole run"
+  fi
 fi
 
 rm -f /tmp/vantage-wayland.ppm
