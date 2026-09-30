@@ -93,7 +93,10 @@ vp_ipc_t *vp_ipc_connect(const char *path) {
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+    /* sun_path is 108 bytes; a longer runtime path cannot be
+     * represented — fail loudly instead of silently truncating. */
+    if (strlen(path) >= sizeof(addr.sun_path)) { close(fd); return NULL; }
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%.107s", path);
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         close(fd);
         return NULL;

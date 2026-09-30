@@ -382,6 +382,13 @@ if [ -n "$WID" ]; then
   read -r MX MY MW MH <<< "$(echo "$MAXGEO" | sed -E 's/.*\t(-?[0-9]+)\t(-?[0-9]+)\t([0-9]+)\t([0-9]+)$/\1 \2 \3 \4/')"
   XDIM=$(xdpyinfo 2>/dev/null | grep -m1 dimensions | grep -oE '[0-9]+x[0-9]+' | head -1)
   SW=${XDIM%x*}; SH=${XDIM#*x}
+  # xdpyinfo is optional (not installed in every environment): the
+  # harness itself starts Xvfb at a KNOWN size — use it as the source
+  # of truth when the tool is missing, so screen-relative geometry
+  # checks never compare against a 0x0 default.
+  if [ -z "$SW" ] || [ -z "$SH" ]; then
+    SW=1024; SH=768
+  fi
   if [ "${MY:-999}" -ge 60 ] && [ "${MW:-0}" -gt 500 ] && \
      [ "${MW:-0}" -le "${SW:-9999}" ] && [ "$((MY + MH))" -le "${SH:-9999}" ]; then
     ok "maximized client below the panel, frame on screen (${MW}x${MH} at +${MX}+${MY})"
@@ -390,6 +397,30 @@ if [ -n "$WID" ]; then
   fi
   "$(vb vantage-remote)" unmaximize "$WID" >/dev/null 2>&1
   sleep 0.4
+  # fullscreen through the same IPC path: RAW OUTPUT semantics — the
+  # window covers the WHOLE screen (panel included), no resize areas,
+  # no black bands. Then unfullscreen restores the previous geometry.
+  "$(vb vantage-remote)" fullscreen "$WID" >/dev/null 2>&1
+  sleep 0.5
+  FSGEO=$("$(vb vantage-remote)" list 2>/dev/null | grep "Vantage Test" \
+            | head -1)
+  read -r FSX FSY FSW FSH <<< "$(echo "$FSGEO" | sed -E 's/.*\t(-?[0-9]+)\t(-?[0-9]+)\t([0-9]+)\t([0-9]+)$/\1 \2 \3 \4/')"
+  if [ "${FSX:-999}" -le 1 ] && [ "${FSY:-999}" -le 1 ] && \
+     [ "${FSW:-0}" -ge "$((SW - 2))" ] && [ "${FSH:-0}" -ge "$((SH - 2))" ]; then
+    ok "fullscreen covers the whole output (${FSW}x${FSH} at +${FSX}+${FSY}, panel covered)"
+  else
+    bad "fullscreen geometry wrong: ${FSW:-?}x${FSH:-?} at +${FSX:-?}+${FSY:-?} (screen ${SW:-?}x${SH:-?})"
+  fi
+  "$(vb vantage-remote)" unfullscreen "$WID" >/dev/null 2>&1
+  sleep 0.4
+  UFSGEO=$("$(vb vantage-remote)" list 2>/dev/null | grep "Vantage Test" \
+             | head -1)
+  read -r UFX UFY UFW UFH <<< "$(echo "$UFSGEO" | sed -E 's/.*\t(-?[0-9]+)\t(-?[0-9]+)\t([0-9]+)\t([0-9]+)$/\1 \2 \3 \4/')"
+  if [ "${UFH:-999}" -lt "${SH:-0}" ] && [ "${UFW:-0}" -gt 100 ]; then
+    ok "unfullscreen restores a windowed geometry (${UFW}x${UFH} at +${UFX}+${UFY})"
+  else
+    bad "unfullscreen left it fullscreen: ${UFW:-?}x${UFH:-?}"
+  fi
   "$(vb vantage-remote)" close "$WID" >/dev/null 2>&1 \
     && ok "IPC close works" || bad "IPC close failed"
   sleep 0.3
@@ -507,6 +538,133 @@ grep -q "post-altclick-motion=[1-9]" "$FREEZE_LOG" \
   && ok "pointer alive after Alt+click on a fullscreen window" \
   || bad "pointer FROZEN after Alt+click on fullscreen: $(cat "$FREEZE_LOG")"
 [ $FRZRC -eq 0 ] && ok "nofreeze probe exit status 0" || bad "nofreeze probe rc=$FRZRC"
+
+echo "== harness-xvfb: GLX direct rendering (the games-launch contract) =="
+if [ -x "$(tc vt-glx-probe)" ]; then
+  GLX_LOG="$WORK/glx.log"
+  # the PROBE is a third-party-linked client (libGLX, fontconfig):
+  # their exit-time one-shot allocations are LSan noise, not ours —
+  # leak-check stays ON for the session/compositor processes.
+  ASAN_OPTIONS=detect_leaks=0 timeout 20 "$(tc vt-glx-probe)" 10 --query > "$GLX_LOG" 2>&1
+  GLXRC=$?
+  grep -q "context created (DIRECT)" "$GLX_LOG" \
+    && ok "GLX direct context created (games can render)" \
+    || bad "no direct GLX context: $(tail -2 "$GLX_LOG")"
+  grep -q "frames swapped; map-notify=1" "$GLX_LOG" \
+    && ok "GLX window mapped + frames swapped (WM frames GL visuals fine)" \
+    || bad "GLX window/swap failed: $(tail -2 "$GLX_LOG")"
+  [ $GLXRC -eq 0 ] && ok "glx probe exit status 0" || bad "glx probe rc=$GLXRC"
+else
+  echo "  (vt-glx-probe not built — GLX check skipped)"
+fi
+
+echo "== harness-xvfb: window resize (frame edges + corner, XTest drag) =="
+if [ -x "$(tc vt-x11-resize-probe)" ]; then
+  RS_LOG="$WORK/resize.log"
+  timeout 30 "$(tc vt-x11-resize-probe)" > "$RS_LOG" 2>&1
+  RSRC=$?
+  grep -q "framed=yes" "$RS_LOG" \
+    && ok "plain window gets the SSD frame" \
+    || bad "window not framed: $(cat "$RS_LOG")"
+  grep -q "edge-resize=ok" "$RS_LOG" \
+    && ok "frame-edge drag resizes the window" \
+    || bad "edge resize failed: $(cat "$RS_LOG")"
+  grep -q "corner-resize=ok" "$RS_LOG" \
+    && ok "corner drag resizes BOTH axes (diagonal)" \
+    || bad "corner resize failed: $(cat "$RS_LOG")"
+  grep -q "csd-framed=no" "$RS_LOG" \
+    && ok "CSD window (MOTIF decorations=0) gets NO second frame" \
+    || bad "CSD window double-decorated: $(grep csd "$RS_LOG")"
+  grep -q "csd-moveresize=ok" "$RS_LOG" \
+    && ok "CSD _NET_WM_MOVERESIZE drag resizes both axes (browser resize)" \
+    || bad "CSD moveresize failed: $(grep csd "$RS_LOG")"
+  [ $RSRC -eq 0 ] && ok "resize probe exit status 0" || bad "resize probe rc=$RSRC"
+else
+  echo "  (vt-x11-resize-probe not built — resize check skipped)"
+fi
+
+echo "== harness-xvfb: browser context-menu workflow (CSD app, XTest) =="
+if [ -x "$(tc gtk4-csd-menu-probe)" ] && [ -x "$(tc vt-xtest-drive)" ] && \
+   [ -x "$(tc vt-x11-wintree)" ]; then
+  CSD_LOG="$WORK/csd-menu.log"
+  # GTK4/fontconfig exit-time allocations are LSan noise (client-side);
+  # the verdict line is fflush'd so it survives any sanitizer exit path.
+  GTK_A11Y=none ASAN_OPTIONS=detect_leaks=0 timeout -k 2 40 "$(tc gtk4-csd-menu-probe)" --wait 32 > "$CSD_LOG" 2>&1 &
+  CSD_PID=$!
+  sleep 3
+  DRV="$(tc vt-xtest-drive)"
+  # locate the probe window from the tree (geometry line: 0xID WxH+X+Y ...)
+  read -r CWD CHT CWX CWY <<< "$("$(tc vt-x11-wintree)" 2>/dev/null | grep 'CSD Menu Probe' | head -1 | sed -E 's/^ *0x[0-9a-f]+ ([0-9]+)x([0-9]+)\+([0-9]+)\+([0-9]+).*/\1 \2 \3 \4/')"
+  if ! [[ "$CWD" =~ ^[0-9]+$ ]] || ! [[ "$CWX" =~ ^[0-9]+$ ]]; then
+    # window not found: assume WM placement below the panel, centered
+    CWD=500; CHT=350; CWX=262; CWY=60
+  fi
+  echo "  (probe window ${CWD}x${CHT}+${CWX}+${CWY})"
+  MCX=$((CWX + CWD / 2)); MCY=$((CWY + CHT / 2 - 40))
+  # 1. text-selection drag
+  "$DRV" drag 1 $((MCX - 60)) $((MCY)) $((MCX + 40)) $((MCY + 20)) 300 >/dev/null 2>&1
+  sleep 0.5
+  # 2. right-click -> menu (popover opens at/just below the click point)
+  "$DRV" click 3 "$MCX" "$MCY" >/dev/null 2>&1
+  sleep 1.2
+  grep -q "menu-popup" "$CSD_LOG" \
+    && ok "right-click opens the context menu (delivered to CSD window)" \
+    || bad "no context menu on right-click: $(tail -3 "$CSD_LOG")"
+  # 3. click the first menu item (Copy) — popover top row
+  "$DRV" click 1 $((MCX)) $((MCY + 30)) >/dev/null 2>&1
+  sleep 1.0
+  grep -q "menu-activate 'copy'" "$CSD_LOG" \
+    && ok "menu item Copy ACTIVATES (context menu works end to end)" \
+    || bad "menu item did not activate: $(grep -c menu-activate "$CSD_LOG") activations"
+  # 4. second right-click + Paste
+  "$DRV" click 3 "$MCX" "$MCY" >/dev/null 2>&1
+  sleep 1.0
+  "$DRV" click 1 $((MCX)) $((MCY + 65)) >/dev/null 2>&1
+  sleep 1.0
+  grep -q "menu-activate 'paste'" "$CSD_LOG" \
+    && ok "second menu: Paste item ACTIVATES (menus keep working)" \
+    || bad "second menu item did not activate"
+  # 5. dismiss by clicking outside
+  "$DRV" click 3 "$MCX" "$MCY" >/dev/null 2>&1
+  sleep 0.8
+  "$DRV" click 1 $((CWX + 20)) $((CWY + CHT - 20)) >/dev/null 2>&1
+  sleep 1.0
+  # 6. liveness across the whole workflow
+  wait $CSD_PID 2>/dev/null
+  CSDRC=$?
+  grep -q "FREEZE-CHECK-OK" "$CSD_LOG" \
+    && ok "app main loop survived all menus (no context-menu freeze)" \
+    || bad "CSD app FROZE after context menu (kill needed)"
+  [ "$CSDRC" -eq 0 ] && ok "csd-menu probe exit status 0" || bad "csd-menu probe rc=$CSDRC"
+else
+  echo "  (gtk4-csd-menu-probe not built — CSD menu check skipped)"
+fi
+
+echo "== harness-xvfb: XI2 event delivery (the GDK4/Firefox input path) =="
+if [ -x "$(tc vt-xi2-event-probe)" ] && [ -x "$(tc vt-xtest-drive)" ]; then
+  XI_LOG="$WORK/xi2.log"
+  "$(tc vt-xi2-event-probe)" 8 > "$XI_LOG" 2>&1 &
+  XI_PID=$!
+  sleep 2
+  "$(tc vt-xtest-drive)" click 1 300 300 > /dev/null 2>&1
+  sleep 0.3
+  "$(tc vt-xtest-drive)" click 3 300 300 > /dev/null 2>&1
+  sleep 0.3
+  "$(tc vt-xtest-drive)" drag 1 300 300 400 350 400 > /dev/null 2>&1
+  wait $XI_PID 2>/dev/null
+  grep -q "press B=3" "$XI_LOG" \
+    && ok "right-clicks delivered to XI2 clients (context menus work)" \
+    || bad "right-click missing on XI2 path: $(tail -2 "$XI_LOG")"
+  grep -qE "release B=1 [0-9]+/[0-9]+" "$XI_LOG" \
+    && ok "button releases delivered (no stuck-grab freeze)" \
+    || bad "button release missing: $(tail -2 "$XI_LOG")"
+  EVENTS=$(grep -o 'events=[0-9]*' "$XI_LOG" | cut -d= -f2)
+  [ -n "$EVENTS" ] && [ "$EVENTS" -ge 6 ] \
+    && ok "XI2 press/release/motion stream complete ($EVENTS events)" \
+    || bad "XI2 event stream incomplete ($EVENTS events)"
+else
+  echo "  (vt-xi2-event-probe not built — XI2 check skipped)"
+fi
 
 echo "== harness-xvfb: continuous geometry feed during a drag (~30 fps) =="
 # The pager's live feed — the X11 twin of the Wayland geo-flow probe,

@@ -74,7 +74,10 @@ typedef struct _wl_surf {
                                        needed to deliver the configure
                                        batch after layer get_popup) */
     struct wl_list link;              /* stacking (head = bottom) */
-    struct wl_list frame_cbs;         /* pending wl_callback */
+    /* frame callbacks (wl_surface.frame) are tracked GLOBALLY in
+     * _wl_state_t.frame_cbs — see _fire_frame_callbacks in the backend.
+     * A per-surface list stranded the callbacks of unmapped/dying
+     * surfaces and coupled their delivery to repaints. */
     /* xdg_surface.set_window_geometry: the window rect inside the
      * buffer (CSD shadows live in the buffer but outside the geometry).
      * SET, never accumulated — accumulating made windows drift across
@@ -197,6 +200,20 @@ typedef struct {
     struct wl_global *ddm_g;
     struct wl_listener client_created;
     struct wl_list surfaces;          /* bottom→top */
+    /* pending wl_surface.frame callbacks, ALL surfaces — fired every
+     * loop tick by _fire_frame_callbacks (the loop is the frame clock) */
+    struct wl_list frame_cbs;
+    uint64_t last_fire_us;             /* frame-clock pacing stamp */
+    /* callback resources already FIED (done sent) whose server-side
+     * destruction is DEFERRED one loop tick: destroying in the same
+     * iteration as the done puts done+delete_id into one client
+     * dispatch batch, and libwayland processes the display queue
+     * first — the callback proxy is finalized by delete_id BEFORE the
+     * done is dispatched, and clients that destroy the callback inside
+     * their done handler (weston's toy toolkit) never see the event:
+     * their animation loop dies after one frame. One tick of deferral
+     * matches the repaint-cycle timing of reference compositors. */
+    struct wl_list retired_cbs;
     vt_backend_t *backend_self;       /* for event emission */
     void *user_data;                  /* wm host pointer */
     /* output */
@@ -288,6 +305,14 @@ typedef struct {
     int op_grab_x, op_grab_y;
     int op_start_x, op_start_y;        /* surface origin at grab (edge math) */
     int op_start_w, op_start_h;
+    /* the LAST CONFIGURE-SIDE size of the running resize — CONTENT
+     * units, never the surface's live buffer size. The release-time
+     * final configure must send the content math: by release, the
+     * client has already re-committed its buffer (content + CSD
+     * shadow margins), so re-reading os->w then sends BUFFER dims and
+     * the toolkit applies them as its new CONTENT size — every edge
+     * drag grew CSD windows by the margin width (+28/+29 per drag). */
+    int op_last_cw, op_last_ch;
     uint64_t op_last_geo_us;           /* geometry-event throttle stamp */
 
     /* IMPLICIT POINTER GRAB: which surface received the last forwarded
@@ -428,6 +453,32 @@ void _xwl_minimize(_wl_surf_t *s, bool on);
 void _xwl_set_workspace(_wl_surf_t *s, int ws);
 int  _xwl_ws_switch(int ws);
 void _xwl_workspace_changed(_wl_state_t *st);
+
+/* ------------------------------------------------------ linux-dmabuf */
+/* Implemented in vt-wl-dmabuf.c (VT_HAVE_LINUX_DMABUF): the GPU-client
+ * buffer path — zwp_linux_dmabuf_v1 v4 with EGL import + readback.
+ * Fails soft: when the EGL import engine is unavailable the global is
+ * not advertised and clients keep using wl_shm. */
+#if defined(VT_HAVE_LINUX_DMABUF)
+bool _dmabuf_globals_create(_wl_state_t *st);
+void _dmabuf_globals_destroy(_wl_state_t *st);
+/* Is this wl_buffer resource a dma-buf buffer of ours, and (if so)
+ * read its pixels back into ARGB8888 storage. The CALLER owns dest and
+ * keeps the copy — mirroring the shm commit path, the buffer is then
+ * released immediately. */
+bool _dmabuf_commit_pixels(struct wl_resource *buf_res, uint32_t *dest,
+                           int dest_stride_u32, int32_t *out_w,
+                           int32_t *out_h);
+void _dmabuf_log_stats(void);
+#else
+static inline bool _dmabuf_globals_create(_wl_state_t *st) { (void)st; return false; }
+static inline void _dmabuf_globals_destroy(_wl_state_t *st) { (void)st; }
+static inline bool _dmabuf_commit_pixels(struct wl_resource *r, uint32_t *d,
+                                          int s, int32_t *w, int32_t *h) {
+    (void)r; (void)d; (void)s; (void)w; (void)h; return false;
+}
+static inline void _dmabuf_log_stats(void) {}
+#endif
 
 /* ------------------------------------------------- staging protocols */
 /* Implemented in vt-wl-protocols.c: cursor-shape-v1 (server-side

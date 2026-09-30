@@ -33,6 +33,7 @@
 
 /* _GNU_SOURCE (memfd_create) is provided by the build (meson) */
 #define VT_LOG_DOMAIN "backend-wayland"
+#include <stddef.h>
 #include <vantage/vt-backend.h>
 #include <vantage/vt-seat.h>
 #include <vantage/vt-kms.h>
@@ -286,21 +287,135 @@ static void _surf_damage(struct wl_client *cli, struct wl_resource *res,
     if (_wls) _wls->dirty = true;
 }
 
+/* --- ultra-cheap frame tracing (SHARED-MMAP ring, ZERO syscalls) -------
+ * ANY syscall (even a 2-byte write) in the commit/paint path perturbs
+ * timing enough to HIDE the frame-callback freeze. This variant writes
+ * plain bytes into an mmap'd file: no syscall at all per event, so the
+ * bug stays visible while we watch what actually happens.
+ * Enabled with VANTAGE_FRAME_TRACE=/path; off by default, free when off. */
+static char *_ftrace_map = NULL;
+static size_t _ftrace_pos = 0, _ftrace_cap = 0;
+static void _ftrace_init(void) {
+    const char *p = getenv("VANTAGE_FRAME_TRACE");
+    if (!p || !*p) return;
+    int fd = open(p, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) return;
+    if (ftruncate(fd, 1 << 20) < 0) { close(fd); return; }
+    _ftrace_map = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE,
+                       MAP_SHARED, fd, 0);
+    _ftrace_cap = _ftrace_map != MAP_FAILED ? (1 << 20) : 0;
+    if (_ftrace_map == MAP_FAILED) _ftrace_map = NULL;
+    close(fd);
+}
+static void _ftrace(char c) {
+    static int _inited = 0;
+    if (!_inited) { _inited = 1; _ftrace_init(); }
+    if (_ftrace_map && _ftrace_pos + 1 < _ftrace_cap) {
+        _ftrace_map[_ftrace_pos++] = c;
+        _ftrace_map[_ftrace_pos] = '\n';
+    }
+}
+
+/* Fire all pending frame callbacks with the current frame time.
+ *
+ * ARCHITECTURE (the browser-stuck-on-one-frame fix): callbacks live on
+ * a GLOBAL list, not per-surface — a surface that nil-commits (unmaps)
+ * or dies with a pending callback must never strand the client waiting
+ * for a done that can no longer be sent (toolkits pace their whole
+ * render loop off wl_surface.frame; one lost done freezes them after a
+ * single frame — reproduced with weston-simple-damage and, on real
+ * hardware, with the browser).
+ *
+ * They fire EVERY loop tick (the loop is the frame clock), not only on
+ * dirty paints: a client that committed while the compositor had
+ * nothing to repaint still gets its done on the next tick, and the
+ * done reaches the wire in the SAME iteration because _wl_dispatch
+ * flushes clients AFTER the callbacks are marshaled. The old order
+ * (flush → paint → done) left every fired callback sitting in the
+ * connection output buffer for a full 20ms iteration — and under a
+ * timing race the buffered event could be lost outright, freezing the
+ * client forever (Send-Q empty, client in poll(-1), compositor looping
+ * idle). */
+static void _fire_frame_callbacks(_wl_state_t *st) {
+    if (!st) return;
+    /* FIRST: destroy last tick's FIRED callback resources. Deferring
+     * the destruction one full loop tick keeps done and delete_id out
+     * of the same client dispatch batch — libwayland dispatches the
+     * display queue (delete_id) before the default queue (done), so a
+     * same-batch delete_id finalizes the callback proxy and the done
+     * event never reaches the client's listener. weston's toy toolkit
+     * destroys the callback INSIDE its done handler; never seeing the
+     * done killed its animation after exactly one frame. */
+    while (!wl_list_empty(&st->retired_cbs)) {
+        _cb_node_t *rn = (_cb_node_t *)(void *)(
+            (char *)st->retired_cbs.next - offsetof(_cb_node_t, link));
+        wl_resource_destroy(rn->cb);   /* destructor unlinks + frees */
+    }
+    if (wl_list_empty(&st->frame_cbs)) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now_us = (uint64_t)ts.tv_sec * 1000000 +
+                      (uint64_t)ts.tv_nsec / 1000;
+    /* pace: this IS the compositor's frame clock. Clients pace their
+     * whole render loop off wl_surface.frame — firing as fast as their
+     * commits arrive lets animation clients busy-spin (measured 1100
+     * redraws/s, a full core burned, before this cap). ~60Hz floor,
+     * tunable via VANTAGE_FRAME_INTERVAL_US. */
+    uint64_t min_us = 15000;
+    const char *p = getenv("VANTAGE_FRAME_INTERVAL_US");
+    if (p && *p) {
+        long v = atol(p);
+        if (v > 0 && v < 1000000) min_us = (uint64_t)v;
+    }
+    if (st->last_fire_us && now_us - st->last_fire_us < min_us)
+        return;
+    st->last_fire_us = now_us;
+    uint32_t msec = (uint32_t)(now_us / 1000);
+    _cb_node_t *n, *tmp;
+    wl_list_for_each_safe(n, tmp, &st->frame_cbs, link) {
+        _ftrace('F');
+        wl_callback_send_done(n->cb, msec);
+        /* RETIRE instead of destroying: the resource dies next tick
+         * (see the head of this function). The node keeps the
+         * resource destructor as its cleanup path either way. */
+        wl_list_remove(&n->link);
+        wl_list_insert(st->retired_cbs.prev, &n->link);
+    }
+}
+
+/* wl_callback resource destructor: owns the pending-node cleanup for
+ * BOTH the normal fire path and client death (libwayland destroys the
+ * resources of a disconnecting client — the nodes must not outlive
+ * them, or the next fire would marshal into freed memory). */
+static void _cb_res_destroy(struct wl_resource *res) {
+    _cb_node_t *n = wl_resource_get_user_data(res);
+    if (!n) return;
+    wl_list_remove(&n->link);
+    vt_free(n);
+}
+
 static void _surf_frame(struct wl_client *cli, struct wl_resource *res,
                         uint32_t callback_id) {
     _wl_surf_t *s = wl_resource_get_user_data(res);
+    _wl_state_t *st = _wls;
+    if (!st) return;
+    (void)s;
     struct wl_resource *cb = wl_resource_create(cli, &wl_callback_interface,
                                                  1, callback_id);
     if (!cb) { wl_client_post_no_memory(cli); return; }
     _cb_node_t *node = vt_malloc0(sizeof(*node));
     node->cb = cb;
-    wl_list_insert(&s->frame_cbs, &node->link);
+    wl_list_insert(st->frame_cbs.prev, &node->link);
+    /* event-only resource: no request implementation, the node is the
+     * user data, the destructor owns the unlink */
+    wl_resource_set_implementation(cb, NULL, node, _cb_res_destroy);
 }
 
 static void _surf_commit(struct wl_client *cli, struct wl_resource *res) {
     (void)cli;
     _wl_surf_t *s = wl_resource_get_user_data(res);
     _wl_state_t *st = _wls;
+    _ftrace('C');
     if (!st) return;
 
     if (s->buf_res) {
@@ -346,15 +461,45 @@ static void _surf_commit(struct wl_client *cli, struct wl_resource *res) {
             }
             wl_buffer_send_release(s->buf_res);
         } else {
-            /* Not a shm buffer (EGL/dmabuf): we advertise no
-             * linux-dmabuf/wl_drm, so this should not happen — say so
-             * loudly instead of silently painting garbage. */
-            static bool warned_nonshm = false;
-            if (!warned_nonshm) {
-                warned_nonshm = true;
-                vt_logw("wayland: client committed a non-shm buffer — "
-                        "only wl_shm buffers are composited");
+            /* Non-shm buffer: a GPU client's dma-buf (zwp_linux_dmabuf_v1)
+             * — import ladder + readback lives in vt-wl-dmabuf.c. Same
+             * contract as the shm path: WE own the copied pixels, the
+             * buffer is released right away, the client never stalls.
+             * GPU apps render on the REAL driver; we read the result. */
+            int32_t dw = 0, dh = 0;
+            bool ok = _dmabuf_commit_pixels(s->buf_res, NULL, 0, &dw, &dh);
+            if (ok && dw > 0 && dh > 0) {
+                size_t need = (size_t)dw * (size_t)dh;
+                if (!s->own || s->own_cap < need) {
+                    vt_free(s->own);
+                    s->own_cap = need + need / 2;
+                    s->own = vt_malloc(sizeof(uint32_t) * s->own_cap);
+                }
+                if (s->own &&
+                    _dmabuf_commit_pixels(s->buf_res, s->own, dw,
+                                          &dw, &dh)) {
+                    s->pixels = s->own;
+                    s->w = dw;
+                    s->h = dh;
+                    s->buf_w = dw;
+                    s->buf_h = dh;
+                    s->stride = dw;
+                } else {
+                    ok = false;
+                }
             }
+            if (!ok) {
+                static bool warned_nonshm = false;
+                if (!warned_nonshm) {
+                    warned_nonshm = true;
+                    vt_logw("wayland: client committed a buffer we cannot "
+                            "import (non-shm, import failed) — it will "
+                            "fall back to wl_shm");
+                }
+            }
+            /* release in ALL cases: withholding it would deadlock the
+             * client's buffer cycling (two commits and it stalls) */
+            wl_buffer_send_release(s->buf_res);
         }
         s->buf_res = NULL;
     } else if (s->attach_pending) {
@@ -526,6 +671,17 @@ static void _surf_commit(struct wl_client *cli, struct wl_resource *res) {
             _kbd_enter_focus(st, s);
             _activate_toplevel(_wls, s->toplevel);
         }
+        /* POINTER focus must be recomputed at MAP: a window that
+         * appears under the stationary pointer owns it from now on.
+         * Nothing ever did this — wl_pointer.enter was only sent when
+         * the pointer PHYSICALLY moved, so a freshly-mapped window
+         * under the cursor got no pointer enter at all. Toolkits that
+         * wake their redraw pipeline on display events (weston's toy
+         * toolkit: frame-callback → schedule-redraw idle → the idle
+         * runs only when the event loop wakes) then froze after their
+         * FIRST frame — weston-flower stopped animating exactly here,
+         * with the pointer sitting inside it and no enter delivered. */
+        _pointer_focus_update(st, false);
         _wls->dirty = true;
     } else if (s->mapped && s->w > 0) {
         _wls->dirty = true;
@@ -583,6 +739,7 @@ static void _surf_set_input(struct wl_client *cli,
     (void)cli;
     _wl_surf_t *s = wl_resource_get_user_data(res);
     if (!s) return;
+
     /* drop the previous region (both arrays) */
     vt_free(s->in_adds); vt_free(s->in_subs);
     s->in_adds = NULL; s->in_subs = NULL;
@@ -824,7 +981,6 @@ static void _compositor_create_surface(struct wl_client *cli,
     (void)res;
     _wl_surf_t *s = vt_malloc0(sizeof(*s));
     if (!s) { wl_client_post_no_memory(cli); return; }
-    wl_list_init(&s->frame_cbs);
     wl_list_init(&s->subs);
     wl_list_init(&s->sub_link);
     struct wl_resource *sr = wl_resource_create(cli, &wl_surface_interface,
@@ -1563,6 +1719,8 @@ static void _toplevel_resize(struct wl_client *cli,
         _wls->op_start_y = t->surf->y;
         _wls->op_start_w = _surf_cw(t->surf);
         _wls->op_start_h = _surf_ch(t->surf);
+        _wls->op_last_cw = _wls->op_start_w;
+        _wls->op_last_ch = _wls->op_start_h;
         _wls->op_last_geo_us = 0;
         t->resizing = true;
     }
@@ -1667,46 +1825,63 @@ static void _toplevel_unmaximize(struct wl_client *cli,
 }
 static void _toplevel_fullscreen(struct wl_client *cli,
                                  struct wl_resource *res,
-                                 struct wl_resource *output) {
-    (void)cli; (void)output;
-    _xdg_toplevel_t *t = wl_resource_get_user_data(res);
+                                 struct wl_resource *output);
+static void _toplevel_unfullscreen(struct wl_client *cli,
+                                   struct wl_resource *res);
+
+/* Fullscreen state application — shared by the client-driven request
+ * path (xdg_toplevel.set_fullscreen) and the WM/taskbar-driven path
+ * (backend op fullscreen_window: IPC "vantage-remote fullscreen <id>").
+ * The WM path used to only flip MODEL flags — the pager showed a
+ * fullscreen window while nothing happened on screen (and the old
+ * harness never noticed because no check covered it). */
+static void _wl_fullscreen_apply(_xdg_toplevel_t *t, bool on) {
     if (!t || !t->surf || !_wls) return;
     _wl_surf_t *s = t->surf;
-    if (t->fullscreen) {
+    if (on) {
+        if (t->fullscreen) {
+            _toplevel_configure(t, _wls->out_w, _wls->out_h,
+                                XDG_TOPLEVEL_STATE_FULLSCREEN);
+            return;
+        }
+        t->prev_x = s->x; t->prev_y = s->y;
+        t->prev_w = s->w; t->prev_h = s->h;
+        t->fullscreen = true;
+        /* the CONTENT rect covers the output: a fullscreen CSD window
+         * whose buffer still carries shadow margins would otherwise
+         * show them as black edges of the display (the reported
+         * "browser ends up with a black portion of the screen in
+         * fullscreen"). */
+        int gx = s->have_win_geo ? s->win_gx : 0;
+        int gy = s->have_win_geo ? s->win_gy : 0;
+        s->x = -gx;
+        s->y = -gy;
         _toplevel_configure(t, _wls->out_w, _wls->out_h,
                             XDG_TOPLEVEL_STATE_FULLSCREEN);
-        return;
+    } else {
+        if (!t->fullscreen) return;
+        t->fullscreen = false;
+        s->x = t->prev_x;
+        s->y = t->prev_y;
+        _toplevel_configure(t, 0, 0, 0);
     }
-    t->prev_x = s->x; t->prev_y = s->y;
-    t->prev_w = s->w; t->prev_h = s->h;
-    t->fullscreen = true;
-    /* the CONTENT rect covers the output: a fullscreen CSD window
-     * whose buffer still carries shadow margins would otherwise show
-     * them as black edges of the display (the reported "browser ends
-     * up with a black portion of the screen in fullscreen"). */
-    int gx = s->have_win_geo ? s->win_gx : 0;
-    int gy = s->have_win_geo ? s->win_gy : 0;
-    s->x = -gx;
-    s->y = -gy;
-    _toplevel_configure(t, _wls->out_w, _wls->out_h,
-                        XDG_TOPLEVEL_STATE_FULLSCREEN);
     _emit_win(_wls, VT_BACKEND_WL_EVENT_WIN_STATE, t);
     _emit_win(_wls, VT_BACKEND_WL_EVENT_WIN_GEOMETRY, t);
     _wls->dirty = true;
+}
+
+static void _toplevel_fullscreen(struct wl_client *cli,
+                                 struct wl_resource *res,
+                                 struct wl_resource *output) {
+    (void)cli; (void)output;
+    _xdg_toplevel_t *t = wl_resource_get_user_data(res);
+    _wl_fullscreen_apply(t, true);
 }
 static void _toplevel_unfullscreen(struct wl_client *cli,
                                    struct wl_resource *res) {
     (void)cli;
     _xdg_toplevel_t *t = wl_resource_get_user_data(res);
-    if (!t || !t->surf || !_wls) return;
-    _wl_surf_t *s = t->surf;
-    t->fullscreen = false;
-    s->x = t->prev_x;
-    s->y = t->prev_y;
-    _toplevel_configure(t, 0, 0, 0);
-    _emit_win(_wls, VT_BACKEND_WL_EVENT_WIN_STATE, t);
-    _emit_win(_wls, VT_BACKEND_WL_EVENT_WIN_GEOMETRY, t);
-    _wls->dirty = true;
+    _wl_fullscreen_apply(t, false);
 }
 static void _toplevel_set_minimized(struct wl_client *cli,
                                     struct wl_resource *res) {
@@ -3144,6 +3319,19 @@ static _wl_surf_t *_surface_at(_wl_state_t *st, int x, int y) {
 
 void _pointer_focus_update(_wl_state_t *st, bool force) {
     _wl_surf_t *s = _surface_at(st, st->cursor_x, st->cursor_y);
+    /* INTERACTIVE OP GRAB: while a move/resize op runs on a surface,
+     * the pointer focus is PINNED to it. The op is an implicit grab —
+     * the pointer may travel outside the client's last-committed
+     * input region (a resize GROWS the window under the drag; the
+     * client re-commits the matching region only after applying the
+     * configure). Recomputing the focus mid-op sent wl_pointer.leave
+     * to the resizing client and its toolkit then dropped the
+     * drag-ending button release as out-of-order — the button state
+     * stuck DOWN, the next click read as a double-press and GTK's
+     * margin gestures wedged after every edge resize. */
+    if (st->op_active && st->op_surf && st->op_surf->res &&
+        st->op_surf->mapped && !st->op_surf->minimized)
+        s = st->op_surf;
     if (s == st->ptr_focus && !force) return;
     /* leave old */
     if (st->ptr_focus && st->ptr_focus->res) {
@@ -3384,6 +3572,11 @@ static void _pointer_motion(_wl_state_t *st, double dx, double dy) {
                 if (st->op_edges & 8) y += h - t->max_h;
                 h = t->max_h;
             }
+            /* remember the configure-side CONTENT size for the
+             * release-time final configure (os->w is the live BUFFER
+             * size once the client re-commits — see op_last_cw) */
+            st->op_last_cw = w;
+            st->op_last_ch = h;
             os->w = w;
             os->h = h;
             os->x = x;
@@ -3481,12 +3674,23 @@ static void _pointer_button(_wl_state_t *st, uint32_t button,
                 /* the FINAL resize configure — with the complete
                  * handshake this is what actually lands the new size
                  * in a real toolkit (mid-drag configures are throttled
-                 * and may have skipped the last few pixels). */
+                 * and may have skipped the last few pixels). Send the
+                 * CONTENT math recorded by _op_motion (op_last_cw/ch):
+                 * re-reading op_surf->w here sends the client's live
+                 * BUFFER dims (content + CSD margins) — every CSD
+                 * edge-drag then grew the window by its shadow
+                 * margins (+28/+29 observed with GTK4). */
+                int fw = (st->op_last_cw > 0) ? st->op_last_cw
+                                              : _surf_cw(st->op_surf);
+                int fh = (st->op_last_ch > 0) ? st->op_last_ch
+                                              : _surf_ch(st->op_surf);
                 if (t->res)
-                    _toplevel_configure(t, st->op_surf->w, st->op_surf->h,
+                    _toplevel_configure(t, fw, fh,
                                         t->activated
                                             ? XDG_TOPLEVEL_STATE_ACTIVATED
                                             : 0);
+                st->op_last_cw = 0;
+                st->op_last_ch = 0;
             }
         }
         st->op_active = false;
@@ -3521,6 +3725,38 @@ static void _pointer_button(_wl_state_t *st, uint32_t button,
             }
             if (top->mapped && !top->popup) break; /* top-most non-popup */
         }
+    }
+    /* RELEASE FORWARDING — under IMPLICIT-GRAB rules, and OUTSIDE the
+     * current-pointer-focus gate: a release belongs to the surface that
+     * received the PRESS (press_surf), never to whatever is under the
+     * cursor at release time. During an interactive resize the pointer
+     * can sit OUTSIDE the client's last-committed input region (the
+     * window is growing under the drag; the client re-commits the new
+     * region only after it applies the configure) — gating on
+     * ptr_focus then dropped the release on the floor, leaving the
+     * toolkit's button state stuck DOWN (the next click in the window
+     * arrived as a double-press and GTK's margin gestures wedged). */
+    if (!pressed) {
+        bool consumed = st->press_consumed;
+        _wl_surf_t *target = st->press_surf;
+        st->press_consumed = false;
+        st->press_surf = NULL;
+        if (consumed)
+            return;                   /* release pairs with a consumed press */
+        if (!target || !target->res)
+            return;                   /* no forwarded press ever happened */
+        _ptr_res_t *pr;
+        wl_list_for_each(pr, &st->ptr_reses, link) {
+            if (wl_resource_get_client(pr->res) ==
+                wl_resource_get_client(target->res)) {
+                wl_pointer_send_button(pr->res, ++st->serial, 0, button,
+                                       WL_POINTER_BUTTON_STATE_RELEASED);
+                if (wl_resource_get_version(pr->res) >=
+                    WL_POINTER_FRAME_SINCE_VERSION)
+                    wl_pointer_send_frame(pr->res);
+            }
+        }
+        return;
     }
     _wl_surf_t *s = st->ptr_focus;
     if (s && s->res) {
@@ -3569,6 +3805,8 @@ static void _pointer_button(_wl_state_t *st, uint32_t button,
                 st->op_start_y = s->y;
                 st->op_start_w = _surf_cw(s);
                 st->op_start_h = _surf_ch(s);
+                st->op_last_cw = st->op_start_w;
+                st->op_last_ch = st->op_start_h;
                 st->op_last_geo_us = 0;
                 st->press_consumed = true;
                 st->press_surf = NULL;
@@ -3656,6 +3894,8 @@ static void _pointer_button(_wl_state_t *st, uint32_t button,
                     st->op_start_y = s->y;
                     st->op_start_w = _surf_cw(s);
                     st->op_start_h = _surf_ch(s);
+                    st->op_last_cw = st->op_start_w;
+                    st->op_last_ch = st->op_start_h;
                     st->op_last_geo_us = 0;
                     if (s->toplevel && s->toplevel->res && !s->xwl) {
                         s->toplevel->resizing = true;
@@ -3681,34 +3921,6 @@ static void _pointer_button(_wl_state_t *st, uint32_t button,
                     return;
                 }
             }
-        }
-        /* FORWARD to the client — under IMPLICIT-GRAB rules:
-         * a PRESS marks the surface that owns the following release;
-         * a RELEASE goes ONLY to that surface's client (never to
-         * whatever is under the cursor at release time — that stray
-         * release was a real client-visible protocol bug), and a
-         * compositor-consumed press consumes its release too. */
-        if (!pressed) {
-            bool consumed = st->press_consumed;
-            _wl_surf_t *target = st->press_surf;
-            st->press_consumed = false;
-            st->press_surf = NULL;
-            if (consumed)
-                return;               /* release pairs with a consumed press */
-            if (!target || !target->res)
-                return;               /* no forwarded press ever happened */
-            _ptr_res_t *pr;
-            wl_list_for_each(pr, &st->ptr_reses, link) {
-                if (wl_resource_get_client(pr->res) ==
-                    wl_resource_get_client(target->res)) {
-                    wl_pointer_send_button(pr->res, ++st->serial, 0, button,
-                                           WL_POINTER_BUTTON_STATE_RELEASED);
-                    if (wl_resource_get_version(pr->res) >=
-                        WL_POINTER_FRAME_SINCE_VERSION)
-                        wl_pointer_send_frame(pr->res);
-                }
-            }
-            return;
         }
         st->press_surf = s;
         st->press_consumed = false;
@@ -4382,7 +4594,12 @@ void _ssd_paint(_wl_state_t *st, _wl_surf_t *s) {
     int fx, fy, fw, fh;
     _ssd_frame_geom(s, &fx, &fy, &fw, &fh);
     bool active = (st->kbd_focus == s);
-    uint32_t border = active ? 0xff4f9adc : 0xff26282e;
+    /* NEUTRAL focus styling: the active border is a slightly LIGHTER
+     * shade of the same graphite family, never a saturated accent —
+     * the old bright blue (0xff4f9adc) read as a glowing blue aura
+     * around active windows ("Mirage has a blue glow around the
+     * window"). Focus is conveyed by the title bar + text instead. */
+    uint32_t border = active ? 0xff3d4148 : 0xff26282e;
     uint32_t bar    = active ? 0xff2b2f36 : 0xff1a1c22;
     uint32_t fg     = active ? 0xffeceef0 : 0xff909399;
     uint32_t *fb = st->fb;
@@ -4690,6 +4907,7 @@ static void _blit_client(_wl_state_t *st, const _wl_surf_t *s,
 
 static void _paint(void) {
     _wl_state_t *st = _wls;
+    _ftrace(st && st->dirty ? 'P' : 'p');
     if (!st || !st->dirty) return;
     _paint_background(st);
     /* surfaces bottom→top (client windows; cursor surfaces skipped;
@@ -4736,19 +4954,8 @@ static void _paint(void) {
         _blit_client(st, s, x, y,
                      !(s->ssd && s->toplevel), s->ssd && s->toplevel);
     }
-    /* fire frame callbacks for EVERY surface (also hidden ones):
-     * clients that commit while on another workspace / minimized must
-     * not have their callbacks queue up forever — that stalls redraws
-     * and leaks callback objects. */
-    wl_list_for_each(s, &st->surfaces, link) {
-        _cb_node_t *n, *tmp;
-        wl_list_for_each_safe(n, tmp, &s->frame_cbs, link) {
-            wl_callback_send_done(n->cb, 0);
-            wl_resource_destroy(n->cb);
-            wl_list_remove(&n->link);
-            vt_free(n);
-        }
-    }
+    /* (frame callbacks fire from _wl_dispatch — see
+     * _fire_frame_callbacks) */
     /* Software cursor sprite — ONLY when the hardware cursor plane
      * is not already showing it. Drawing BOTH (the old "always blend
      * the sprite" belt-and-braces) double-blends the cursor's
@@ -4875,6 +5082,23 @@ static int _wl_maximize_window(vt_backend_t *self, uint64_t id, bool on) {
     return -1;
 }
 
+static int _wl_fullscreen_window(vt_backend_t *self, uint64_t id, bool on) {
+    _wl_state_t *st = self->priv;
+    if (!st) return -1;
+    _wl_surf_t *s;
+    wl_list_for_each(s, &st->surfaces, link) {
+        if (s->toplevel && s->toplevel->id == id) {
+            if (s->xwl) {
+                _xwl_fullscreen(s, on);
+                return 0;
+            }
+            _wl_fullscreen_apply(s->toplevel, on);
+            return 0;
+        }
+    }
+    return -1;
+}
+
 static int _wl_minimize_window(vt_backend_t *self, uint64_t id, bool on) {
     _wl_state_t *st = self->priv;
     if (!st) return -1;
@@ -4960,6 +5184,8 @@ static int _wl_init(vt_backend_t *self) {
     if (!st->display) { vt_free(st); return -1; }
     st->loop = wl_display_get_event_loop(st->display);
     wl_list_init(&st->surfaces);
+    wl_list_init(&st->frame_cbs);
+    wl_list_init(&st->retired_cbs);
     wl_list_init(&st->ptr_reses);
     wl_list_init(&st->kbd_reses);
     wl_list_init(&st->data_devs);
@@ -5321,6 +5547,12 @@ static int _wl_init(vt_backend_t *self) {
     /* staging protocols: cursor-shape, xdg-activation,
      * fractional-scale, toplevel-icon */
     _proto_globals_create(st);
+    /* linux-dmabuf: GPU client buffers (EGL import + readback). On real
+     * hardware this is what lets browsers/games render on the actual
+     * GPU — and what unblocks Xwayland glamor (hardware GLX for X11
+     * apps). Runs BEFORE _xwl_start so Xwayland sees the global at
+     * spawn time. */
+    _dmabuf_globals_create(st);
     /* Xwayland: X11 apps become first-class windows of this session */
     st->xwl_enabled = _xwl_start(st);
 
@@ -5342,6 +5574,7 @@ static int _wl_init(vt_backend_t *self) {
     }
     _paint();
     _present();
+    _dmabuf_log_stats();
     _stage_ok(14, "desktop painted %dx%d (%s), wallpaper background, "
               "cursor software sprite, layer-shell + Xwayland ready",
               st->out_w, st->out_h,
@@ -5366,6 +5599,7 @@ static void _wl_fini(vt_backend_t *self) {
     _xwl_stop(st);
     _layer_shell_global_destroy(st);
     _proto_globals_destroy(st);
+    _dmabuf_globals_destroy(st);
     _title_cache_free_all();
 #if defined(VT_HAVE_FREETYPE)
     _ssd_title_font_fini();
@@ -5410,11 +5644,19 @@ static int _wl_dispatch(vt_backend_t *self, int timeout_ms) {
         wl_event_loop_dispatch(st->loop, timeout_ms);
     else
         wl_event_loop_dispatch(st->loop, 0);
-    wl_display_flush_clients(st->display);
     /* Xwayland window events (MapRequest/properties/…) arrive on the
      * xcb connection, not the wayland loop — drain them here */
     _xwl_dispatch();
+    /* PAINT FIRST, then marshal frame callbacks, then FLUSH: every
+     * event generated this iteration (buffer releases during request
+     * dispatch, callback done below) hits the socket before the
+     * iteration ends. The previous order (flush → paint) left fired
+     * callbacks buffered for a full 20ms tick — and a race could lose
+     * them entirely, freezing frame-callback-driven clients (browsers)
+     * after their first frame. */
     _paint();
+    _fire_frame_callbacks(st);
+    wl_display_flush_clients(st->display);
     _present();
     /* deferred screenshot: the framebuffer is COMPLETE here (a dump
      * taken mid-paint photographed half-blitted windows) */
@@ -5639,6 +5881,7 @@ vt_backend_t *_vt_backend_wayland_new(void) {
     b->can_swap_buffers = _wl_can_swap_buffers;
     b->close_window = _wl_close_window;
     b->maximize_window = _wl_maximize_window;
+    b->fullscreen_window = _wl_fullscreen_window;
     b->minimize_window = _wl_minimize_window;
     b->test_input = _wl_test_input;
     b->set_workspace = _wl_set_workspace;

@@ -246,24 +246,40 @@ static bool _framed(const _client_t *c);
 
 /* --------------------------------------------------- _MOTIF_WM_HINTS */
 /* mwm.h field semantics (de facto standard): hints[0]=flags,
- * hints[2]=decorations. MWM_HINTS_DECORATIONS=1<<2,
- * MWM_DECOR_ALL=1, MWM_DECOR_TITLE=1<<3 (2), MWM_DECOR_BORDER=1<<4 (4).
+ * hints[2]=decorations. MWM_HINTS_FUNCTIONS=1<<0, MWM_HINTS_DECORATIONS
+ * =1<<1, MWM_HINTS_INPUT_MODE=1<<2, MWM_HINTS_STATUS=1<<3;
+ * MWM_DECOR_ALL=1<<0, MWM_DECOR_BORDER=1<<1, MWM_DECOR_RESIZEH=1<<2,
+ * MWM_DECOR_TITLE=1<<3. (Earlier revision had DECORATIONS=1<<2 and
+ * BORDER=1<<4 — wrong bits: GTK4's flags=0x3 then masked to 0 and the
+ * check never fired, so CSD windows were double-decorated in the X11
+ * session even when the property was read correctly.)
  *
  * GTK/Chromium/Firefox windows that draw their own headerbars set
  * decorations=0 here. A WM that ignores this DOUBLE-DECORATES those
  * windows — its own titlebar stacked on top of the app's. */
-#define _MWM_HINTS_DECORATIONS (1L << 2)
+#define _MWM_HINTS_DECORATIONS (1L << 1)
 #define _MWM_DECOR_ALL         (1L << 0)
 #define _MWM_DECOR_TITLE       (1L << 3)
-#define _MWM_DECOR_BORDER      (1L << 4)
+#define _MWM_DECOR_BORDER      (1L << 1)
 
-/* returns true when the client asks for NO server-side decorations */
+/* returns true when the client asks for NO server-side decorations.
+ *
+ * The property is read with AnyPropertyType: the MWM spec says the
+ * _MOTIF_WM_HINTS property TYPE is the _MOTIF_WM_HINTS atom itself
+ * (GTK4 writes it that way), but plenty of toolkits write it as
+ * XA_CARDINAL. Requesting XA_CARDINAL only — the old bug — made the
+ * read come back EMPTY for every spec-correct client: GTK4 headerbar
+ * apps (CSD browsers, Mirage, every GTK4 app) read as "wants SSD" and
+ * got the WM frame stacked AROUND their own decorations (the reported
+ * double decoration). */
 static bool _motif_undecorated(_client_t *c, Display *dpy) {
+    (void)dpy;
     const vt_x11_atoms_t *a = vt_x11_atoms();
     unsigned char *data = NULL;
     unsigned long n = 0;
     bool undecorated = false;
-    if (vt_x11_get_window_property(c->win, a->motif_wm_hints, a->cardinal,
+    if (vt_x11_get_window_property(c->win, a->motif_wm_hints,
+                                   AnyPropertyType,
                                    &data, &n) && data && n >= 3) {
         unsigned long *h = (unsigned long *)(void *)data;
         if (h[0] & _MWM_HINTS_DECORATIONS) {
@@ -577,8 +593,9 @@ static void _fill(Display *dpy, XRenderPictFormat *fmt, Drawable d, int x,
 #endif
 
 /* Paint the frame: border, title bar, title text, window buttons.
- * Colors follow the Vantage dark palette; the active window gets the
- * accent border and bright text, inactive ones dim down. */
+ * Colors follow the Vantage dark palette. Focus styling is NEUTRAL
+ * (lighter graphite border + bright text) — a saturated accent border
+ * read as a glowing blue aura around active windows on both backends. */
 static void _frame_paint(vt_wm_x11_t *e, _client_t *c) {
     if (!_framed(c)) return;
     Display *dpy = e->dpy;
@@ -599,7 +616,7 @@ static void _frame_paint(vt_wm_x11_t *e, _client_t *c) {
     XRenderPictFormat *fmt = XRenderFindVisualFormat(
         dpy, DefaultVisual(dpy, DefaultScreen(dpy)));
     bool active = c->model.focused;
-    unsigned long border = active ? 0xff4f9adc : 0xff26282e;
+    unsigned long border = active ? 0xff3d4148 : 0xff26282e;
     unsigned long bar    = active ? 0xff2b2f36 : 0xff1a1c22;
     unsigned long fg     = active ? 0xffeceef0 : 0xff909399;
 
@@ -1690,10 +1707,23 @@ static void _handle_client_message(vt_wm_x11_t *e, XClientMessageEvent *cm) {
         if (dir == 8) {
             _op_start(e, c, 0, 0, (int)cm->data.l[0], (int)cm->data.l[1]);
         } else if (dir >= 0 && dir <= 7) {
+            /* EWMH direction enum → our edge bits (1=E 2=S 4=W 8=N).
+             * The mapping is SPEC-EXACT — CSD toolkits (GTK headerbar
+             * apps, Firefox/Chromium) resize through THIS path when the
+             * user drags their own shadow borders: a wrong bit makes the
+             * wrong edges move ("windows cannot be resized" — dragging
+             * the bottom-right corner moved the top-left). */
             int edge = 0;
-            if (dir == 1 || dir == 3 || dir == 5 || dir == 7) edge |= 1;
-            if (dir == 2 || dir == 3 || dir == 6 || dir == 7) edge |= 2;
-            if (dir == 4 || dir == 5 || dir == 6 || dir == 7) edge |= 4 | 8;
+            switch (dir) {
+            case 0: edge = 4 | 8; break;   /* _SIZE_TOPLEFT: W+N */
+            case 1: edge = 8;     break;   /* _SIZE_TOP: N */
+            case 2: edge = 1 | 8; break;   /* _SIZE_TOPRIGHT: E+N */
+            case 3: edge = 1;     break;   /* _SIZE_RIGHT: E */
+            case 4: edge = 1 | 2; break;   /* _SIZE_BOTTOMRIGHT: E+S */
+            case 5: edge = 2;     break;   /* _SIZE_BOTTOM: S */
+            case 6: edge = 2 | 4; break;   /* _SIZE_BOTTOMLEFT: S+W */
+            case 7: edge = 4;     break;   /* _SIZE_LEFT: W */
+            }
             _op_start(e, c, 1, edge, (int)cm->data.l[0], (int)cm->data.l[1]);
         }
     } else if (cm->message_type == a->net_restack_window) {
@@ -2311,6 +2341,16 @@ bool vt_wm_x11_is_dock(struct vt_wm_x11 *eng, uint32_t id) {
     vt_wm_x11_t *e = (vt_wm_x11_t *)eng;
     _client_t *c = e ? _find(e, (Window)id) : NULL;
     return c ? (c->is_dock || c->is_desktop) : false;
+}
+
+bool vt_wm_x11_window_is_frame(struct vt_wm_x11 *eng, unsigned long w) {
+    vt_wm_x11_t *e = (vt_wm_x11_t *)eng;
+    if (!e) return false;
+    for (size_t i = 0; i < e->clients.size; i++) {
+        _client_t *c = *(_client_t **)vt_vec_at(&e->clients, i);
+        if (_framed(c) && c->frame == (Window)w) return true;
+    }
+    return false;
 }
 
 void vt_wm_x11_set_focus_mode(struct vt_wm_x11 *eng, bool sloppy) {

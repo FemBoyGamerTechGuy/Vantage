@@ -106,7 +106,69 @@ if wl_client_ok
     install_dir : join_paths(vt_libdir, 'vantage', 'tests'),
     install_rpath : vt_extra_rpath,
   )
+
+  # Frame-callback probe: animating client paced by wl_surface.frame
+  # callbacks (the browser redraw model). Pins the commit→paint→done
+  # cycle: a compositor that fires callbacks only on damage (or drops
+  # the flush) freezes such clients after one frame.
+  # GPU-buffer probe (below): full zwp_linux_dmabuf_v1 client (feedback,
+  # params, create_immed, attach, frame-callback animation). Pins the
+  # hardware-acceleration path end-to-end.
+  dmabuf_xml = join_paths(wl_protocols_dir, 'unstable', 'linux-dmabuf',
+                          'linux-dmabuf-unstable-v1.xml')
+  have_dmabuf_xml = run_command('test', '-f', dmabuf_xml,
+                                check: false).returncode() == 0
+  if have_dmabuf_xml
+    dmabuf_client_h = custom_target('linux-dmabuf-client-protocol.h',
+      input: dmabuf_xml,
+      output: 'linux-dmabuf-client-protocol.h',
+      command: [prog_wl_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+    dmabuf_probe = executable('vt-dmabuf-probe',
+      sources : ['vt-dmabuf-probe.c', xdg_shell_client_h, dmabuf_client_h],
+      include_directories : [include_directories('.')],
+      dependencies : tests_deps + [dep_wayland_client],
+      install : true,
+      install_dir : join_paths(vt_libdir, 'vantage', 'tests'),
+      install_rpath : vt_extra_rpath,
+    )
+  endif
+
+  # GLX probe (X11 games): full direct-context GLX pipeline against the
+  # X11 session — pins "games launch" (display, visual, direct context,
+  # mapping, swap) independently of any game engine.
+  if dep_x11.found() and dep_gl.found()
+    glx_probe = executable('vt-glx-probe',
+      sources : 'vt-glx-probe.c',
+      dependencies : [dep_x11, dep_gl],
+      install : true,
+      install_dir : join_paths(vt_libdir, 'vantage', 'tests'),
+      install_rpath : vt_extra_rpath,
+    )
+  endif
+
+  frame_probe = executable('vt-frame-probe',
+    sources : ['vt-frame-probe.c', xdg_shell_client_h],
+    include_directories : [include_directories('.')],
+    dependencies : tests_deps + [dep_wayland_client],
+    install : true,
+    install_dir : join_paths(vt_libdir, 'vantage', 'tests'),
+    install_rpath : vt_extra_rpath,
+  )
 endif
+
+
+  # X11 browser-behavior probe: CSD window + text selection + right-click
+  # context menu — pins the "menu opens, app does not freeze" contract
+  # and the "no duplicate decoration around CSD" contract.
+  if sub_dep_gtk4.found() and get_option('tests').enabled()
+    gtk4_csd_probe = executable('gtk4-csd-menu-probe',
+      sources : 'gtk4-csd-menu-probe.c',
+      dependencies : [sub_dep_gtk4],
+      install : true,
+      install_dir : join_paths(vt_libdir, 'vantage', 'tests'),
+      install_rpath : vt_extra_rpath,
+    )
+  endif
 
 # ------------------------------------------------------------------
 # REAL-toolkit GTK4 probe: a plain GTK application (CSD headerbar,
@@ -193,3 +255,44 @@ if harness_cli.found() and get_option('tests').enabled()
     suite : 'integration',
     is_parallel : false)
 endif
+
+  if dep_x11.found() and dep_xtst.found()
+    x11_resize_probe = executable('vt-x11-resize-probe',
+      sources : 'vt-x11-resize-probe.c',
+      dependencies : [dep_x11, dep_xtst],
+      install : true,
+      install_dir : join_paths(vt_libdir, 'vantage', 'tests'),
+      install_rpath : vt_extra_rpath,
+    )
+  endif
+
+  # generic XTest input injector (gestures against real toolkits)
+  if dep_x11.found() and dep_xtst.found()
+    xtest_drive = executable('vt-xtest-drive',
+      sources : 'vt-xtest-drive.c',
+      dependencies : [dep_x11, dep_xtst],
+      install : true,
+      install_dir : join_paths(vt_libdir, 'vantage', 'tests'),
+      install_rpath : vt_extra_rpath,
+    )
+    # window-tree dumper — locates probe windows / popovers for the
+    # harness without external X tools (xwininfo/xdotool)
+    wintree_tool = executable('vt-x11-wintree',
+      sources : 'vt-x11-wintree.c',
+      dependencies : [dep_x11],
+      install : true,
+      install_dir : join_paths(vt_libdir, 'vantage', 'tests'),
+      install_rpath : vt_extra_rpath,
+    )
+  endif
+
+  # raw XI2 event-delivery probe (the GDK4 input path)
+  if dep_x11.found() and dep_xi.found()
+    xi2_probe = executable('vt-xi2-event-probe',
+      sources : 'vt-xi2-event-probe.c',
+      dependencies : [dep_x11, dep_xi],
+      install : true,
+      install_dir : join_paths(vt_libdir, 'vantage', 'tests'),
+      install_rpath : vt_extra_rpath,
+    )
+  endif

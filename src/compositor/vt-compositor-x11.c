@@ -206,8 +206,17 @@ static void _paint_shadow(struct vt_compositor_x11 *cm, _cwin_t *cw) {
     if (!cw->picture || !cw->viewable || cw->w <= 0 || cw->h <= 0) return;
     int r = cm->comp->cfg.shadow_radius;
     if (r <= 0) return;
+    /* ONLY the WM's own SSD frames get a shadow. CSD windows (GTK
+     * headerbar apps, Firefox/Chromium) draw their own shadows inside
+     * their decoration margins — painting ours TOO is a second
+     * decoration stacked around the first (the reported "DE adds a
+     * decoration around the browser"). Docks/desktops and override-
+     * redirect popups equally carry their own visuals. */
+    struct vt_wm_x11 *xwm = vt_wm_x11_from(cm->wm);
+    if (!xwm || !vt_wm_x11_window_is_frame(xwm, (unsigned long)cw->win))
+        return;
     /* soft-ish shadow: layered translucent black silhouettes behind the
-     * window. Cheap (three fills), default OFF — zero cost when disabled. */
+     * window. Cheap (three fills), zero cost when disabled. */
     int off = r / 3;
     XRenderColor c1 = { .red = 0, .green = 0, .blue = 0, .alpha = 0x2800 };
     XRenderColor c2 = { .red = 0, .green = 0, .blue = 0, .alpha = 0x3800 };

@@ -1,7 +1,7 @@
 src_backends = ['vt-backend.c', 'vt-backend-x11.c', 'vt-backend-wayland.c',
                 'vt-seat.c', 'vt-kms.c']
 
-backend_deps = [vantage_core_dep, vantage_ipc_dep,
+backend_deps = [vantage_core_dep, vantage_gpu_dep, vantage_ipc_dep,
                 vantage_integrations_dep, vantage_wallpaper_dep]
 backend_cargs = []
 
@@ -49,6 +49,11 @@ tablet_v2_xml = join_paths(wl_protocols_dir, 'unstable',
 # constant integer scale of 1.0 the viewport is always the identity
 viewporter_xml = join_paths(wl_protocols_dir, 'stable',
   'viewporter', 'viewporter.xml')
+# zwp_linux_dmabuf_v1 — GPU client buffers (the hardware-acceleration
+# path: browsers/games/toolkits render on the real GPU and hand us
+# dma-bufs; also what Xwayland glamor needs for hardware GLX).
+linux_dmabuf_xml = join_paths(wl_protocols_dir, 'unstable',
+  'linux-dmabuf', 'linux-dmabuf-unstable-v1.xml')
 # vendored protocol XMLs (repo-root protocols/):
 #   wlr-layer-shell (MIT, wlr-protocols — panels dock through it)
 #   xwayland-shell (wayland-protocols staging — X11 window association)
@@ -162,6 +167,25 @@ if dep_wayland_server.found() and dep_wayland_client.found() and \
     output: 'viewporter-protocol.c',
     command: [prog_wl_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
 
+  # linux-dmabuf (guarded — wayland-protocols ships it, but stay
+  # honest if a stripped install lacks the xml)
+  have_linux_dmabuf = run_command('test', '-f', linux_dmabuf_xml,
+                                  check: false).returncode() == 0
+  dmabuf_sources = []
+  if have_linux_dmabuf
+    dmabuf_sources += [
+      custom_target('linux-dmabuf-unstable-v1-protocol.h',
+        input: linux_dmabuf_xml,
+        output: 'linux-dmabuf-unstable-v1-protocol.h',
+        command: [prog_wl_scanner, 'server-header', '@INPUT@', '@OUTPUT@']),
+      custom_target('linux-dmabuf-unstable-v1-protocol.c',
+        input: linux_dmabuf_xml,
+        output: 'linux-dmabuf-unstable-v1-protocol.c',
+        command: [prog_wl_scanner, 'private-code', '@INPUT@', '@OUTPUT@']),
+      'vt-wl-dmabuf.c']
+    backend_cargs += ['-DVT_HAVE_LINUX_DMABUF']
+  endif
+
   backend_deps += [dep_wayland_client, dep_wayland_server, dep_xkbcommon]
   backend_cargs += ['-DVT_HAVE_WAYLAND']
   lib_vantage_backends_extra_sources = [
@@ -176,7 +200,7 @@ if dep_wayland_server.found() and dep_wayland_client.found() and \
     toplevel_icon_proto_c, toplevel_icon_proto_h,
     tablet_v2_proto_c,
     viewporter_proto_c, viewporter_proto_h,
-    'vt-wl-layer.c', 'vt-wl-xwayland.c', 'vt-wl-protocols.c']
+    'vt-wl-layer.c', 'vt-wl-xwayland.c', 'vt-wl-protocols.c'] + dmabuf_sources
 
   # Xwayland window management needs xcb (+icccm for property types).
   # xcb-composite: the WM-side CompositeRedirectSubwindows(root, MANUAL)

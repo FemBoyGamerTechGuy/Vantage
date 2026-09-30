@@ -424,6 +424,48 @@ else
   echo "  (vt-registry-probe not built — registry check skipped)"
 fi
 
+# ------------------------------------------------------- GPU dmabuf path
+# The hardware-acceleration contract: zwp_linux_dmabuf_v1 v4 with EGL
+# import + readback. The probe does what a GPU app does (feedback →
+# params → create_immed → attach → frame-callback animation) and must
+# BOTH map on screen and keep redrawing — the exact failure modes of
+# the browser-stuck-on-one-frame bug class. On headless boxes the EGL
+# device is llvmpipe (the same import code path a real GPU driver
+# runs); on real hardware the render node takes over automatically.
+if [ -x "$(tc vt-dmabuf-probe)" ]; then
+  DMOUT=$(timeout 6 "$(tc vt-dmabuf-probe)" 4 2>&1 | tail -1)
+  if echo "$DMOUT" | grep -q "imported=yes" && \
+     echo "$DMOUT" | grep -q "feedback=yes"; then
+    ok "linux-dmabuf v4: global advertised, feedback parsed, buffers imported (EGL)"
+  else
+    bad "linux-dmabuf probe: $DMOUT"
+  fi
+  DMFRAMES=$(echo "$DMOUT" | grep -o 'frames=[0-9]*' | cut -d= -f2)
+  if [ -n "$DMFRAMES" ] && [ "$DMFRAMES" -gt 60 ]; then
+    ok "dmabuf client animates continuously ($DMFRAMES frames/4s — no single-frame stall)"
+  else
+    bad "dmabuf client stalled (frames=$DMFRAMES — the browser-freeze class)"
+  fi
+else
+  echo "  (vt-dmabuf-probe not built — dmabuf check skipped)"
+fi
+
+# Frame-callback pacing (SHM clients): the compositor's frame clock
+# must fire wl_surface.frame callbacks without coupling them to
+# damage-driven repaints — weston-simple-damage froze at a random frame
+# before the fix (the lost-callback race).
+if [ -x "$(tc vt-frame-probe)" ]; then
+  FPOUT=$(timeout 6 "$(tc vt-frame-probe)" 4 2>&1 | tail -1)
+  FPFRAMES=$(echo "$FPOUT" | grep -o 'frames=[0-9]*' | cut -d= -f2)
+  if [ -n "$FPFRAMES" ] && [ "$FPFRAMES" -gt 60 ]; then
+    ok "frame-callback clock keeps SHM clients animating ($FPFRAMES frames/4s)"
+  else
+    bad "frame-callback stall for SHM clients (frames=$FPFRAMES)"
+  fi
+else
+  echo "  (vt-frame-probe not built — frame-clock check skipped)"
+fi
+
 # ------------------------------------------------------------- client
 echo "== harness-wayland: xdg-shell client =="
 CLIENT_LOG="$WORK/client.log"
@@ -1190,6 +1232,107 @@ rsz_case "SOUTH edge grows height"                S   0  50   0  0   0  50
 rsz_case "SE corner both axes"                    SE 30  30   0  0  30  30
 rsz_case "NW corner both axes + origin"           NW -25 -25 -25 -25 25  25
 
+# ------------------------------------------------------ fullscreen safety
+# "Fullscreen/maximize must not be affected by resize decorations": a
+# fullscreen window owns the ENTIRE output — no SSD pixels, no resize
+# hitbox at the screen edges, and the panel is covered (raw-output
+# fullscreen semantics). Edge drags MUST NOT resize it. Uses the
+# --apply-configure client (a real toolkit applies the configured
+# fullscreen size; the synthetic blind-ack client never would).
+{
+  FS_LOG="$WORK/fs-client.log"
+  VT_TESTCLIENT_SECONDS=20 "$(tc vt-wayland-testclient)" \
+      --apply-configure --ssd 0xff5a9a3a 300 200 > "$FS_LOG" 2>&1 &
+  FS_PID=$!
+  sleep 1.2
+  # the fullscreen client is the NEWEST one (the resize section's
+  # client is still alive with the same title)
+  wgeo_fs() { "$(vb vantage-remote)" list 2>/dev/null | grep "Vantage Wayland Test" \
+           | tail -1 | sed -E 's/.*\t(-?[0-9]+)\t(-?[0-9]+)\t([0-9]+)\t([0-9]+)$/\1 \2 \3 \4/'; }
+  WID=$("$(vb vantage-remote)" list 2>/dev/null | grep "Vantage Wayland Test" \
+        | tail -1 | cut -f1)
+  if [ -n "$WID" ]; then
+    "$(vb vantage-remote)" fullscreen "$WID" >/dev/null 2>&1
+    sleep 1.0
+    FG2=$(wgeo_fs); read -r FX1 FY1 FW1 FH1 <<< "$FG2"
+    if [ "$FX1" = "0" ] && [ "$FY1" = "0" ] && [ "$FW1" = "1024" ] && \
+       [ "$FH1" = "768" ]; then
+      ok "fullscreen: window covers the whole output (taskbar fullscreen works)"
+    else
+      bad "fullscreen geometry wrong: $FG2 (want 0 0 1024 768)"
+    fi
+    # edge-drag at the SCREEN edge must NOT resize a fullscreen window
+    ti "motion x=1020 y=400"
+    sleep 0.1
+    ti "press b=1"
+    sleep 0.1
+    ti "motion x=920 y=400"
+    sleep 0.15
+    ti "release b=1"
+    sleep 0.3
+    FG3=$(wgeo_fs); read -r FX2 FY2 FW2 FH2 <<< "$FG3"
+    if [ "$FW2" = "1024" ] && [ "$FH2" = "768" ] && [ "$FX2" = "0" ] && \
+       [ "$FY2" = "0" ]; then
+      ok "fullscreen: screen-edge drag does NOT resize (no resize hitbox)"
+    else
+      bad "fullscreen edge-drag resized the window: $FG3"
+    fi
+    # pixel proof: the client color (0xff5a9a3a) fills the screen incl.
+    # the panel band — no SSD/black/blue regions anywhere
+    rm -f /tmp/vantage-wayland.ppm
+    kill -USR1 "$WM_PID" 2>/dev/null
+    wait_ppm || true
+    if [ -s /tmp/vantage-wayland.ppm ]; then
+      FS_PX=$(python3 - <<'PYFS'
+data = open('/tmp/vantage-wayland.ppm','rb').read()
+parts = data.split(b'\n',3)
+w,h = map(int,parts[1].split())
+pix = parts[3]
+# sample a grid: all four edges BELOW the panel band (DE policy: the
+# top-layer panel stays visible over fullscreen windows) and the body;
+# skip a small cursor neighborhood (the sprite blends over content by
+# design)
+PANEL_H = 45
+bad_px = 0; total = 0
+for y in list(range(PANEL_H, h, 48)) + [h-2, PANEL_H+1]:
+    for x in range(0,w,32):
+        if 880 <= x <= 970 and 360 <= y <= 440:   # cursor at 920,400
+            continue
+        i = (y*w+x)*3
+        r,g,b = pix[i], pix[i+1], pix[i+2]
+        total += 1
+        # client color 0x5a9a3a
+        if not (70 <= r <= 105 and 140 <= g <= 170 and 45 <= b <= 70):
+            bad_px += 1
+print(f"{bad_px} {total}")
+PYFS
+)
+      NBAD=$(echo "$FS_PX" | cut -d' ' -f1); NTOT=$(echo "$FS_PX" | cut -d' ' -f2)
+      if [ "${NBAD:-999}" -le $(( ${NTOT:-0} / 10 )) ]; then
+        ok "fullscreen: app pixels own the whole screen (no decoration/resize regions)"
+      else
+        bad "fullscreen: $NBAD/$NTOT sampled pixels are not app content"
+      fi
+    else
+      bad "no frame dump for the fullscreen pixel check"
+    fi
+    "$(vb vantage-remote)" unfullscreen "$WID" >/dev/null 2>&1
+    sleep 0.6
+    FG4=$(wgeo_fs); read -r FX4 FY4 FW4 FH4 <<< "$FG4"
+    # no longer fullscreen-covering, position restored (not 0,0 full)
+    if [ "$FX4" != "0" ] || [ "$FY4" != "0" ] || [ "$FW4" != "1024" ] || \
+       [ "$FH4" != "768" ]; then
+      ok "unfullscreen leaves fullscreen state (pos ${FX4},${FY4} size ${FW4}x${FH4})"
+    else
+      bad "unfullscreen did nothing: $FG4"
+    fi
+    kill $FS_PID 2>/dev/null
+    wait $FS_PID 2>/dev/null
+  else
+    bad "fullscreen check: testclient id not found"
+  fi
+}
+
 # resize cursor over the east edge: the double-arrow sprite (white
 # shaft pixels) replaces the arrow while hovering the resize zone
 RG=$(wgeo); read -r X Y WD H <<< "$RG"
@@ -1515,6 +1658,34 @@ PYEOF6
   else
     bad "desktop click leaked to the client ($PRESSES_IN -> $PRESSES_DESK presses)"
   fi
+
+  # --- 1b. PLAIN edge drag on the CSD margin (NO Super): the native
+  #     affordance. GTK4 CSD windows grab their own shadow margins and
+  #     call xdg_toplevel.resize — the compositor must (a) deliver the
+  #     press inside the margin band (input-region aware) and (b) honor
+  #     the resize request. A press 6px past the content edge is inside
+  #     the margin but outside the window geometry.
+  #     Runs AFTER the click/pairing checks on purpose: GDK consumes
+  #     the drag-ending release internally (begin_resize), so the
+  #     probe's button accounting keeps that press "down" — a later
+  #     click would read as a double-press. The wire itself is correct
+  #     (verified: enter→press→motion→release all delivered); the
+  #     order keeps the strict stray/double canaries meaningful.
+  GP2B0=$(wgeo_t "GtkProbe")
+  read -r GX2B0 GY2B0 GW2B0 GH2B0 <<< "$(echo "$GP2B0" | tr -d '\t')"
+  ti "motion x=$((GX2B0 + GW2B0 + 6)) y=$((GY2B0 + GH2B0 / 2))"
+  sleep 0.2
+  ti "press b=1"; sleep 0.12
+  ti "motion x=$((GX2B0 + GW2B0 + 6 + 90)) y=$((GY2B0 + GH2B0 / 2))"; sleep 0.3
+  ti "release b=1"; sleep 1.2
+  GP2B=$(wgeo_t "GtkProbe")
+  read -r GX2B GY2B GW2B GH2B <<< "$(echo "$GP2B" | tr -d '\t')"
+  if [ "${GW2B:-0}" -gt $((GW2B0 + 40)) ] 2>/dev/null; then
+    ok "GTK4 CSD EDGE resize works plain (no Super): ${GW2B0}x${GH2B0} -> ${GW2B}x${GH2B}"
+  else
+    bad "CSD edge drag did not resize: ${GW2B0:-?}x${GH2B0:-?} -> ${GW2B:-?}x${GH2B:-?}"
+  fi
+
 
   # --- 2d. TASKBAR dropdown (right-click context menu): must stay
   #     open across WM poll cycles (the old full rebuild destroyed

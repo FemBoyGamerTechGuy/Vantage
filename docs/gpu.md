@@ -57,3 +57,47 @@ Vsync is on by default for the OpenGL renderer. The compositor calls
 [desktop]
 vsync=false
 ```
+
+## Client-side hardware acceleration (zwp_linux_dmabuf_v1)
+
+Apps render on the GPU too, not just the compositor. Vantage advertises
+`zwp_linux_dmabuf_v1` v4 so GPU clients (browsers, games, EGL/Vulkan
+toolkits, and Xwayland/glamor for X11 GL apps) can hand their
+rendered buffers to the compositor as dma-bufs:
+
+```
+app renders → EGL/Vulkan on the GPU driver
+            → wl_buffer backed by a dma-buf
+            → compositor imports it (EGL/GBM on the render node)
+            → readback into the composition surface → screen
+```
+
+* Formats: ARGB/XRGB/ABGR/XBGR8888, LINEAR and INVALID modifier
+  (INVALID maps to the driver's implicit layout).
+* v4 feedback is honored: the main device (`dev_t` of the render node)
+  and the format/modifier table are sent via the feedback event, so
+  clients allocate on the SAME GPU the compositor scans out from.
+* Import ladder: EGL image import → readback (`glReadPixels`, Y-flip,
+  format convert) → compositor composition; mmap fallback for LINEAR
+  buffers when EGL is unavailable; failed imports release the buffer
+  immediately (clients fall back to wl_shm, never stall).
+* The buffer is released right after readback: the client's swapchain
+  never stalls on the compositor.
+* On machines without `/dev/dri`, the EGL import engine uses Mesa's
+  software EGL device (llvmpipe) so the protocol path is still
+  exercised end-to-end; with a GPU present the same code imports from
+  the real render node via GBM.
+
+Verify from `vantage-diagnostics`:
+```
+dmabuf: zwp_linux_dmabuf_v1 v4 advertised — import renderer '<name>'
+```
+
+## Frame pacing (wl_surface.frame)
+
+Frame callbacks are the compositor's frame clock: they fire every loop
+tick (paced to ~60 Hz, `VANTAGE_FRAME_INTERVAL_US` to tune) with a real
+timestamp, on a global list that survives surface unmapping, and the
+`done` reaches the wire in the same iteration it was marshaled. The
+callback resource destruction is deferred one tick so `done` and
+`wl_display.delete_id` never share a client dispatch batch.

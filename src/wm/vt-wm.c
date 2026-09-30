@@ -191,6 +191,15 @@ void vt_wm_fullscreen(vt_wm_t *wm, vt_window_t *w, bool on) {
         vt_wm_x11_fullscreen_id((struct vt_wm_x11 *)wm->engine, w->id, on);
         return;
     }
+    /* Wayland: ask the compositor to APPLY the state (xdg configure at
+     * output size, content-rect placement, prev-geometry save). The
+     * model-flag-only fallback below was the old path — the pager
+     * showed a fullscreen window while nothing happened on screen. */
+    if (wm->backend && wm->backend->kind == VT_BACKEND_WAYLAND &&
+        wm->backend->fullscreen_window) {
+        if (wm->backend->fullscreen_window(wm->backend, w->id, on) == 0)
+            return;
+    }
     if (on && !w->fullscreen) {
         w->prev_x = w->x; w->prev_y = w->y;
         w->prev_w = w->w; w->prev_h = w->h;

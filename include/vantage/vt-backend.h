@@ -109,6 +109,11 @@ typedef struct vt_backend {
                                bool on);
     int      (*minimize_window)(struct vt_backend *self, uint64_t window_id,
                                bool on);
+    /* Fullscreen toggle for native windows — the IPC/taskbar path
+     * (vantage-remote fullscreen <id>). Optional; without it the WM
+     * falls back to model-flag flips (cosmetic only). */
+    int      (*fullscreen_window)(struct vt_backend *self, uint64_t window_id,
+                               bool on);
     /* Optional: compositor-side hotkey dispatch, set by the WM host.
      * Returns true when the combo was consumed (do not forward the key
      * to the focused client). */

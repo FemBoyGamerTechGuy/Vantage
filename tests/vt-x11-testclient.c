@@ -309,8 +309,14 @@ int main(int argc, char **argv) {
         Window root = RootWindow(d, s);
         Window w = make_window(d, "CSD Probe", 120, 120, 300, 200,
                                0x5f9a3a);
-        /* _MOTIF_WM_HINTS: flags, functions, decorations, input, status */
-        unsigned long hints[5] = { 1L << 2 /* MWM_HINTS_DECORATIONS */,
+        /* _MOTIF_WM_HINTS: flags, functions, decorations, input, status.
+         * MWM_HINTS_DECORATIONS is bit 1 (1<<1) — mwm.h de facto
+         * standard; bit 2 is INPUT_MODE. (This probe once used 1<<2,
+         * mirroring the WM's own misdefined constant: the WM read the
+         * flags correctly but saw no DECORATIONS bit, framed the
+         * window, and the check "passed" only while BOTH sides used
+         * the same wrong bit.) */
+        unsigned long hints[5] = { 1L << 1 /* MWM_HINTS_DECORATIONS */,
                                    0, 0, 0, 0 };
         Atom motif = XInternAtom(d, "_MOTIF_WM_HINTS", False);
         XChangeProperty(d, w, motif, XA_CARDINAL, 32, PropModeReplace,

@@ -86,6 +86,21 @@ static void _draw_fn(GtkDrawingArea *da, cairo_t *cr, int w, int h,
  * lines after driving compositor-consumed gestures (SSD clicks,
  * Super+drag) over the window. */
 static int g_btn_state[16] = {0};
+/* A sequence may END without our release handler running: another
+ * controller CLAIMS it first (GTK4's own CSD-margin resize gesture
+ * claims margin presses and consumes their release internally — the
+ * widget tree never sees it). Without this the accounting state stuck
+ * "pressed" and the NEXT click read as a double-press, failing the
+ * pairing check for what is correct compositor behavior. */
+static void _on_btn_seq_end(GtkGesture *g, GdkEventSequence *seq, gpointer u) {
+    (void)seq; (void)u;
+    for (int i = 0; i < 16; i++)
+        if (g_btn_state[i]) {
+            printf("button %u cancel\n", (unsigned)i);
+            g_btn_state[i] = 0;
+        }
+    (void)g;
+}
 static void _on_btn_press(GtkGestureClick *g, int n, double x, double y,
                            gpointer u) {
     (void)g; (void)n; (void)x; (void)y; (void)u;
@@ -141,6 +156,11 @@ static void _activate(GApplication *app, gpointer u) {
     gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(bg), 0);
     g_signal_connect(bg, "pressed", G_CALLBACK(_on_btn_press), NULL);
     g_signal_connect(bg, "released", G_CALLBACK(_on_btn_release), NULL);
+    /* "cancel", NOT "end": GtkGestureClick emits "end" between every
+     * press and its release (the gesture's own click accounting), but
+     * "cancel" fires exactly when ANOTHER controller claims the
+     * sequence (GTK's CSD-margin resize claiming a margin press). */
+    g_signal_connect(bg, "cancel", G_CALLBACK(_on_btn_seq_end), NULL);
     gtk_widget_add_controller(win, GTK_EVENT_CONTROLLER(bg));
     gtk_window_set_child(GTK_WINDOW(win), box);
     gtk_widget_set_visible(win, TRUE);

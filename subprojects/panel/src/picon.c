@@ -76,7 +76,8 @@ static const char *_find_icon_dir(void) {
         xdh = xdhbuf;
     }
     if (*xdh)
-        snprintf(paths[n++], PATH_MAX, "%s/vantage-panel/icons", xdh);
+        snprintf(paths[n++], PATH_MAX, "%.*s/vantage-panel/icons",
+                 (int)(PATH_MAX - 32), xdh);
 
     for (int i = 0; i < n; i++) {
         char probe[PATH_MAX + 32];

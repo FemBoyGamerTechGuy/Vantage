@@ -153,6 +153,12 @@ void vt_wm_x11_tile_id(struct vt_wm_x11 *eng, uint32_t id, vt_wm_tile_t t);
 void vt_wm_x11_desktop(struct vt_wm_x11 *eng, int d);
 void vt_wm_x11_move_to_desktop_id(struct vt_wm_x11 *eng, uint32_t id, int d);
 bool vt_wm_x11_is_dock(struct vt_wm_x11 *eng, uint32_t id);
+/* Decoration classification for the compositor: is this root-child
+ * window the WM's OWN frame around a client (SSD)? CSD client
+ * windows, docks, desktops and override-redirect popups answer NO —
+ * the compositor must not paint its shadow around apps that draw
+ * their own decorations (double decoration). */
+bool vt_wm_x11_window_is_frame(struct vt_wm_x11 *eng, unsigned long w);
 /* Focus policy: true = sloppy (pointer-follows), false = click-to-focus
  * (the default — hovering must never steal keyboard focus). */
 void vt_wm_x11_set_focus_mode(struct vt_wm_x11 *eng, bool sloppy);
